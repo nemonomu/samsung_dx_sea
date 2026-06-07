@@ -1,0 +1,6 @@
+selenium
+webdriver-manager
+psycopg2-binary
+lxml
+pandas
+openpyxl

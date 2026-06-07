@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+config.py
+*.env
+
+log/
+raw/
+*.html
+*.csv
+*.xlsx
+*.jsonl
