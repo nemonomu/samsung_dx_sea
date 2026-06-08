@@ -34,6 +34,28 @@ def text(value: Any) -> Optional[str]:
     return str(value)
 
 
+def walk_values(value: Any) -> Iterable[Any]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_values(child)
+
+
+def text_fragments(value: Any) -> List[str]:
+    out: List[str] = []
+    for node in walk_values(value):
+        if not isinstance(node, dict):
+            continue
+        for key in ("text", "label", "value", "slaText", "title"):
+            raw = node.get(key)
+            if isinstance(raw, str) and raw.strip():
+                out.append(re.sub(r"\s+", " ", raw).strip())
+    return out
+
+
 def full_url(value: Any) -> Optional[str]:
     value = text(value)
     if not value:

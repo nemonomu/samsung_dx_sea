@@ -26,6 +26,11 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def require_file(path: Path, message: str) -> None:
+    if not path.exists():
+        raise SystemExit(f"{message}: {path}")
+
+
 def assert_listing_minimums(summary_path: Path, min_main: int = 300, min_bsr: int = 100) -> None:
     summary = read_json(summary_path)
     listing = summary.get("listing") or {}
@@ -71,6 +76,9 @@ def main() -> int:
     transform = common_dir / "walmart_db_shape_transform.py"
     validator = common_dir / "walmart_db_shape_validator.py"
     inserter = common_dir / "walmart_db_insert_csv.py"
+    btf_seed = log_dir / "walmart_api_seeds_fullheaders.json"
+    require_file(project_root / "config.py", "Missing DB config.py")
+    require_file(btf_seed, "Missing Walmart BTF seed JSON. Copy it before running; retailer_sku_name_similar depends on this file")
 
     log_stage("1/8", f"listing collection start: main_pages={args.main_pages}, bsr_pages={args.bsr_pages}, target_per_type={args.target_per_type}")
     run([
