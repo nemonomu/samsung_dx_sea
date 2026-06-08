@@ -64,6 +64,7 @@ def main() -> int:
     parser.add_argument("--target-per-type", type=int, default=330)
     parser.add_argument("--max-reviews", type=int, default=20)
     parser.add_argument("--max-review-pages", type=int, default=2)
+    parser.add_argument("--session-json", type=Path, default=None)
     parser.add_argument("--recovery-passes", type=int, default=3)
     parser.add_argument("--table", default="tv_retail_com")
     parser.add_argument("--commit-db", action="store_true")
@@ -89,6 +90,17 @@ def main() -> int:
     validator = common_dir / "walmart_db_shape_validator.py"
     inserter = common_dir / "walmart_db_insert_csv.py"
     btf_seed = log_dir / "walmart_api_seeds_fullheaders.json"
+    session_json = args.session_json
+    if session_json is None:
+        candidate = log_dir / "walmart_browser_session.json"
+        session_json = candidate if candidate.exists() else None
+    elif not session_json.is_absolute():
+        session_json = (project_root / session_json).resolve()
+    session_args = ["--session-json", str(session_json)] if session_json and session_json.exists() else []
+    if session_args:
+        print(f"[SESSION] using browser session: {session_json}", flush=True)
+    else:
+        print("[SESSION] no browser session JSON found; raw headers only", flush=True)
     require_file(project_root / "config.py", "Missing DB config.py")
     require_file(btf_seed, "Missing Walmart BTF seed JSON. Copy it before running; retailer_sku_name_similar depends on this file")
 
@@ -105,6 +117,7 @@ def main() -> int:
         "--retries", "1",
         "--retry-sleep", "2",
         "--between-pages", "0.8",
+        *session_args,
     ])
     log_stage("2/8", "listing minimum check: require main>=300 and bsr>=100")
     listing_counts = assert_listing_minimums(base_out / "summary.json", min_main=300, min_bsr=100)
@@ -140,6 +153,7 @@ def main() -> int:
         "--progress-every", "1",
         "--flush-every", "10",
         "--with-btf",
+        *session_args,
     ])
 
     chunk_dirs: List[Path] = []
@@ -172,6 +186,7 @@ def main() -> int:
             "--between-pages", "1.2",
             "--between-items", "1.2",
             "--with-btf",
+            *session_args,
         ])
         chunk_dirs.append(chunk_out)
     else:

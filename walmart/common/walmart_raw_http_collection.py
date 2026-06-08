@@ -87,7 +87,64 @@ def ssl_context() -> Optional[ssl.SSLContext]:
     return None
 
 
-def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, Any]:
+def cookie_header_from_cookies(cookies: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for cookie in cookies:
+        name = str(cookie.get("name") or "").strip()
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "")
+        if name and (not domain or "walmart.com" in domain):
+            parts.append(f"{name}={value}")
+    return "; ".join(parts)
+
+
+def session_headers_from_json(path: Optional[Path]) -> Dict[str, str]:
+    if not path:
+        return {}
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    headers: Dict[str, str] = {}
+    raw_headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
+    for key, value in raw_headers.items():
+        lk = str(key).lower()
+        if lk in {"host", "content-length", "accept-encoding", "connection"}:
+            continue
+        if value is not None:
+            headers[str(key)] = str(value)
+    user_agent = data.get("user_agent") or data.get("userAgent")
+    if user_agent:
+        headers["User-Agent"] = str(user_agent)
+    cookie_header = data.get("cookie_header") or data.get("cookieHeader")
+    if not cookie_header:
+        cookies = data.get("cookies") or ((data.get("storage_state") or {}).get("cookies") if isinstance(data.get("storage_state"), dict) else [])
+        if isinstance(cookies, list):
+            cookie_header = cookie_header_from_cookies(cookies)
+    if cookie_header:
+        headers["Cookie"] = str(cookie_header)
+    return headers
+
+
+def default_session_json(project_root: Path) -> Optional[Path]:
+    env_path = os.environ.get("WALMART_SESSION_JSON")
+    if env_path:
+        return Path(env_path)
+    candidate = project_root / "log" / "walmart_browser_session.json"
+    return candidate if candidate.exists() else None
+
+
+def merge_headers(base: Dict[str, str], overlay: Dict[str, str]) -> Dict[str, str]:
+    out = dict(base)
+    for key, value in overlay.items():
+        if value not in (None, ""):
+            out[str(key)] = str(value)
+    return out
+
+
+def fetch_html(url: str, timeout: int, retries: int, sleep: float, session_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -98,6 +155,8 @@ def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, 
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+    if session_headers:
+        headers = merge_headers(headers, session_headers)
     last: Dict[str, Any] = {}
     for attempt in range(1, retries + 2):
         started = time.perf_counter()
@@ -529,6 +588,9 @@ def run_listing(args: argparse.Namespace, project_root: Path, out_dir: Path) -> 
 
     raw_dir = out_dir / "raw" / "listing"
     excluded_urls = set() if args.no_mst_exclusion else load_excluded_product_urls()
+    args.session_headers = session_headers_from_json(args.session_json)
+    if args.session_headers:
+        print(f"[session] loaded for listing: {args.session_json}", flush=True)
     specs = {
         "main": ensure_listing_page_urls(
             load_page_urls(project_root, "wmart_tv_main_page_url", "main", args.main_pages),
@@ -549,7 +611,7 @@ def run_listing(args: argparse.Namespace, project_root: Path, out_dir: Path) -> 
     for page_type in page_types:
         for page_number, url in specs[page_type]:
             print(f"[listing {page_type} p{page_number}] GET {url}")
-            result = fetch_html(url, args.timeout, args.retries, args.retry_sleep)
+            result = fetch_html(url, args.timeout, args.retries, args.retry_sleep, args.session_headers)
             abort_if_robot(result, f"listing {page_type} p{page_number}")
             html = result.pop("html", "")
             next_data = extract_next_data(html) if result["has_next_data"] else None
@@ -731,6 +793,9 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
 
     seed = args.seed or out_dir / "all_unique_items.csv"
     seeds = load_seed(seed, args.limit, args.start)
+    args.session_headers = session_headers_from_json(args.session_json)
+    if args.session_headers:
+        print(f"[session] loaded for detail-review: {args.session_json}", flush=True)
     raw_dir = out_dir / "raw" / "detail_review"
     detail_rows: List[Dict[str, Any]] = []
     review_rows: List[Dict[str, Any]] = []
@@ -799,7 +864,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         item_summary: Dict[str, Any] = {"index": offset, "item": item, "product_url": product_url}
 
         print(f"[detail {offset}/{args.start + total_items} {item}] GET {product_url}", flush=True)
-        detail_result = fetch_html(product_url, args.timeout, args.retries, args.retry_sleep)
+        detail_result = fetch_html(product_url, args.timeout, args.retries, args.retry_sleep, args.session_headers)
         abort_if_robot(detail_result, f"detail {offset}/{args.start + total_items} {item}")
         detail_html = detail_result.pop("html", "")
         detail_next = extract_next_data(detail_html) if detail_result["has_next_data"] else None
@@ -837,7 +902,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                 elif args.with_btf:
                     progress["btf_calls"] += 1
                     btf_started = time.perf_counter()
-                    btf_result = fetch_btf(project_root, item, product_url, args.timeout, detail_next)
+                    btf_result = fetch_btf(project_root, item, product_url, args.timeout, detail_next, args.session_headers)
                     item_summary["btf_meta"] = btf_result["meta"]
                     item_summary["btf_elapsed_sec"] = round(time.perf_counter() - btf_started, 2)
                     if btf_result["data"] is not None:
@@ -902,7 +967,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                 for page_index, review_page_url in enumerate(urls, 1):
                     print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
                     progress["review_pages_attempted"] += 1
-                    review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep)
+                    review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep, args.session_headers)
                     abort_if_robot(review_result, f"review {offset}/{args.start + total_items} {item} p{page_index}")
                     review_html = review_result.pop("html", "")
                     review_next = extract_next_data(review_html) if review_result["has_next_data"] else None
@@ -917,7 +982,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                             if fallback_url == review_page_url:
                                 continue
                             progress["review_fallback_attempts"] += 1
-                            fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep)
+                            fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep, args.session_headers)
                             abort_if_robot(fallback_result, f"review fallback {offset}/{args.start + total_items} {item} p{page_index}")
                             fallback_html = fallback_result.pop("html", "")
                             fallback_next = (
@@ -1091,6 +1156,7 @@ def fetch_btf(
     product_url: str,
     timeout: int,
     detail_next: Optional[Dict[str, Any]] = None,
+    session_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     try:
         from walmart_persisted_query_probe import (  # type: ignore
@@ -1117,6 +1183,10 @@ def fetch_btf(
         for key in list(headers):
             if key.lower() == "cookie":
                 headers.pop(key, None)
+        if session_headers:
+            for key, value in session_headers.items():
+                if key.lower() in {"cookie", "user-agent", "accept-language"} and value:
+                    headers[key] = value
         row, parsed, _text = request_json(
             "btf",
             "POST",
@@ -1156,6 +1226,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Walmart raw HTTP collection")
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--session-json", type=Path, default=None, help="Browser session JSON with Walmart cookies/headers")
     parser.add_argument("--stage", choices=["listing", "detail-review", "all"], default="all")
     parser.add_argument("--seed", type=Path)
     parser.add_argument("--start", type=int, default=0)
@@ -1182,6 +1253,10 @@ def main() -> int:
     args = parser.parse_args()
 
     project_root = args.project_root.resolve()
+    if args.session_json is None:
+        args.session_json = default_session_json(project_root)
+    elif not args.session_json.is_absolute():
+        args.session_json = (project_root / args.session_json).resolve()
     setup_project_imports(project_root)
     out_dir = (args.out_dir or project_root / "log" / "walmart_raw_http_collection").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
