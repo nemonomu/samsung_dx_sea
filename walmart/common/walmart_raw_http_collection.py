@@ -146,7 +146,9 @@ def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, 
             "error": error,
             "html": html,
         }
-        if last["status"] == 200 and last["has_next_data"] and not last["robot_detected"]:
+        if last["robot_detected"]:
+            return last
+        if last["status"] == 200 and last["has_next_data"]:
             return last
         if attempt <= retries:
             time.sleep(sleep)
@@ -719,9 +721,11 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
     failures: List[Dict[str, Any]] = []
     total_items = len(seeds)
     stage_started = time.perf_counter()
+    consecutive_detail_robot_blocks = 0
     progress = {
         "detail_ok": 0,
         "detail_fail": 0,
+        "detail_robot_blocked": 0,
         "review_ok": 0,
         "review_fail": 0,
         "review_pages_attempted": 0,
@@ -756,6 +760,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
             f"sku={item}{item_part} elapsed={format_duration(elapsed)} "
             f"avg_per_item={avg:.1f}s eta={format_duration(eta)} "
             f"detail_ok={progress['detail_ok']} detail_fail={progress['detail_fail']} "
+            f"detail_robot_blocked={progress['detail_robot_blocked']} "
             f"review_ok={progress['review_ok']} review_fail={progress['review_fail']} "
             f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
             f"review_skipped_zero={progress['review_skipped_zero']} "
@@ -782,7 +787,23 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         if args.save_html:
             item_dir.mkdir(parents=True, exist_ok=True)
             (item_dir / "detail.html").write_text(detail_html, encoding="utf-8", errors="replace")
-        if detail_next is not None:
+        if detail_result.get("robot_detected"):
+            consecutive_detail_robot_blocks += 1
+            progress["detail_robot_blocked"] += 1
+            print(
+                f"[detail {offset}/{args.start + total_items} {item}] BLOCKED "
+                f"consecutive={consecutive_detail_robot_blocks}/{args.max_consecutive_robot_blocks} "
+                f"final_url={detail_result.get('final_url')}",
+                flush=True,
+            )
+            if args.max_consecutive_robot_blocks and consecutive_detail_robot_blocks >= args.max_consecutive_robot_blocks:
+                raise SystemExit(
+                    "Walmart robot/blocked page repeated "
+                    f"{consecutive_detail_robot_blocks} times during detail collection. "
+                    "Stop this run, change IP/session, then rerun."
+                )
+        elif detail_next is not None:
+            consecutive_detail_robot_blocks = 0
             write_json(item_dir / "detail_next_data.json", detail_next)
             try:
                 drow = clean_row_values(detail_row(detail_next, args.max_reviews))
@@ -822,7 +843,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
             progress["detail_fail"] += 1
         item_summary["detail_meta"] = {k: v for k, v in detail_result.items() if k != "url"}
 
-        if not args.skip_reviews:
+        if not args.skip_reviews and item_summary.get("detail_ok"):
             review_nexts: List[Dict[str, Any]] = []
             review_count = safe_int(item_summary.get("count_of_reviews"))
             if review_count == 0:
@@ -930,6 +951,9 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                 else:
                     item_summary["review_ok"] = False
                     progress["review_fail"] += 1
+        elif not args.skip_reviews:
+            item_summary["review_ok"] = False
+            item_summary["review_skip_reason"] = "detail_not_ok"
         item_summaries.append(item_summary)
         if args.flush_every and (len(item_summaries) % args.flush_every == 0):
             write_csv(out_dir / "detail_items_probe_raw.csv", detail_rows)
@@ -953,6 +977,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         f"detail_rows={len(detail_rows)} review_rows={len(review_rows)} "
         f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
         f"review_skipped_zero={progress['review_skipped_zero']} "
+        f"detail_robot_blocked={progress['detail_robot_blocked']} "
         f"review_fallback_attempts={progress['review_fallback_attempts']} "
         f"btf={progress['btf_ok']}/{progress['btf_calls']} "
         f"similar_hit=html:{progress['html_similar_hit']} btf:{progress['btf_similar_hit']} "
@@ -1127,6 +1152,7 @@ def main() -> int:
     parser.add_argument("--similar-limit", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=1, help="Print detail/review progress every N completed items")
     parser.add_argument("--flush-every", type=int, default=10, help="Flush probe CSV/summary every N completed items")
+    parser.add_argument("--max-consecutive-robot-blocks", type=int, default=10, help="Abort detail/review collection after N consecutive blocked detail pages; 0 disables")
     args = parser.parse_args()
 
     project_root = args.project_root.resolve()
