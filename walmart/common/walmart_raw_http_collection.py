@@ -155,6 +155,22 @@ def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, 
     return last
 
 
+def abort_if_robot(result: Dict[str, Any], stage: str) -> None:
+    final_url = str(result.get("final_url") or result.get("url") or "")
+    top_keys = str(result.get("top_keys") or "")
+    status = str(result.get("status") or "")
+    detected = bool(result.get("robot_detected")) or "/blocked" in final_url.lower()
+    if status == "412" and ("blockScript" in top_keys or "redirectUrl" in top_keys):
+        detected = True
+    if not detected:
+        return
+    raise SystemExit(
+        "Walmart bot/blocked page detected. Abort crawler immediately. "
+        f"stage={stage} status={result.get('status')} final_url={final_url} "
+        f"top_keys={top_keys} error={result.get('error') or ''}"
+    )
+
+
 def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
     match = NEXT_RE.search(html)
     if not match:
@@ -534,6 +550,7 @@ def run_listing(args: argparse.Namespace, project_root: Path, out_dir: Path) -> 
         for page_number, url in specs[page_type]:
             print(f"[listing {page_type} p{page_number}] GET {url}")
             result = fetch_html(url, args.timeout, args.retries, args.retry_sleep)
+            abort_if_robot(result, f"listing {page_type} p{page_number}")
             html = result.pop("html", "")
             next_data = extract_next_data(html) if result["has_next_data"] else None
             raw_page_dir = raw_dir / page_type
@@ -782,6 +799,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
 
         print(f"[detail {offset}/{args.start + total_items} {item}] GET {product_url}", flush=True)
         detail_result = fetch_html(product_url, args.timeout, args.retries, args.retry_sleep)
+        abort_if_robot(detail_result, f"detail {offset}/{args.start + total_items} {item}")
         detail_html = detail_result.pop("html", "")
         detail_next = extract_next_data(detail_html) if detail_result["has_next_data"] else None
         if args.save_html:
@@ -881,6 +899,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                     print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
                     progress["review_pages_attempted"] += 1
                     review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep)
+                    abort_if_robot(review_result, f"review {offset}/{args.start + total_items} {item} p{page_index}")
                     review_html = review_result.pop("html", "")
                     review_next = extract_next_data(review_html) if review_result["has_next_data"] else None
                     if (
@@ -895,6 +914,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                                 continue
                             progress["review_fallback_attempts"] += 1
                             fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep)
+                            abort_if_robot(fallback_result, f"review fallback {offset}/{args.start + total_items} {item} p{page_index}")
                             fallback_html = fallback_result.pop("html", "")
                             fallback_next = (
                                 extract_next_data(fallback_html) if fallback_result["has_next_data"] else None
@@ -1101,6 +1121,7 @@ def fetch_btf(
             {"variables": btf_vars},
             timeout,
         )
+        abort_if_robot(row, f"btf {item}")
         return {"meta": row, "data": parsed if row.get("status") == 200 else None}
     except Exception as exc:
         return {"meta": {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, "data": None}
