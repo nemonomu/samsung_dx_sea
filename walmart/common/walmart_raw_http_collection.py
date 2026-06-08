@@ -205,9 +205,12 @@ def fetch_html(url: str, timeout: int, retries: int, sleep: float, session_heade
             "error": error,
             "html": html,
         }
-        if last["robot_detected"]:
-            return last
+        # Some valid Walmart pages contain robot-related text in embedded data.
+        # Treat a page as usable when __NEXT_DATA__ exists; only pure challenge
+        # pages should drive abort/retry behavior.
         if last["status"] == 200 and last["has_next_data"]:
+            return last
+        if last["robot_detected"]:
             return last
         if attempt <= retries:
             time.sleep(sleep)
@@ -218,7 +221,8 @@ def abort_if_robot(result: Dict[str, Any], stage: str) -> None:
     final_url = str(result.get("final_url") or result.get("url") or "")
     top_keys = str(result.get("top_keys") or "")
     status = str(result.get("status") or "")
-    detected = bool(result.get("robot_detected")) or "/blocked" in final_url.lower()
+    has_next_data = bool(result.get("has_next_data"))
+    detected = "/blocked" in final_url.lower() or (bool(result.get("robot_detected")) and not has_next_data)
     if status == "412" and ("blockScript" in top_keys or "redirectUrl" in top_keys):
         detected = True
     if not detected:

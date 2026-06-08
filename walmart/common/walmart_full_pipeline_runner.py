@@ -65,6 +65,7 @@ def main() -> int:
     parser.add_argument("--max-reviews", type=int, default=20)
     parser.add_argument("--max-review-pages", type=int, default=2)
     parser.add_argument("--session-json", type=Path, default=None)
+    parser.add_argument("--with-btf", action="store_true", help="Enable ItemByIdBtf GraphQL enrichment for similar items")
     parser.add_argument("--recovery-passes", type=int, default=3)
     parser.add_argument("--table", default="tv_retail_com")
     parser.add_argument("--commit-db", action="store_true")
@@ -102,7 +103,10 @@ def main() -> int:
     else:
         print("[SESSION] no browser session JSON found; raw headers only", flush=True)
     require_file(project_root / "config.py", "Missing DB config.py")
-    require_file(btf_seed, "Missing Walmart BTF seed JSON. Copy it before running; retailer_sku_name_similar depends on this file")
+    if args.with_btf:
+        require_file(btf_seed, "Missing Walmart BTF seed JSON. Copy it before running; retailer_sku_name_similar depends on this file")
+    else:
+        print("[BTF] disabled; retailer_sku_name_similar will use HTML/listing sources only", flush=True)
 
     log_stage("1/8", f"listing collection start: main_pages={args.main_pages}, bsr_pages={args.bsr_pages}, target_per_type={args.target_per_type}")
     run([
@@ -130,12 +134,14 @@ def main() -> int:
     print(
         "[CHECK] detail/review expected workload: "
         f"detail~{seed_count}, review~{seed_count} to {seed_count * max(1, args.max_review_pages)}, "
-        f"btf up to {seed_count}; max_review_pages={args.max_review_pages}. "
+        f"btf up to {seed_count if args.with_btf else 0}; max_review_pages={args.max_review_pages}. "
         "runtime depends on Walmart response time, review p2 count, BTF fallback count, retries, and sleeps.",
         flush=True,
     )
 
-    log_stage("3/8", f"detail/review collection start: seed_rows={seed_count}, max_reviews={args.max_reviews}, max_review_pages={args.max_review_pages}, with_btf=true")
+    btf_args = ["--with-btf"] if args.with_btf else []
+
+    log_stage("3/8", f"detail/review collection start: seed_rows={seed_count}, max_reviews={args.max_reviews}, max_review_pages={args.max_review_pages}, with_btf={str(args.with_btf).lower()}")
     run([
         python, str(collector),
         "--project-root", str(project_root),
@@ -152,7 +158,7 @@ def main() -> int:
         "--between-items", "1.2",
         "--progress-every", "1",
         "--flush-every", "10",
-        "--with-btf",
+        *btf_args,
         *session_args,
     ])
 
@@ -185,7 +191,7 @@ def main() -> int:
             "--retry-sleep", "5",
             "--between-pages", "1.2",
             "--between-items", "1.2",
-            "--with-btf",
+            *btf_args,
             *session_args,
         ])
         chunk_dirs.append(chunk_out)
