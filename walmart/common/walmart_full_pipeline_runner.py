@@ -63,6 +63,7 @@ def main() -> int:
     parser.add_argument("--bsr-pages", type=int, default=5)
     parser.add_argument("--target-per-type", type=int, default=330)
     parser.add_argument("--max-reviews", type=int, default=20)
+    parser.add_argument("--max-review-pages", type=int, default=2)
     parser.add_argument("--recovery-passes", type=int, default=3)
     parser.add_argument("--table", default="tv_retail_com")
     parser.add_argument("--commit-db", action="store_true")
@@ -115,12 +116,13 @@ def main() -> int:
     )
     print(
         "[CHECK] detail/review expected workload: "
-        f"detail~{seed_count}, review~{seed_count} to {seed_count * 2}, btf up to {seed_count}; "
+        f"detail~{seed_count}, review~{seed_count} to {seed_count * max(1, args.max_review_pages)}, "
+        f"btf up to {seed_count}; max_review_pages={args.max_review_pages}. "
         "runtime depends on Walmart response time, review p2 count, BTF fallback count, retries, and sleeps.",
         flush=True,
     )
 
-    log_stage("3/8", f"detail/review collection start: seed_rows={seed_count}, max_reviews={args.max_reviews}, with_btf=true")
+    log_stage("3/8", f"detail/review collection start: seed_rows={seed_count}, max_reviews={args.max_reviews}, max_review_pages={args.max_review_pages}, with_btf=true")
     run([
         python, str(collector),
         "--project-root", str(project_root),
@@ -129,6 +131,7 @@ def main() -> int:
         "--seed", str(base_out / "all_unique_items.csv"),
         "--limit", "0",
         "--max-reviews", str(args.max_reviews),
+        "--max-review-pages", str(args.max_review_pages),
         "--timeout", "35",
         "--retries", "2",
         "--retry-sleep", "5",
@@ -162,6 +165,7 @@ def main() -> int:
             "--seed", str(missing_seed),
             "--limit", "0",
             "--max-reviews", str(args.max_reviews),
+            "--max-review-pages", str(args.max_review_pages),
             "--timeout", "35",
             "--retries", "2",
             "--retry-sleep", "5",

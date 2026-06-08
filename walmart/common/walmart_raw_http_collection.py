@@ -758,8 +758,9 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
     print(
         "[detail-review start] "
         f"seed={seed} total_items={total_items} max_reviews={args.max_reviews} "
-        f"with_btf={args.with_btf} between_pages={args.between_pages}s "
-        f"between_items={args.between_items}s progress_every={args.progress_every}",
+        f"with_btf={args.with_btf} max_review_pages={args.max_review_pages} "
+        f"between_pages={args.between_pages}s between_items={args.between_items}s "
+        f"progress_every={args.progress_every}",
         flush=True,
     )
 
@@ -892,9 +893,12 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                     progress["review_fail"] += 1
             else:
                 urls = [review_url(item) or f"https://www.walmart.com/reviews/product/{item}"]
-                if review_count is None or review_count > 10:
+                if args.max_review_pages >= 2 and (review_count is None or review_count > 10):
                     urls.append(page2_review_url(item))
                 item_summary["review_pages_planned"] = len(urls)
+                item_summary["review_page2_deferred"] = bool(
+                    args.max_review_pages < 2 and (review_count is None or review_count > 10)
+                )
                 for page_index, review_page_url in enumerate(urls, 1):
                     print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
                     progress["review_pages_attempted"] += 1
@@ -1166,6 +1170,7 @@ def main() -> int:
     parser.add_argument("--between-pages", type=float, default=0.8)
     parser.add_argument("--between-items", type=float, default=0.8)
     parser.add_argument("--max-reviews", type=int, default=20)
+    parser.add_argument("--max-review-pages", type=int, default=2, help="Maximum review pages per SKU; use 1 to defer page 2 collection")
     parser.add_argument("--save-html", action="store_true")
     parser.add_argument("--no-mst-exclusion", action="store_true")
     parser.add_argument("--skip-reviews", action="store_true")
