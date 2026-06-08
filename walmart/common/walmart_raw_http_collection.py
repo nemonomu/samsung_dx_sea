@@ -507,6 +507,7 @@ def run_listing(args: argparse.Namespace, project_root: Path, out_dir: Path) -> 
     page_types = ("main", "bsr") if args.only_type == "all" else (args.only_type,)
     all_by_type: Dict[str, List[Dict[str, Any]]] = {"main": [], "bsr": []}
     page_summaries: List[Dict[str, Any]] = []
+    consecutive_fetch_failures = 0
 
     for page_type in page_types:
         for page_number, url in specs[page_type]:
@@ -540,10 +541,22 @@ def run_listing(args: argparse.Namespace, project_root: Path, out_dir: Path) -> 
                 **{k: v for k, v in result.items() if k != "url"},
             }
             page_summaries.append(page_summary)
+            error_text = str(result.get("error") or "").strip()
             print(
                 f"[listing {page_type} p{page_number}] rows={len(rows)} "
-                f"status={result['status']} next={result['has_next_data']} robot={result['robot_detected']}"
+                f"status={result['status']} next={result['has_next_data']} "
+                f"robot={result['robot_detected']} error={error_text[:180]}"
             )
+            if not result.get("status") and not rows:
+                consecutive_fetch_failures += 1
+            else:
+                consecutive_fetch_failures = 0
+            if consecutive_fetch_failures >= 3:
+                raise SystemExit(
+                    "Listing fetch failed 3 pages in a row before any useful response. "
+                    "Check VPN/network/DNS/proxy from this RDP. Last error: "
+                    f"{error_text or 'empty status with no captured exception text'}"
+                )
             if len(dedupe_rows(all_by_type[page_type])) >= args.target_per_type:
                 break
             time.sleep(args.between_pages)

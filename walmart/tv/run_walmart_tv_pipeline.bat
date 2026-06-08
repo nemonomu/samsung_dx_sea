@@ -10,7 +10,7 @@ echo [START] Walmart full pipeline
 echo [PROJECT_ROOT] %PROJECT_ROOT%
 echo.
 
-"%PYTHON%" "%RUNNER%" --project-root "%PROJECT_ROOT%" --commit-db
+"%PYTHON%" "%RUNNER%" --project-root "%PROJECT_ROOT%" --table public.test_tv_retail_com --commit-db
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.

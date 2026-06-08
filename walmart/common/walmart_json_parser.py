@@ -313,8 +313,29 @@ def fulfillment_options_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def shipping_arrival_text(item: Dict[str, Any]) -> Optional[str]:
+    for value in text_fragments(item):
+        lower = value.lower()
+        if "arrives" not in lower:
+            continue
+        if "tomorrow" in lower:
+            return "tomorrow"
+        if "today" in lower:
+            return "today"
+        match = re.search(r"arrives\s+(in\s+3\+\s+days)", value, re.I)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+        match = re.search(r"arrives\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[A-Z][a-z]{2}\s+\d{1,2})", value)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
 def fulfillment_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out = fulfillment_options_fields(item)
+    arrival = shipping_arrival_text(item)
+    if arrival and (out["fastest_delivery"] is None or str(out["fastest_delivery"]).lower() == "available"):
+        out["fastest_delivery"] = arrival
     groups = item.get("fulfillmentBadgeGroups") or []
     if not isinstance(groups, list):
         return out

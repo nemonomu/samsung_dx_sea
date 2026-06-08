@@ -17,6 +17,11 @@ def run(cmd: List[str], *, allow_nonzero: bool = False) -> subprocess.CompletedP
     return completed
 
 
+def log_stage(step: str, message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[STAGE {step}] {stamp} | {message}", flush=True)
+
+
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -43,6 +48,7 @@ def main() -> int:
     parser.add_argument("--target-per-type", type=int, default=330)
     parser.add_argument("--max-reviews", type=int, default=20)
     parser.add_argument("--recovery-passes", type=int, default=3)
+    parser.add_argument("--table", default="tv_retail_com")
     parser.add_argument("--commit-db", action="store_true")
     parser.add_argument("--skip-db", action="store_true")
     args = parser.parse_args()
@@ -51,7 +57,10 @@ def main() -> int:
     common_dir = project_root / "walmart" / "common"
     log_dir = project_root / "log"
     sample_csv = log_dir / "tv_retail_com_202606051111.csv"
-    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_started_at = datetime.now()
+    run_id = args.run_id or run_started_at.strftime("%Y%m%d_%H%M%S")
+    crawl_datetime = run_started_at.strftime("%Y-%m-%d %H:%M:%S")
+    batch_id = f"t_w_{run_id}"
     base_out = log_dir / f"walmart_full_run_{run_id}"
     merged_out = log_dir / f"walmart_full_run_{run_id}_merged"
     python = sys.executable
@@ -63,6 +72,7 @@ def main() -> int:
     validator = common_dir / "walmart_db_shape_validator.py"
     inserter = common_dir / "walmart_db_insert_csv.py"
 
+    log_stage("1/8", f"listing collection start: main_pages={args.main_pages}, bsr_pages={args.bsr_pages}, target_per_type={args.target_per_type}")
     run([
         python, str(collector),
         "--project-root", str(project_root),
@@ -76,8 +86,10 @@ def main() -> int:
         "--retry-sleep", "2",
         "--between-pages", "0.8",
     ])
+    log_stage("2/8", "listing minimum check: require main>=300 and bsr>=100")
     assert_listing_minimums(base_out / "summary.json", min_main=300, min_bsr=100)
 
+    log_stage("3/8", f"detail/review collection start: max_reviews={args.max_reviews}, with_btf=true")
     run([
         python, str(collector),
         "--project-root", str(project_root),
@@ -96,6 +108,7 @@ def main() -> int:
 
     chunk_dirs: List[Path] = []
     for pass_no in range(1, args.recovery_passes + 1):
+        log_stage("4/8", f"recovery audit pass {pass_no}/{args.recovery_passes}")
         audit_cmd = [python, str(audit), "--base-dir", str(base_out)]
         for chunk_dir in chunk_dirs:
             audit_cmd.extend(["--chunk-dir", str(chunk_dir)])
@@ -107,6 +120,7 @@ def main() -> int:
             break
         missing_seed = base_out / "missing_seed.csv"
         chunk_out = log_dir / f"walmart_full_run_{run_id}_missing{pass_no}"
+        log_stage("4/8", f"recovery collection pass {pass_no}/{args.recovery_passes}: retry missing detail/review rows")
         run([
             python, str(collector),
             "--project-root", str(project_root),
@@ -131,12 +145,22 @@ def main() -> int:
     merge_cmd = [python, str(merge), "--base-dir", str(base_out), "--out-dir", str(merged_out)]
     for chunk_dir in chunk_dirs:
         merge_cmd.extend(["--chunk-dir", str(chunk_dir)])
+    log_stage("5/8", "merge base and recovery chunks")
     run(merge_cmd)
 
-    run([python, str(transform), "--out-dir", str(merged_out)])
+    log_stage("6/8", f"normalize to DB insert shape: batch_id={batch_id}, account_name=Walmart, country=SEA")
+    run([
+        python, str(transform),
+        "--out-dir", str(merged_out),
+        "--crawl-datetime", crawl_datetime,
+        "--account-name", "Walmart",
+        "--batch-id", batch_id,
+        "--country", "SEA",
+    ])
 
     target_csv = merged_out / "db_insert_review_items_wmart_dt_shape.csv"
     for idx in range(1, 4):
+        log_stage("7/8", f"validator pass {idx}/3 against sample CSV")
         run([
             python, str(validator),
             "--target-csv", str(target_csv),
@@ -146,11 +170,12 @@ def main() -> int:
         ])
 
     if not args.skip_db:
+        log_stage("8/8", f"DB insert start: table={args.table}, mode={'commit' if args.commit_db else 'dry_run'}")
         insert_cmd = [
             python, str(inserter),
             "--project-root", str(project_root),
             "--csv", str(target_csv),
-            "--table", "tv_retail_com",
+            "--table", args.table,
         ]
         if args.commit_db:
             insert_cmd.append("--commit")

@@ -52,6 +52,22 @@ def blank(value: Any) -> bool:
     return value is None or str(value).strip() == ""
 
 
+def current_calendar_week() -> str:
+    return f"w{datetime.now().isocalendar().week}"
+
+
+def calendar_week_from_datetime(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return current_calendar_week()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d_%H%M%S", "%Y%m%d%H%M%S"):
+        try:
+            return f"w{datetime.strptime(text, fmt).isocalendar().week}"
+        except ValueError:
+            continue
+    return current_calendar_week()
+
+
 def normalize_int_text(value: Any) -> str:
     if blank(value):
         return ""
@@ -157,7 +173,22 @@ def merge_detail(row: Dict[str, str], detail: Dict[str, str]) -> None:
             row[field] = detail[field]
 
 
-def transform_source(out_dir: Path, source_name: str, output_name: str, listing_by_item: Dict[str, Dict[str, str]], detail_by_item: Dict[str, Dict[str, str]]) -> List[Dict[str, str]]:
+def apply_meta_defaults(row: Dict[str, str], meta_defaults: Dict[str, str]) -> None:
+    for field, value in meta_defaults.items():
+        if blank(row.get(field)) and value:
+            row[field] = value
+    if blank(row.get("calendar_week")):
+        row["calendar_week"] = meta_defaults.get("calendar_week") or current_calendar_week()
+
+
+def transform_source(
+    out_dir: Path,
+    source_name: str,
+    output_name: str,
+    listing_by_item: Dict[str, Dict[str, str]],
+    detail_by_item: Dict[str, Dict[str, str]],
+    meta_defaults: Dict[str, str],
+) -> List[Dict[str, str]]:
     rows = read_csv(out_dir / source_name)
     allowed = set(listing_by_item)
     out: List[Dict[str, str]] = []
@@ -169,6 +200,7 @@ def transform_source(out_dir: Path, source_name: str, output_name: str, listing_
         merge_listing(norm, listing_by_item.get(item, {}))
         if source_name.startswith("db_insert_review"):
             merge_detail(norm, detail_by_item.get(item, {}))
+        apply_meta_defaults(norm, meta_defaults)
         norm = normalize_row(norm)
         out.append(norm)
     write_csv(out_dir / output_name, out, EXPECTED_DB_COLUMNS)
@@ -178,13 +210,24 @@ def transform_source(out_dir: Path, source_name: str, output_name: str, listing_
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--crawl-datetime", default="")
+    parser.add_argument("--account-name", default="Walmart")
+    parser.add_argument("--batch-id", default="")
+    parser.add_argument("--country", default="SEA")
     args = parser.parse_args()
     out_dir = args.out_dir.resolve()
+    meta_defaults = {
+        "crawl_datetime": args.crawl_datetime,
+        "account_name": args.account_name,
+        "batch_id": args.batch_id,
+        "country": args.country,
+        "calendar_week": calendar_week_from_datetime(args.crawl_datetime),
+    }
     listing_by_item = build_listing_fallback(out_dir)
     detail_rows = [normalize_row(row) for row in read_csv(out_dir / "db_insert_detail_items.csv")]
     detail_by_item = {row.get("item", ""): row for row in detail_rows if row.get("item")}
-    review_out = transform_source(out_dir, "db_insert_review_items.csv", "db_insert_review_items_wmart_dt_shape.csv", listing_by_item, detail_by_item)
-    detail_out = transform_source(out_dir, "db_insert_detail_items.csv", "db_insert_detail_items_wmart_dt_shape.csv", listing_by_item, {})
+    review_out = transform_source(out_dir, "db_insert_review_items.csv", "db_insert_review_items_wmart_dt_shape.csv", listing_by_item, detail_by_item, meta_defaults)
+    detail_out = transform_source(out_dir, "db_insert_detail_items.csv", "db_insert_detail_items_wmart_dt_shape.csv", listing_by_item, {}, meta_defaults)
     report = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "out_dir": str(out_dir),
