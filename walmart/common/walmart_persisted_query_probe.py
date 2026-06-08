@@ -6,7 +6,9 @@ import argparse
 import csv
 import gzip
 import json
+import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -86,6 +88,12 @@ def find_seed(seed_path: Path, contains: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def ssl_context() -> Optional[ssl.SSLContext]:
+    if os.environ.get("WALMART_SSL_NO_VERIFY") == "1":
+        return ssl._create_unverified_context()
+    return None
+
+
 def request_json(
     label: str,
     method: str,
@@ -105,7 +113,7 @@ def request_json(
     status = None
     reason = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             status = resp.status
             reason = getattr(resp, "reason", "")
             raw = resp.read()

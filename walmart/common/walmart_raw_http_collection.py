@@ -11,7 +11,9 @@ import csv
 import copy
 import gzip
 import json
+import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -68,6 +70,12 @@ def setup_project_imports(project_root: Path) -> None:
     sys.path.insert(0, str(project_root / "walmart" / "common"))
 
 
+def ssl_context() -> Optional[ssl.SSLContext]:
+    if os.environ.get("WALMART_SSL_NO_VERIFY") == "1":
+        return ssl._create_unverified_context()
+    return None
+
+
 def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, Any]:
     headers = {
         "User-Agent": (
@@ -90,7 +98,7 @@ def fetch_html(url: str, timeout: int, retries: int, sleep: float) -> Dict[str, 
         error = ""
         try:
             req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
                 status = resp.status
                 reason = getattr(resp, "reason", "")
                 final_url = resp.url
