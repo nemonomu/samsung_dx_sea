@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
@@ -31,17 +32,27 @@ def require_file(path: Path, message: str) -> None:
         raise SystemExit(f"{message}: {path}")
 
 
-def assert_listing_minimums(summary_path: Path, min_main: int = 300, min_bsr: int = 100) -> None:
+def assert_listing_minimums(summary_path: Path, min_main: int = 300, min_bsr: int = 100) -> dict:
     summary = read_json(summary_path)
     listing = summary.get("listing") or {}
     by_type = listing.get("by_type") or {}
+    combined = listing.get("combined") or {}
     main_count = int((by_type.get("main") or {}).get("accepted_items") or 0)
     bsr_count = int((by_type.get("bsr") or {}).get("accepted_items") or 0)
+    unique_items = int(combined.get("unique_items") or 0)
     if main_count < min_main or bsr_count < min_bsr:
         raise SystemExit(
             f"Listing minimum not met: main accepted={main_count}/{min_main}, "
             f"bsr accepted={bsr_count}/{min_bsr}. Increase listing pages or review listing source URLs."
         )
+    return {"main_count": main_count, "bsr_count": bsr_count, "unique_items": unique_items}
+
+
+def count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        return sum(1 for _ in csv.DictReader(fh))
 
 
 def main() -> int:
@@ -95,9 +106,21 @@ def main() -> int:
         "--between-pages", "0.8",
     ])
     log_stage("2/8", "listing minimum check: require main>=300 and bsr>=100")
-    assert_listing_minimums(base_out / "summary.json", min_main=300, min_bsr=100)
+    listing_counts = assert_listing_minimums(base_out / "summary.json", min_main=300, min_bsr=100)
+    seed_count = count_csv_rows(base_out / "all_unique_items.csv")
+    print(
+        f"[CHECK] listing accepted main={listing_counts['main_count']} bsr={listing_counts['bsr_count']} "
+        f"unique_items={listing_counts['unique_items']} detail_review_seed_rows={seed_count}",
+        flush=True,
+    )
+    print(
+        "[CHECK] detail/review expected workload: "
+        f"detail~{seed_count}, review~{seed_count} to {seed_count * 2}, btf up to {seed_count}; "
+        "runtime depends on Walmart response time, review p2 count, BTF fallback count, retries, and sleeps.",
+        flush=True,
+    )
 
-    log_stage("3/8", f"detail/review collection start: max_reviews={args.max_reviews}, with_btf=true")
+    log_stage("3/8", f"detail/review collection start: seed_rows={seed_count}, max_reviews={args.max_reviews}, with_btf=true")
     run([
         python, str(collector),
         "--project-root", str(project_root),
@@ -111,6 +134,8 @@ def main() -> int:
         "--retry-sleep", "5",
         "--between-pages", "1.2",
         "--between-items", "1.2",
+        "--progress-every", "1",
+        "--flush-every", "10",
         "--with-btf",
     ])
 

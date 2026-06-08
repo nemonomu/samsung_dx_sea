@@ -37,6 +37,17 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def read_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
@@ -706,8 +717,54 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
     review_rows: List[Dict[str, Any]] = []
     item_summaries: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    total_items = len(seeds)
+    stage_started = time.perf_counter()
+    progress = {
+        "detail_ok": 0,
+        "detail_fail": 0,
+        "review_ok": 0,
+        "review_fail": 0,
+        "review_pages_attempted": 0,
+        "review_pages_ok": 0,
+        "review_fallback_attempts": 0,
+        "btf_calls": 0,
+        "btf_ok": 0,
+        "btf_similar_hit": 0,
+        "html_similar_hit": 0,
+    }
+
+    print(
+        "[detail-review start] "
+        f"seed={seed} total_items={total_items} max_reviews={args.max_reviews} "
+        f"with_btf={args.with_btf} between_pages={args.between_pages}s "
+        f"between_items={args.between_items}s progress_every={args.progress_every}",
+        flush=True,
+    )
+
+    def print_progress(offset: int, item: str, item_elapsed: Optional[float] = None) -> None:
+        elapsed = time.perf_counter() - stage_started
+        done = max(1, offset - args.start)
+        remaining = max(0, total_items - done)
+        avg = elapsed / done
+        eta = avg * remaining
+        pct = (done / total_items * 100) if total_items else 100.0
+        item_part = f" item_elapsed={format_duration(item_elapsed)}" if item_elapsed is not None else ""
+        print(
+            "[detail-review progress] "
+            f"item={offset}/{args.start + total_items} done={done}/{total_items} ({pct:.1f}%) "
+            f"sku={item}{item_part} elapsed={format_duration(elapsed)} "
+            f"avg_per_item={avg:.1f}s eta={format_duration(eta)} "
+            f"detail_ok={progress['detail_ok']} detail_fail={progress['detail_fail']} "
+            f"review_ok={progress['review_ok']} review_fail={progress['review_fail']} "
+            f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
+            f"btf={progress['btf_ok']}/{progress['btf_calls']} "
+            f"similar_hit=html:{progress['html_similar_hit']} btf:{progress['btf_similar_hit']} "
+            f"failures={len(failures)}",
+            flush=True,
+        )
 
     for offset, seed_row in enumerate(seeds, args.start + 1):
+        item_started = time.perf_counter()
         product_url = seed_row.get("product_url") or ""
         item = seed_row.get("item") or item_from_url(product_url)
         if not item or not product_url:
@@ -716,7 +773,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         item_dir = raw_dir / str(item)
         item_summary: Dict[str, Any] = {"index": offset, "item": item, "product_url": product_url}
 
-        print(f"[detail {item}] GET {product_url}")
+        print(f"[detail {offset}/{args.start + total_items} {item}] GET {product_url}", flush=True)
         detail_result = fetch_html(product_url, args.timeout, args.retries, args.retry_sleep)
         detail_html = detail_result.pop("html", "")
         detail_next = extract_next_data(detail_html) if detail_result["has_next_data"] else None
@@ -733,25 +790,34 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                 drow["seed_product_url"] = product_url
                 similar_names = similar_names_from_rendered_html(detail_html)
                 if similar_names:
+                    progress["html_similar_hit"] += 1
                     drow["retailer_sku_name_similar"] = " ||| ".join(similar_names[: args.similar_limit])
                 elif args.with_btf:
+                    progress["btf_calls"] += 1
+                    btf_started = time.perf_counter()
                     btf_result = fetch_btf(project_root, item, product_url, args.timeout, detail_next)
                     item_summary["btf_meta"] = btf_result["meta"]
+                    item_summary["btf_elapsed_sec"] = round(time.perf_counter() - btf_started, 2)
                     if btf_result["data"] is not None:
+                        progress["btf_ok"] += 1
                         write_json(item_dir / "btf_response.json", btf_result["data"])
                         similar_names = similar_names_from_btf_response(btf_result["data"])
                         item_summary["btf_similar_count"] = len(similar_names)
                         if similar_names:
+                            progress["btf_similar_hit"] += 1
                             drow["retailer_sku_name_similar"] = " ||| ".join(similar_names[: args.similar_limit])
                 detail_rows.append(drow)
                 item_summary["detail_ok"] = True
                 item_summary["count_of_reviews"] = drow.get("count_of_reviews")
+                progress["detail_ok"] += 1
             except Exception as exc:
                 failures.append({"index": offset, "item": item, "stage": "detail_parse", "error": str(exc)})
                 item_summary["detail_ok"] = False
+                progress["detail_fail"] += 1
         else:
             failures.append({"index": offset, "item": item, "stage": "detail_fetch", "error": detail_result.get("error")})
             item_summary["detail_ok"] = False
+            progress["detail_fail"] += 1
         item_summary["detail_meta"] = {k: v for k, v in detail_result.items() if k != "url"}
 
         if not args.skip_reviews:
@@ -760,8 +826,10 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
             urls = [review_url(item) or f"https://www.walmart.com/reviews/product/{item}"]
             if review_count is None or review_count > 10:
                 urls.append(page2_review_url(item))
+            item_summary["review_pages_planned"] = len(urls)
             for page_index, review_page_url in enumerate(urls, 1):
-                print(f"[review {item} p{page_index}] GET {review_page_url}")
+                print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
+                progress["review_pages_attempted"] += 1
                 review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep)
                 review_html = review_result.pop("html", "")
                 review_next = extract_next_data(review_html) if review_result["has_next_data"] else None
@@ -775,6 +843,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                     for fallback_url in page2_review_fallback_urls(item):
                         if fallback_url == review_page_url:
                             continue
+                        progress["review_fallback_attempts"] += 1
                         fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep)
                         fallback_html = fallback_result.pop("html", "")
                         fallback_next = (
@@ -789,6 +858,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                     item_dir.mkdir(parents=True, exist_ok=True)
                     (item_dir / f"review_p{page_index}.html").write_text(review_html, encoding="utf-8", errors="replace")
                 if review_next is not None:
+                    progress["review_pages_ok"] += 1
                     write_json(item_dir / f"review_p{page_index}_next_data.json", review_next)
                     review_nexts.append(review_next)
                 else:
@@ -823,23 +893,50 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
                     item_summary["review_ok"] = True
                     item_summary["review_pages_loaded"] = rrow.get("review_pages_loaded")
                     item_summary["review_extracted_count"] = rrow.get("review_extracted_count")
+                    progress["review_ok"] += 1
                 except Exception as exc:
                     failures.append({"index": offset, "item": item, "stage": "review_parse", "error": str(exc)})
                     item_summary["review_ok"] = False
+                    progress["review_fail"] += 1
+            else:
+                item_summary["review_ok"] = False
+                progress["review_fail"] += 1
         item_summaries.append(item_summary)
-        write_csv(out_dir / "detail_items_probe_raw.csv", detail_rows)
-        write_csv(out_dir / "review_items_probe_raw.csv", review_rows)
-        write_json(out_dir / "detail_review_summary.json", {"items": item_summaries, "failures": failures})
+        if args.flush_every and (len(item_summaries) % args.flush_every == 0):
+            write_csv(out_dir / "detail_items_probe_raw.csv", detail_rows)
+            write_csv(out_dir / "review_items_probe_raw.csv", review_rows)
+            write_json(out_dir / "detail_review_summary.json", {"items": item_summaries, "failures": failures, "progress": progress})
+        item_elapsed = time.perf_counter() - item_started
+        if args.progress_every and (len(item_summaries) % args.progress_every == 0):
+            print_progress(offset, str(item), item_elapsed)
         time.sleep(args.between_items)
 
+    write_csv(out_dir / "detail_items_probe_raw.csv", detail_rows)
+    write_csv(out_dir / "review_items_probe_raw.csv", review_rows)
+    write_json(out_dir / "detail_review_summary.json", {"items": item_summaries, "failures": failures, "progress": progress})
     write_csv(out_dir / "detail_items.csv", detail_rows)
     write_csv(out_dir / "review_items.csv", review_rows)
+    elapsed_total = time.perf_counter() - stage_started
+    print(
+        "[detail-review complete] "
+        f"items={len(item_summaries)}/{total_items} elapsed={format_duration(elapsed_total)} "
+        f"avg_per_item={(elapsed_total / max(1, len(item_summaries))):.1f}s "
+        f"detail_rows={len(detail_rows)} review_rows={len(review_rows)} "
+        f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
+        f"review_fallback_attempts={progress['review_fallback_attempts']} "
+        f"btf={progress['btf_ok']}/{progress['btf_calls']} "
+        f"similar_hit=html:{progress['html_similar_hit']} btf:{progress['btf_similar_hit']} "
+        f"failures={len(failures)}",
+        flush=True,
+    )
     return {
         "seed": str(seed),
         "detail_rows": len(detail_rows),
         "review_rows": len(review_rows),
         "failures": failures,
         "items": item_summaries,
+        "progress": progress,
+        "elapsed_sec": round(elapsed_total, 2),
     }
 
 
@@ -998,6 +1095,8 @@ def main() -> int:
     parser.add_argument("--skip-reviews", action="store_true")
     parser.add_argument("--with-btf", action="store_true", help="Supplement detail rows with ItemByIdBtf GraphQL modules")
     parser.add_argument("--similar-limit", type=int, default=20)
+    parser.add_argument("--progress-every", type=int, default=1, help="Print detail/review progress every N completed items")
+    parser.add_argument("--flush-every", type=int, default=10, help="Flush probe CSV/summary every N completed items")
     args = parser.parse_args()
 
     project_root = args.project_root.resolve()
