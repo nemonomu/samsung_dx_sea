@@ -727,6 +727,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         "review_pages_attempted": 0,
         "review_pages_ok": 0,
         "review_fallback_attempts": 0,
+        "review_skipped_zero": 0,
         "btf_calls": 0,
         "btf_ok": 0,
         "btf_similar_hit": 0,
@@ -757,6 +758,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
             f"detail_ok={progress['detail_ok']} detail_fail={progress['detail_fail']} "
             f"review_ok={progress['review_ok']} review_fail={progress['review_fail']} "
             f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
+            f"review_skipped_zero={progress['review_skipped_zero']} "
             f"btf={progress['btf_ok']}/{progress['btf_calls']} "
             f"similar_hit=html:{progress['html_similar_hit']} btf:{progress['btf_similar_hit']} "
             f"failures={len(failures)}",
@@ -823,84 +825,111 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         if not args.skip_reviews:
             review_nexts: List[Dict[str, Any]] = []
             review_count = safe_int(item_summary.get("count_of_reviews"))
-            urls = [review_url(item) or f"https://www.walmart.com/reviews/product/{item}"]
-            if review_count is None or review_count > 10:
-                urls.append(page2_review_url(item))
-            item_summary["review_pages_planned"] = len(urls)
-            for page_index, review_page_url in enumerate(urls, 1):
-                print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
-                progress["review_pages_attempted"] += 1
-                review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep)
-                review_html = review_result.pop("html", "")
-                review_next = extract_next_data(review_html) if review_result["has_next_data"] else None
-                if (
-                    review_next is not None
-                    and page_index > 1
-                    and safe_int(item_summary.get("count_of_reviews"))
-                    and safe_int(item_summary.get("count_of_reviews")) > 10
-                    and review_count_from_next(review_next) == 0
-                ):
-                    for fallback_url in page2_review_fallback_urls(item):
-                        if fallback_url == review_page_url:
-                            continue
-                        progress["review_fallback_attempts"] += 1
-                        fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep)
-                        fallback_html = fallback_result.pop("html", "")
-                        fallback_next = (
-                            extract_next_data(fallback_html) if fallback_result["has_next_data"] else None
-                        )
-                        if review_count_from_next(fallback_next) > 0:
-                            review_result = fallback_result
-                            review_next = fallback_next
-                            item_summary[f"review_p{page_index}_fallback_url"] = fallback_url
-                            break
-                if args.save_html:
-                    item_dir.mkdir(parents=True, exist_ok=True)
-                    (item_dir / f"review_p{page_index}.html").write_text(review_html, encoding="utf-8", errors="replace")
-                if review_next is not None:
-                    progress["review_pages_ok"] += 1
-                    write_json(item_dir / f"review_p{page_index}_next_data.json", review_next)
-                    review_nexts.append(review_next)
-                else:
-                    failures.append(
-                        {
-                            "index": offset,
-                            "item": item,
-                            "stage": f"review_p{page_index}_fetch",
-                            "error": review_result.get("error"),
-                        }
-                    )
-                item_summary[f"review_p{page_index}_meta"] = {k: v for k, v in review_result.items() if k != "url"}
-                time.sleep(args.between_pages)
-            if review_nexts:
-                try:
-                    rrow = clean_row_values(review_collection_row(review_nexts, args.max_reviews))
-                    apply_listing_context(rrow, seed_row)
-                    detail_context = (
-                        detail_rows[-1]
-                        if detail_rows and str(detail_rows[-1].get("item")) == str(item)
-                        else {}
-                    )
-                    apply_detail_context(rrow, detail_context)
-                    fill_screen_size_fallback(rrow)
+            if review_count == 0:
+                detail_context = (
+                    detail_rows[-1]
+                    if detail_rows and str(detail_rows[-1].get("item")) == str(item)
+                    else {}
+                )
+                if detail_context:
+                    rrow = dict(detail_context)
                     rrow["seed_index"] = offset
                     rrow["seed_product_url"] = product_url
-                    if detail_context:
-                        similar = detail_context.get("retailer_sku_name_similar")
-                        if similar:
-                            rrow["retailer_sku_name_similar"] = similar
+                    rrow["review_pages_loaded"] = 0
+                    rrow["review_extracted_count"] = 0
+                    rrow["detailed_review_content"] = ""
                     review_rows.append(rrow)
                     item_summary["review_ok"] = True
-                    item_summary["review_pages_loaded"] = rrow.get("review_pages_loaded")
-                    item_summary["review_extracted_count"] = rrow.get("review_extracted_count")
+                    item_summary["review_pages_planned"] = 0
+                    item_summary["review_pages_loaded"] = 0
+                    item_summary["review_extracted_count"] = 0
+                    item_summary["review_skip_reason"] = "count_of_reviews=0"
+                    progress["review_skipped_zero"] += 1
                     progress["review_ok"] += 1
-                except Exception as exc:
-                    failures.append({"index": offset, "item": item, "stage": "review_parse", "error": str(exc)})
+                    print(f"[review {offset}/{args.start + total_items} {item}] SKIP count_of_reviews=0", flush=True)
+                else:
                     item_summary["review_ok"] = False
+                    item_summary["review_skip_reason"] = "count_of_reviews=0 but detail_context_missing"
                     progress["review_fail"] += 1
             else:
-                item_summary["review_ok"] = False
-                progress["review_fail"] += 1
+                urls = [review_url(item) or f"https://www.walmart.com/reviews/product/{item}"]
+                if review_count is None or review_count > 10:
+                    urls.append(page2_review_url(item))
+                item_summary["review_pages_planned"] = len(urls)
+                for page_index, review_page_url in enumerate(urls, 1):
+                    print(f"[review {offset}/{args.start + total_items} {item} p{page_index}/{len(urls)}] GET {review_page_url}", flush=True)
+                    progress["review_pages_attempted"] += 1
+                    review_result = fetch_html(review_page_url, args.timeout, args.retries, args.retry_sleep)
+                    review_html = review_result.pop("html", "")
+                    review_next = extract_next_data(review_html) if review_result["has_next_data"] else None
+                    if (
+                        review_next is not None
+                        and page_index > 1
+                        and safe_int(item_summary.get("count_of_reviews"))
+                        and safe_int(item_summary.get("count_of_reviews")) > 10
+                        and review_count_from_next(review_next) == 0
+                    ):
+                        for fallback_url in page2_review_fallback_urls(item):
+                            if fallback_url == review_page_url:
+                                continue
+                            progress["review_fallback_attempts"] += 1
+                            fallback_result = fetch_html(fallback_url, args.timeout, args.retries, args.retry_sleep)
+                            fallback_html = fallback_result.pop("html", "")
+                            fallback_next = (
+                                extract_next_data(fallback_html) if fallback_result["has_next_data"] else None
+                            )
+                            if review_count_from_next(fallback_next) > 0:
+                                review_result = fallback_result
+                                review_next = fallback_next
+                                item_summary[f"review_p{page_index}_fallback_url"] = fallback_url
+                                break
+                    if args.save_html:
+                        item_dir.mkdir(parents=True, exist_ok=True)
+                        (item_dir / f"review_p{page_index}.html").write_text(review_html, encoding="utf-8", errors="replace")
+                    if review_next is not None:
+                        progress["review_pages_ok"] += 1
+                        write_json(item_dir / f"review_p{page_index}_next_data.json", review_next)
+                        review_nexts.append(review_next)
+                    else:
+                        failures.append(
+                            {
+                                "index": offset,
+                                "item": item,
+                                "stage": f"review_p{page_index}_fetch",
+                                "error": review_result.get("error"),
+                            }
+                        )
+                    item_summary[f"review_p{page_index}_meta"] = {k: v for k, v in review_result.items() if k != "url"}
+                    time.sleep(args.between_pages)
+                if review_nexts:
+                    try:
+                        rrow = clean_row_values(review_collection_row(review_nexts, args.max_reviews))
+                        apply_listing_context(rrow, seed_row)
+                        detail_context = (
+                            detail_rows[-1]
+                            if detail_rows and str(detail_rows[-1].get("item")) == str(item)
+                            else {}
+                        )
+                        apply_detail_context(rrow, detail_context)
+                        fill_screen_size_fallback(rrow)
+                        rrow["seed_index"] = offset
+                        rrow["seed_product_url"] = product_url
+                        if detail_context:
+                            similar = detail_context.get("retailer_sku_name_similar")
+                            if similar:
+                                rrow["retailer_sku_name_similar"] = similar
+                        review_rows.append(rrow)
+                        item_summary["review_ok"] = True
+                        item_summary["review_pages_loaded"] = rrow.get("review_pages_loaded")
+                        item_summary["review_extracted_count"] = rrow.get("review_extracted_count")
+                        progress["review_ok"] += 1
+                    except Exception as exc:
+                        failures.append({"index": offset, "item": item, "stage": "review_parse", "error": str(exc)})
+                        item_summary["review_ok"] = False
+                        progress["review_fail"] += 1
+                else:
+                    item_summary["review_ok"] = False
+                    progress["review_fail"] += 1
         item_summaries.append(item_summary)
         if args.flush_every and (len(item_summaries) % args.flush_every == 0):
             write_csv(out_dir / "detail_items_probe_raw.csv", detail_rows)
@@ -923,6 +952,7 @@ def run_detail_review(args: argparse.Namespace, project_root: Path, out_dir: Pat
         f"avg_per_item={(elapsed_total / max(1, len(item_summaries))):.1f}s "
         f"detail_rows={len(detail_rows)} review_rows={len(review_rows)} "
         f"review_pages={progress['review_pages_ok']}/{progress['review_pages_attempted']} "
+        f"review_skipped_zero={progress['review_skipped_zero']} "
         f"review_fallback_attempts={progress['review_fallback_attempts']} "
         f"btf={progress['btf_ok']}/{progress['btf_calls']} "
         f"similar_hit=html:{progress['html_similar_hit']} btf:{progress['btf_similar_hit']} "

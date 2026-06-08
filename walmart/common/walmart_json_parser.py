@@ -517,6 +517,7 @@ def detail_row(next_data: Dict[str, Any], max_reviews: int = 20) -> Dict[str, An
     specs = specs_map(idml)
 
     row = item_row(product, page_type="detail")
+    text_review_count = review_text_count(reviews)
     row.update(
         {
             "item": text(product.get("usItemId") or product.get("primaryProductId") or row.get("item")),
@@ -529,7 +530,7 @@ def detail_row(next_data: Dict[str, Any], max_reviews: int = 20) -> Dict[str, An
             "refresh_rate": first_spec(specs, "refresh rate"),
             "model_year": first_spec(specs, "model year") or row.get("model_year"),
             "count_of_star_ratings": review_rating_count(reviews),
-            "count_of_reviews": review_text_count(reviews) or row.get("count_of_reviews"),
+            "count_of_reviews": text_review_count if text_review_count is not None else row.get("count_of_reviews"),
             "star_rating": review_display_rating(reviews, row.get("star_rating")),
             "reviews_with_text_count": reviews.get("reviewsWithTextCount"),
             "recommended_percentage": reviews.get("recommendedPercentage"),
@@ -556,7 +557,8 @@ def review_collection_row(next_datas: List[Dict[str, Any]], max_reviews: int = 2
     first_data = review_page_data(next_datas[0]) if next_datas else {}
     product = first_data.get("product") or {}
     first_reviews = first_data.get("reviews") or {}
-    total_reviews = review_text_count(first_reviews) or first_reviews.get("totalReviewCount")
+    text_review_count = review_text_count(first_reviews)
+    total_reviews = text_review_count if text_review_count is not None else first_reviews.get("totalReviewCount")
     try:
         target_reviews = min(int(total_reviews), max_reviews) if total_reviews is not None else max_reviews
     except (TypeError, ValueError):
