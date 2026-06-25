@@ -1,15 +1,94 @@
+# Configuration files with sensitive information
+config.py
+
+# Python cache
 __pycache__/
 *.py[cod]
-.venv/
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 venv/
+ENV/
 env/
+.venv
 
-config.py
-*.env
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-log/
-raw/
-*.html
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# SQL files
+*.sql
+
+# Cookies and session files
+*.pkl
+*_cookies.pkl
+*_storage_state.json
+walmart_storage_state.json
+cookies/
+amazon/cookies/
+
+# Screenshots and debug files
+capture/
+*/capture/
+amazon/capture/
+bestbuy/capture/
+walmart/capture/
+hhp/walmart/capture/
+capture_error/
+*/capture_error/
+walmart/capture_error/
+hhp/walmart/capture_error/
+captcha_screen_*.png
+walmart_robot_page_*.html
+login_page_debug.html
+
+# CSV exports
 *.csv
-*.xlsx
-*.jsonl
+
+# Text dumps
+*.txt
+!requirements.txt
+
+# Internal documentation (PRD files)
+*_PRD.md
+graphql_scraping_guide.md
+
+# Market XML responses
+market/xml/
+
+

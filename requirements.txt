@@ -1,6 +1,27 @@
-selenium
-webdriver-manager
-psycopg2-binary
-lxml
-pandas
-openpyxl
+# Web Scraping
+selenium>=4.0.0
+lxml>=4.9.0
+playwright>=1.40.0
+DrissionPage>=4.0.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# WebDriver Management
+webdriver-manager>=4.0.0
+
+# Utilities
+pytz>=2023.3
+pyautogui>=0.9.54
+
+# AI / LLM
+openai>=1.0.0
+
+# Data Processing
+pandas>=2.0.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# IMF Data API
+sdmx1>=2.0.0
