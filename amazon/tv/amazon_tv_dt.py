@@ -690,6 +690,10 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         if not item:
             return
 
+        if not self.ensure_db_connection():
+            print(f"[ERROR] upsert_item_mst skipped (no DB): {item}")
+            return
+
         try:
             cursor = self.db_conn.cursor()
             new_sku = product.get('sku') or 'no sku'
@@ -758,7 +762,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
         except Exception as e:
             print(f"[ERROR] upsert_item_mst failed: {item}: {e}")
-            self.db_conn.rollback()
+            self.safe_rollback()
 
     def save_to_retail_com(self, product):
         """DB 저장: 1개씩 INSERT.
@@ -773,6 +777,9 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         if 'redirect' not in product:
             product['redirect'] = False
 
+        if not self.ensure_db_connection():
+            print(f"[ERROR] DB save skipped (no DB): {product.get('item')}")
+            return False
 
         try:
             cursor = self.db_conn.cursor()
@@ -808,7 +815,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         except Exception as e:
             print(f"[ERROR] DB save failed: {product.get('item')}: {e}")
             traceback.print_exc()
-            self.db_conn.rollback()
+            self.safe_rollback()
             return False
 
     # ========================================================================
@@ -820,6 +827,10 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     def get_tv_specs_from_mst(self, item):
         """마스터 테이블에서 TV 스펙 및 SKU 조회"""
         if not item:
+            return None, None
+
+        if not self.ensure_db_connection():
+            print("  [WARNING] get_tv_specs_from_mst skipped (no DB)")
             return None, None
 
         try:

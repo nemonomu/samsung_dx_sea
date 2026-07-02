@@ -142,6 +142,29 @@ class BaseCrawler:
                 traceback.print_exc()
                 return False
 
+    def ensure_db_connection(self):
+        """긴 크롤링 도중 PostgreSQL(RDS)이 idle/장시간 연결을 끊었으면 재연결한다.
+
+        RDS는 오래 살아있는(또는 유휴) 연결을 서버에서 끊는데, psycopg2는 다음 쿼리를
+        시도하기 전까지 conn.closed가 0으로 남아있을 수 있다. 따라서 직전 실패로 conn이
+        닫힌 뒤 이 메서드를 호출하면 재연결되어 이후 제품 처리가 이어진다.
+        """
+        try:
+            if self.db_conn and not self.db_conn.closed:
+                return True
+        except Exception:
+            pass
+        print("[WARNING] DB connection closed; reconnecting...")
+        return self.connect_db()
+
+    def safe_rollback(self):
+        """연결이 이미 죽은 상태에서 rollback()이 InterfaceError(2차 예외)를 던지는 것을 방지."""
+        try:
+            if self.db_conn and not self.db_conn.closed:
+                self.db_conn.rollback()
+        except Exception:
+            pass
+
     @staticmethod
     def fetch_today_batch_ids(table_name, account_name, test_mode=False):
         """오늘 날짜의 batch_id 목록 조회.
