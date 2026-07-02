@@ -394,21 +394,37 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         return True
 
     def load_product_list(self):
-        """amazon_tv_product_list 테이블에서 제품 URL 및 기본 정보 조회"""
+        """amazon_tv_product_list 테이블에서 제품 URL 및 기본 정보 조회.
+
+        같은 batch로 이미 tv_retail_com에 저장된 product_url은 제외한다(skip-existing).
+        - 신규 런: 해당 batch 저장 행이 없어 no-op → 전체 로드
+        - 재개(--resume-from detail 같은 batch_id): 이미 저장된 제품은 건너뛰고 누락분만
+          처리 → 중복 INSERT 없이 중단 지점부터 이어받기.
+        """
+        if not self.ensure_db_connection():
+            print("[ERROR] load_product_list: no DB connection")
+            return []
         try:
             cursor = self.db_conn.cursor()
 
-            query = """
+            retail_table = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
+            query = f"""
                 SELECT
-                    retailer_sku_name,
-                    fastest_delivery,
-                    delivery_availability, number_of_units_purchased_past_month,
-                    available_quantity_for_purchase,
-                    main_rank, bsr_rank, product_url, calendar_week,
-                    crawl_datetime, page_type
-                FROM amazon_tv_product_list
-                WHERE account_name = %s AND batch_id = %s AND product_url IS NOT NULL
-                ORDER BY id
+                    pl.retailer_sku_name,
+                    pl.fastest_delivery,
+                    pl.delivery_availability, pl.number_of_units_purchased_past_month,
+                    pl.available_quantity_for_purchase,
+                    pl.main_rank, pl.bsr_rank, pl.product_url, pl.calendar_week,
+                    pl.crawl_datetime, pl.page_type
+                FROM amazon_tv_product_list pl
+                WHERE pl.account_name = %s AND pl.batch_id = %s AND pl.product_url IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {retail_table} rc
+                      WHERE rc.account_name = pl.account_name
+                        AND rc.batch_id = pl.batch_id
+                        AND rc.product_url = pl.product_url
+                  )
+                ORDER BY pl.id
             """
 
             cursor.execute(query, (self.account_name, self.batch_id))
@@ -433,7 +449,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 }
                 product_list.append(product)
 
-            print(f"[INFO] Loaded {len(product_list)} products")
+            print(f"[INFO] Loaded {len(product_list)} products to crawl (already-saved in this batch excluded)")
             return product_list
 
         except Exception as e:
