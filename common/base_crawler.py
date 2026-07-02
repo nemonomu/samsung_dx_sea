@@ -1087,8 +1087,8 @@ class BaseCrawler:
     # ====================================================================
     # Cleanup target usage:
     # - base_crawler.py: called by setup_driver_stealth() for non-Amazon fallback
-    # - tv/amazon/amazon_tv_item_mst.py: AmazonTVItemMstCrawler.initialize()
-    # - hhp/amazon/amazon_hhp_item.py: AmazonItemCrawler.initialize()
+    # - amazon/tv/amazon_tv_item_mst.py: AmazonTVItemMstCrawler.initialize()
+    # - amazon/hhp/amazon_hhp_item.py: AmazonItemCrawler.initialize()
     def setup_driver(self):
         """
         Chrome WebDriver 설정 및 초기화
@@ -1147,9 +1147,9 @@ class BaseCrawler:
         print("[SUCCESS] WebDriver setup complete")
 
     # Cleanup target usage:
-    # - hhp/amazon/amazon_hhp_main.py: initialize(), restart_browser()
-    # - hhp/amazon/amazon_hhp_bsr.py: initialize(), restart_browser()
-    # - hhp/amazon/amazon_hhp_dt_update.py: initialize(), restart_driver()
+    # - amazon/hhp/amazon_hhp_main.py: initialize(), restart_browser()
+    # - amazon/hhp/amazon_hhp_bsr.py: initialize(), restart_browser()
+    # - amazon/hhp/amazon_hhp_dt_update.py: initialize(), restart_driver()
     def setup_driver_stealth(self, account_name='Amazon'):
         """
         강화된 봇 감지 회피 Chrome WebDriver 설정
@@ -1487,7 +1487,7 @@ class BaseCrawler:
             return False
 
     # Cleanup target usage:
-    # - hhp/amazon/amazon_hhp_dt_update.py: saves cookies during review crawling
+    # - amazon/hhp/amazon_hhp_dt_update.py: saves cookies during review crawling
     # - Mentioned in CLAUDE.md
     def save_cookies(self, account_name):
         """
@@ -1521,7 +1521,7 @@ class BaseCrawler:
             print(f"[WARNING] Failed to save cookies: {e}")
 
     # Cleanup target usage:
-    # - hhp/amazon/amazon_hhp_dt_update.py: initialize(), restart_driver()
+    # - amazon/hhp/amazon_hhp_dt_update.py: initialize(), restart_driver()
     # - Mentioned in CLAUDE.md
     def load_cookies(self, account_name, suffix=None):
         """

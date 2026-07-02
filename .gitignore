@@ -1,5 +1,8 @@
 # Configuration files with sensitive information
 config.py
+.env
+*.env
+.env.*
 
 # Python cache
 __pycache__/
