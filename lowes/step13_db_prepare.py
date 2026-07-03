@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from .step00_erd_schema import erd_field_order
 from .step00_config import (
     DEFAULT_LOWES_RUN_ROOT,
     db_config,
@@ -18,6 +19,14 @@ RUN_ROOT = Path(os.getenv("LOWES_RUN_ROOT", str(DEFAULT_LOWES_RUN_ROOT)))
 OUTPUT_ROOT = Path(os.getenv("LOWES_OUTPUT_ROOT", str(RUN_ROOT / "output")))
 TARGET_SCHEMA = os.getenv("LOWES_DB_SCHEMA", "public").strip() or "public"
 TARGET_TABLE = lowes_output_table()
+PRODUCT_TYPE = lowes_product_type().upper()
+TARGET_COLUMNS = erd_field_order(PRODUCT_TYPE)
+DRY_RUN = os.getenv("LOWES_DB_PREPARE_DRY_RUN", os.getenv("LOWES_DB_DRY_RUN", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 
 
 def now():
@@ -28,35 +37,51 @@ def quote_ident(value):
     return '"' + str(value).replace('"', '""') + '"'
 
 
+def existing_columns(cur):
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        """,
+        (TARGET_SCHEMA, TARGET_TABLE),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
 def ensure_table(cur):
     cur.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(TARGET_SCHEMA)}")
+    column_defs = []
+    for column_name in TARGET_COLUMNS:
+        data_type = "integer" if column_name in {"main_rank", "bsr_rank"} else "text"
+        column_defs.append(f"{quote_ident(column_name)} {data_type}")
+    column_sql = ",\n          ".join(column_defs)
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {quote_ident(TARGET_SCHEMA)}.{quote_ident(TARGET_TABLE)} (
           id bigserial PRIMARY KEY,
-          product_type varchar(20),
-          run_date varchar(8),
-          batch_id varchar(80),
-          omni_item_id text,
-          item_number text,
-          brand text,
-          model_id text,
-          main_rank integer,
-          bsr_rank integer,
-          final_target_rank integer,
-          product_url text,
-          retailer_sku_name text,
-          final_selling_price text,
-          final_price_source text,
-          row_json jsonb NOT NULL,
-          loaded_at timestamptz NOT NULL DEFAULT now()
+          {column_sql}
         )
         """
     )
+    columns = existing_columns(cur)
+    for column_name in TARGET_COLUMNS:
+        if column_name in columns or column_name == "id":
+            continue
+        if column_name in {"main_rank", "bsr_rank"}:
+            data_type = "integer"
+        else:
+            data_type = "text"
+        cur.execute(
+            f"""
+            ALTER TABLE {quote_ident(TARGET_SCHEMA)}.{quote_ident(TARGET_TABLE)}
+            ADD COLUMN IF NOT EXISTS {quote_ident(column_name)} {data_type}
+            """
+        )
     index_prefix = TARGET_TABLE[:45]
     indexes = [
         (f"idx_{index_prefix}_batch", "batch_id"),
-        (f"idx_{index_prefix}_omni", "omni_item_id"),
+        (f"idx_{index_prefix}_item", "item"),
         (f"idx_{index_prefix}_main_rank", "main_rank"),
     ]
     for index_name, column_name in indexes:
@@ -72,6 +97,29 @@ def ensure_table(cur):
 def main():
     started_at = now()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    if DRY_RUN:
+        manifest = {
+            "run_type": "step13_db_prepare",
+            "started_at": started_at,
+            "finished_at": now(),
+            "run_date": RUN_DATE,
+            "product_type": lowes_product_type().upper(),
+            "run_root": rel_path(RUN_ROOT),
+            "output_root": rel_path(OUTPUT_ROOT),
+            "schema": TARGET_SCHEMA,
+            "table": TARGET_TABLE,
+            "success": True,
+            "skipped": True,
+            "dry_run": True,
+            "planned_columns": TARGET_COLUMNS,
+        }
+        (OUTPUT_ROOT / "manifest_db_prepare.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+        return
+
     config = db_config()
     if not config:
         raise RuntimeError("DB_CONFIG is missing")
@@ -96,13 +144,14 @@ def main():
         "started_at": started_at,
         "finished_at": now(),
         "run_date": RUN_DATE,
-        "product_type": lowes_product_type().upper(),
+        "product_type": PRODUCT_TYPE,
         "run_root": rel_path(RUN_ROOT),
         "output_root": rel_path(OUTPUT_ROOT),
         "schema": TARGET_SCHEMA,
         "table": TARGET_TABLE,
         "success": True,
         "skipped": False,
+        "dry_run": False,
     }
     (OUTPUT_ROOT / "manifest_db_prepare.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),

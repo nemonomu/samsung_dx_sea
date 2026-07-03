@@ -26,26 +26,25 @@ class Step:
         return f"{self.number:02d}"
 
 
+MAIN_LIST_MODULE = os.getenv("LOWES_MAIN_LIST_MODULE", "lowes.lowes_main_list_uc_api").strip() or "lowes.lowes_main_list_uc_api"
+
+
 STEPS = [
-    Step(
-        1,
-        "main_list",
-        os.getenv("LOWES_MAIN_LIST_MODULE", "lowes.step01_main_list"),
-        env={"LOWES_MAIN_RUN_ID": "main"},
-    ),
+    Step(1, "main_list", MAIN_LIST_MODULE, env={"LOWES_MAIN_RUN_ID": "main"}),
     Step(2, "main_targets", "lowes.step02_main_targets", env={"LOWES_MAIN_RUN_ID": "main"}),
     Step(3, "bsr_list", "lowes.step03_bsr_list", env={"LOWES_BSR_RUN_ID": "bsr"}),
     Step(4, "bsr_rank", "lowes.step04_bsr_rank", env={"LOWES_BSR_RUN_ID": "bsr"}),
     Step(5, "promotion_deals", "lowes.step05_promotion_deals"),
     Step(6, "trending_deals", "lowes.step06_trending_deals"),
     Step(7, "final_targets", "lowes.step07_final_targets"),
-    Step(8, "detail_enrichment", "lowes.step08_detail_enrichment"),
-    Step(9, "review20", "lowes.step09_review20"),
+    Step(8, "detail_enrichment", "lowes.step08_uc_xhr"),
+    Step(9, "finalize", "lowes.step09_finalize"),
     Step(10, "status_check", "lowes.step10_status_check"),
     Step(11, "s3_sync", "lowes.step11_s3_sync"),
     Step(12, "local_cleanup", "lowes.step12_local_cleanup"),
     Step(13, "db_prepare", "lowes.step13_db_prepare"),
     Step(14, "db_load", "lowes.step14_db_load"),
+    Step(15, "email_notify", "lowes.step15_email_notify"),
 ]
 
 
@@ -93,12 +92,13 @@ def step_complete(step):
     if step.name == "final_targets":
         return csv_count(root / "output" / "lowes_final_targets.csv") > 0, "final targets"
     if step.name == "detail_enrichment":
-        return csv_count(root / "output" / "final_output.csv") > 0, "detail output"
-    if step.name in {"promotion_deals", "trending_deals", "review20"}:
+        return csv_count(root / "detail" / "parsed" / "detail_enriched_rows.csv") > 0, "detail enriched rows"
+    if step.name == "finalize":
+        return csv_count(root / "output" / "final_output.csv") > 0, "final output"
+    if step.name in {"promotion_deals", "trending_deals"}:
         manifest_name = {
             "promotion_deals": "promotion/manifest_promotion_deals.json",
             "trending_deals": "trending/manifest_trending_deals.json",
-            "review20": "detail/manifest_review20.json",
         }[step.name]
         manifest = read_json(root / manifest_name)
         return manifest.get("success") is True, manifest.get("skip_reason", step.name)
@@ -112,6 +112,8 @@ def step_complete(step):
         return False, "always ensure DB tables when selected"
     if step.name == "db_load":
         return False, "always load final outputs to DB when selected"
+    if step.name == "email_notify":
+        return False, "always send notification when selected"
     return False, "no completion rule"
 
 
@@ -134,7 +136,7 @@ def resume_steps():
             continue
         print(f"[todo] step {step.key} {step.name}: {reason}")
         selected.append(step)
-        if step.name not in {"status_check", "s3_sync", "local_cleanup", "db_prepare", "db_load"}:
+        if step.name not in {"status_check", "s3_sync", "local_cleanup", "db_prepare", "db_load", "email_notify"}:
             force_downstream = True
     return selected
 
@@ -160,8 +162,6 @@ def run_step(step, dry_run=False):
     env.setdefault("LOWES_RUN_ROOT", str(DEFAULT_LOWES_RUN_ROOT))
     env.update(step.env)
     module = step.module
-    if step.name == "main_list":
-        module = env.get("LOWES_MAIN_LIST_MODULE", module)
     command = [PYTHON, "-m", module]
     print(f"[run] step {step.key} {step.name}: {' '.join(command)}")
     print(f"      LOWES_RUN_ROOT={env.get('LOWES_RUN_ROOT')}")
@@ -194,15 +194,11 @@ def main():
     args = parser.parse_args()
 
     os.environ["LOWES_PRODUCT_TYPE"] = str(args.product_type).strip().upper()
-    os.environ.setdefault("LOWES_MAIN_LIST_MODULE", "lowes.lowes_main_list_uc_api")
-    os.environ.setdefault("LOWES_BSR_TRANSPORT", "uc_first")
-    os.environ.setdefault("LOWES_BSR_FALLBACK_ZENROWS", "1")
-    os.environ.setdefault("LOWES_DETAIL_TRANSPORT", "uc_first")
-    os.environ.setdefault("LOWES_DETAIL_FALLBACK_ZENROWS", "1")
+    # Verified production defaults (REF/LDY both pass with these):
+    #   mode=auto, no custom headers, NY store cookies
     if os.environ["LOWES_PRODUCT_TYPE"] == "LDY":
         os.environ.setdefault("LOWES_SEARCH_TERM", "washing machine")
         os.environ.setdefault("LOWES_BSR_PRODUCT_GROUP", "LDY")
-        os.environ.setdefault("LOWES_REQUEST_VARIANT", "js_premium_block_visual")
     else:
         os.environ.setdefault("LOWES_SEARCH_TERM", "refrigerator")
         os.environ.setdefault("LOWES_BSR_PRODUCT_GROUP", "REF")

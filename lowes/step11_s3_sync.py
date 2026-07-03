@@ -24,6 +24,7 @@ S3_INCLUDE_OUTPUT_ONLY = os.getenv("S3_INCLUDE_OUTPUT_ONLY", "0").strip().lower(
 S3_SYNC_MAX_ATTEMPTS = max(1, int(os.getenv("S3_SYNC_MAX_ATTEMPTS", "3") or 3))
 S3_SYNC_RETRY_SECONDS = max(0, int(os.getenv("S3_SYNC_RETRY_SECONDS", "10") or 10))
 S3_VERIFY_AFTER_SYNC = os.getenv("S3_VERIFY_AFTER_SYNC", "1").strip().lower() in {"1", "true", "yes", "y"}
+S3_SYNC_ENABLED = os.getenv("LOWES_S3_SYNC_ENABLED", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 MANIFEST_PATH = RUN_ROOT / "s3_sync_manifest.json"
 DEFAULT_AWS_EXE = Path(r"C:\Program Files\Amazon\AWSCLIV2\aws.exe")
@@ -142,8 +143,25 @@ def write_manifest(started_at, sync_cmd, attempts, verify_cmd=None, verify_resul
 
 
 def main():
-    require_config()
     started_at = now()
+    if not S3_SYNC_ENABLED:
+        MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "run_type": "step11_s3_sync",
+            "started_at": started_at,
+            "finished_at": now(),
+            "success": False,
+            "skipped": True,
+            "skip_reason": "LOWES_S3_SYNC_ENABLED=0 (default). Set to 1 to enable.",
+            "product_type": PRODUCT_TYPE.upper(),
+            "run_date": RUN_DATE,
+            "run_root": rel_path(RUN_ROOT),
+        }
+        MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+        return
+
+    require_config()
     command = sync_command()
     attempts = []
     print(" ".join(command))

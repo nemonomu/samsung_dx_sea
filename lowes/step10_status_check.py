@@ -56,7 +56,7 @@ def build_status():
         "bsr_rank_rows": csv_count(BSR_ROOT / "parsed" / "bsr_rank_map.csv"),
         "final_target_rows": csv_count(final_targets),
         "final_output_rows": csv_count(final_output),
-        "detail_success_files": file_count(DETAIL_ROOT / "raw" / "detail_html", "*.html"),
+        "detail_success_files": file_count(DETAIL_ROOT / "raw" / "detail_xhr", "*_success"),
         "detail_failure_rows": csv_count(detail_failures),
         "final_targets_csv": str(final_targets),
         "final_output_csv": str(final_output),

@@ -1,11 +1,15 @@
 import csv
 import ast
 import json
+import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
+
+from dotenv import load_dotenv
 
 
 LOWES_BASE_URL = "https://www.lowes.com"
@@ -16,19 +20,47 @@ INITIAL_URLS_CSV = CONFIG_DIR / "lowes_initial_urls.csv"
 DEFAULT_LOWES_RUNS_BASE = PACKAGE_DIR / "data"
 DEFAULT_PRODUCT_TYPE = "REF"
 DEFAULT_RETAILER = "Lowes"
-TARGET_URL_TABLE = os.getenv("LOWES_TARGET_URL_TABLE", "public.dx_target_page_url")
-OUTPUT_TABLE_REGISTRY = os.getenv("COMMON_OUTPUT_TABLE_REGISTRY", "public.common_setting_step02_output_table")
 LOWES_OUTPUT_TABLES = {
-    "REF": "ref_retail_com_lowes",
-    "LDY": "ldy_retail_com_lowes",
+    "REF": "ref_retail_com",
+    "LDY": "ldy_retail_com",
 }
 
+SENSITIVE_VALUE_PATTERNS = [
+    (re.compile(r"(?i)([?&]apikey=)[^&\s\"']+"), r"\1<redacted>"),
+    (re.compile(r"(?i)([?&]api_key=)[^&\s\"']+"), r"\1<redacted>"),
+    (re.compile(r"(?i)([?&]key=)[^&\s\"']+"), r"\1<redacted>"),
+    (re.compile(r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?bearer\s+)[^,\s\"']+"), r"\1<redacted>"),
+]
 
-def load_env(path=None):
-    env_path = Path(path or (PROJECT_ROOT / ".env"))
-    if not env_path.exists():
-        return
-    lines = env_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+def redact_sensitive(value):
+    if isinstance(value, dict):
+        return {key: redact_sensitive(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [redact_sensitive(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive(child) for child in value)
+    if not isinstance(value, str):
+        return value
+    redacted = value
+    for pattern, replacement in SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _is_incomplete_object(value):
+    text = str(value or "").strip()
+    if text in {"", "{", "["}:
+        return True
+    return text.count("{") > text.count("}") or text.count("[") > text.count("]")
+
+
+def _load_loose_env(env_path, override=False):
+    try:
+        lines = Path(env_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+    loaded = False
     i = 0
     while i < len(lines):
         line = lines[i].strip()
@@ -38,21 +70,52 @@ def load_env(path=None):
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if value == "{":
-            collected = ["{"]
-            depth = 1
+        if not key:
+            continue
+        if _is_incomplete_object(value):
+            collected = [value]
+            depth = value.count("{") - value.count("}") + value.count("[") - value.count("]")
             while i < len(lines) and depth > 0:
                 part = lines[i]
                 i += 1
                 collected.append(part)
-                depth += part.count("{") - part.count("}")
+                depth += part.count("{") - part.count("}") + part.count("[") - part.count("]")
             value = "\n".join(collected)
         else:
             value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+
+        existing = os.environ.get(key)
+        if override or existing is None or _is_incomplete_object(existing):
+            os.environ[key] = value
+            loaded = True
+    return loaded
+
+
+def load_env(path=None, override=False):
+    env_file = os.getenv("LOWES_ENV_FILE", "").strip()
+    if path:
+        candidates = [Path(path)]
+    elif env_file:
+        candidates = [Path(env_file)]
+    else:
+        candidates = [PACKAGE_DIR / ".env", PROJECT_ROOT / ".env"]
+
+    loaded = False
+    dotenv_logger = logging.getLogger("dotenv.main")
+    old_level = dotenv_logger.level
+    dotenv_logger.setLevel(logging.ERROR)
+    for env_path in candidates:
+        if env_path.exists():
+            loaded = load_dotenv(dotenv_path=env_path, override=override, encoding="utf-8") or loaded
+            loaded = _load_loose_env(env_path, override=override) or loaded
+    dotenv_logger.setLevel(old_level)
+    return loaded
 
 
 load_env()
+
+TARGET_URL_TABLE = os.getenv("LOWES_TARGET_URL_TABLE", "public.dx_target_page_url")
+OUTPUT_TABLE_REGISTRY = os.getenv("COMMON_OUTPUT_TABLE_REGISTRY", "public.common_setting_step02_output_table")
 
 LOWES_URLS = {
     "main_search_refrigerator": f"{LOWES_BASE_URL}/search?searchTerm=refrigerator",
@@ -91,32 +154,7 @@ DEFAULT_LOWES_RUN_ROOT = lowes_dated_run_root()
 
 
 def _read_multiline_env_object(name):
-    raw = os.getenv(name)
-    if raw and raw.strip() not in {"{", ""}:
-        return raw
-    env_path = PROJECT_ROOT / ".env"
-    if not env_path.exists():
-        return raw or ""
-    lines = env_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    collecting = False
-    collected = []
-    depth = 0
-    for line in lines:
-        stripped = line.strip()
-        if not collecting and stripped.startswith(f"{name}") and "=" in stripped:
-            value = line.split("=", 1)[1].strip()
-            collecting = True
-            collected.append(value)
-            depth += value.count("{") - value.count("}")
-            if depth <= 0 and value:
-                break
-            continue
-        if collecting:
-            collected.append(line)
-            depth += line.count("{") - line.count("}")
-            if depth <= 0:
-                break
-    return "\n".join(collected).strip()
+    return os.getenv(name, "").strip()
 
 
 def db_config():
@@ -134,9 +172,9 @@ def db_config():
 
 def lowes_output_table(product_type=None):
     product = (product_type or lowes_product_type()).strip().upper()
-    return os.getenv("LOWES_DB_FINAL_TABLE") or _fetch_output_table_from_db(product, "final") or LOWES_OUTPUT_TABLES.get(
+    return os.getenv("LOWES_DB_FINAL_TABLE") or LOWES_OUTPUT_TABLES.get(
         product,
-        f"{product.lower()}_retail_com_lowes",
+        f"{product.lower()}_retail_com",
     )
 
 

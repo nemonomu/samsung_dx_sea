@@ -12,7 +12,7 @@ from urllib.parse import quote, urlencode
 from requests import RequestException, Session
 from zenrows import ZenRowsClient
 
-from .step00_config import DEFAULT_LOWES_RUN_ROOT, LOWES_BASE_URL, load_env
+from .step00_config import DEFAULT_LOWES_RUN_ROOT, LOWES_BASE_URL, load_env, redact_sensitive
 from .step00_parse_search import (
     extract_preloaded_state,
     find_item_list,
@@ -29,32 +29,34 @@ load_env(PROJECT_ROOT / ".env")
 
 SEARCH_TERM = os.getenv("LOWES_SEARCH_TERM", "refrigerator")
 PAGE_SIZE = int(os.getenv("LOWES_PAGE_SIZE", "24"))
-PAGES = int(os.getenv("LOWES_PAGES", "13"))
+PAGES = int(os.getenv("LOWES_PAGES", "14"))
 PAGE_LIST = os.getenv("LOWES_PAGE_LIST", "").strip()
-MAX_WORKERS = int(os.getenv("LOWES_PAGE_WORKERS", "1"))
-REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "600"))
-MAX_ATTEMPTS = int(os.getenv("LOWES_MAX_ATTEMPTS", "2"))
+MAX_WORKERS = int(os.getenv("LOWES_PAGE_WORKERS", "4"))
+REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "300"))
+MAX_ATTEMPTS = int(os.getenv("LOWES_MAX_ATTEMPTS", "3"))
 RETRY_SLEEP_SECONDS = int(os.getenv("LOWES_RETRY_SLEEP_SECONDS", "10"))
+MAIN_RECOVERY_ROUNDS = max(0, int(os.getenv("LOWES_MAIN_RECOVERY_ROUNDS", "1")))
+MAIN_RECOVERY_SLEEP_SECONDS = max(0, int(os.getenv("LOWES_MAIN_RECOVERY_SLEEP_SECONDS", str(RETRY_SLEEP_SECONDS))))
 MAIN_SOURCE = os.getenv("LOWES_MAIN_SOURCE", "html").strip().lower()
 LOCAL_HTML_PATH = os.getenv("LOWES_MAIN_LOCAL_HTML", "").strip()
 LOCAL_STATE_JSON_PATH = os.getenv("LOWES_MAIN_LOCAL_STATE_JSON", "").strip()
 REQUEST_VARIANT = os.getenv("LOWES_REQUEST_VARIANT", "auto").strip().lower()
 BLOCK_RESOURCES = os.getenv("LOWES_BLOCK_RESOURCES", "image,media,font,stylesheet").strip()
 ANTIBOT = os.getenv("LOWES_ZENROWS_ANTIBOT", "true").strip().lower()
-HTML_CUSTOM_HEADERS = os.getenv("LOWES_HTML_CUSTOM_HEADERS", "true").strip().lower() in {"1", "true", "yes", "y"}
+HTML_CUSTOM_HEADERS = os.getenv("LOWES_HTML_CUSTOM_HEADERS", "false").strip().lower() in {"1", "true", "yes", "y"}
 WAIT_FOR_SELECTOR = os.getenv("LOWES_WAIT_FOR_SELECTOR", ".content").strip()
 WAIT_MS = os.getenv("LOWES_WAIT_MS", "2500").strip()
 API_CURL_FILE = os.getenv("LOWES_API_CURL_FILE", "").strip()
 API_TRANSPORT = os.getenv("LOWES_API_TRANSPORT", "curl" if API_CURL_FILE else "zenrows").strip().lower()
 API_INITIAL_ADJUSTED_OFFSET = os.getenv("LOWES_API_INITIAL_ADJUSTED_OFFSET", "").strip()
-API_NEARBY_STORES = os.getenv("LOWES_API_NEARBY_STORES", "1633,2955,2512").strip()
-API_STORE_ID = os.getenv("LOWES_API_STORE_ID", "0289").strip()
+API_NEARBY_STORES = os.getenv("LOWES_API_NEARBY_STORES", "1674").strip()
+API_STORE_ID = os.getenv("LOWES_API_STORE_ID", "1674").strip()
 API_STORE_NUMBER = os.getenv("LOWES_API_STORE_NUMBER", str(int(API_STORE_ID))).strip()
-API_STORE_NAME = os.getenv("LOWES_API_STORE_NAME", "Anchorage Lowe's").strip()
-API_STORE_CITY = os.getenv("LOWES_API_STORE_CITY", "Anchorage").strip()
-API_STORE_STATE = os.getenv("LOWES_API_STORE_STATE", "AK").strip()
-API_STORE_ZIP = os.getenv("LOWES_API_STORE_ZIP", "99503").strip()
-API_STORE_REGION = os.getenv("LOWES_API_STORE_REGION", "14").strip()
+API_STORE_NAME = os.getenv("LOWES_API_STORE_NAME", "Brooklyn Lowe's").strip()
+API_STORE_CITY = os.getenv("LOWES_API_STORE_CITY", "Brooklyn").strip()
+API_STORE_STATE = os.getenv("LOWES_API_STORE_STATE", "NY").strip()
+API_STORE_ZIP = os.getenv("LOWES_API_STORE_ZIP", "10010").strip()
+API_STORE_REGION = os.getenv("LOWES_API_STORE_REGION", "4").strip()
 API_COOKIE = os.getenv("LOWES_API_COOKIE", "").strip()
 RETRY_STATUS_CODES = {
     int(value.strip())
@@ -428,9 +430,9 @@ def save_attempt(result):
         ),
         encoding="utf-8",
     )
-    body_path.write_text(result["text"] or result["error"], encoding="utf-8", errors="replace")
+    body_path.write_text(redact_sensitive(result["text"] or result["error"]), encoding="utf-8", errors="replace")
     headers_path.write_text(
-        json.dumps(result["headers"], indent=2, ensure_ascii=False),
+        json.dumps(redact_sensitive(result["headers"]), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     meta = {key: value for key, value in result.items() if key not in {"text", "headers"}}
@@ -439,15 +441,18 @@ def save_attempt(result):
     meta["request_path"] = str(request_path)
     meta["body_path"] = str(body_path)
     meta["headers_path"] = str(headers_path)
+    meta = redact_sensitive(meta)
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta
 
 
-def fetch_page_with_retries(task, logger):
+def fetch_page_with_retries(task, logger, attempt_offset=0):
     page_number, offset = task
     attempts = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        logger.write(f"START page={page_number:03d} offset={offset} attempt={attempt}/{MAX_ATTEMPTS}")
+    total_attempts = attempt_offset + MAX_ATTEMPTS
+    for attempt_index in range(1, MAX_ATTEMPTS + 1):
+        attempt = attempt_offset + attempt_index
+        logger.write(f"START page={page_number:03d} offset={offset} attempt={attempt}/{total_attempts}")
         result = fetch_once(task, attempt)
         meta = save_attempt(result)
         attempts.append(meta)
@@ -462,7 +467,7 @@ def fetch_page_with_retries(task, logger):
             result["attempts"] = attempts
             return result
 
-        if attempt < MAX_ATTEMPTS and should_retry(result["status_code"]):
+        if attempt_index < MAX_ATTEMPTS and should_retry(result["status_code"]):
             logger.write(f"WAIT  page={page_number:03d} retry_after={RETRY_SLEEP_SECONDS}s")
             time.sleep(RETRY_SLEEP_SECONDS)
             continue
@@ -472,6 +477,79 @@ def fetch_page_with_retries(task, logger):
 
     result["attempts"] = attempts
     return result
+
+
+def fetch_html_pages(tasks, logger, attempt_offsets=None):
+    attempt_offsets = attempt_offsets or {}
+    fetch_results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(
+                fetch_page_with_retries,
+                task,
+                logger,
+                attempt_offsets.get(task[0], 0),
+            ): task
+            for task in tasks
+        }
+        for future in as_completed(future_map):
+            fetch_results.append(future.result())
+    return fetch_results
+
+
+def fetch_html_pages_with_recovery(tasks, logger):
+    task_by_page = {task[0]: task for task in tasks}
+    results_by_page = {result["page"]: result for result in fetch_html_pages(tasks, logger)}
+    recovered_pages = []
+    rounds_run = 0
+
+    for round_number in range(1, MAIN_RECOVERY_ROUNDS + 1):
+        failed_pages = [
+            page_number
+            for page_number, result in sorted(results_by_page.items())
+            if result.get("status_code") != 200
+        ]
+        if not failed_pages:
+            break
+
+        rounds_run = round_number
+        logger.write(
+            f"RECOVERY main_pages round={round_number}/{MAIN_RECOVERY_ROUNDS} "
+            f"failed_pages={','.join(str(page) for page in failed_pages)}"
+        )
+        if MAIN_RECOVERY_SLEEP_SECONDS:
+            logger.write(f"WAIT  main_pages recovery_after={MAIN_RECOVERY_SLEEP_SECONDS}s")
+            time.sleep(MAIN_RECOVERY_SLEEP_SECONDS)
+
+        attempt_offsets = {
+            page_number: len(results_by_page[page_number].get("attempts", []))
+            for page_number in failed_pages
+        }
+        retry_tasks = [task_by_page[page_number] for page_number in failed_pages]
+        retry_results = fetch_html_pages(retry_tasks, logger, attempt_offsets)
+        for retry_result in retry_results:
+            page_number = retry_result["page"]
+            previous = results_by_page[page_number]
+            retry_result["attempts"] = previous.get("attempts", []) + retry_result.get("attempts", [])
+            if previous.get("status_code") != 200 and retry_result.get("status_code") == 200:
+                recovered_pages.append(page_number)
+                logger.write(f"RECOVERED page={page_number:03d} attempts={len(retry_result['attempts'])}")
+            results_by_page[page_number] = retry_result
+
+    failed_pages = [
+        page_number
+        for page_number, result in sorted(results_by_page.items())
+        if result.get("status_code") != 200
+    ]
+    return (
+        [results_by_page[page_number] for page_number in sorted(results_by_page)],
+        {
+            "rounds_configured": MAIN_RECOVERY_ROUNDS,
+            "rounds_run": rounds_run,
+            "recovered_pages": sorted(set(recovered_pages)),
+            "failed_pages": failed_pages,
+        },
+    )
 
 
 def parse_json_payload(text):
@@ -819,8 +897,8 @@ def write_page_summary(path, fetch_results):
                     "x_request_id": headers.get("X-Request-Id", ""),
                     "concurrency_limit": headers.get("Concurrency-Limit", ""),
                     "concurrency_remaining": headers.get("Concurrency-Remaining", ""),
-                    "zr_final_url": headers.get("Zr-Final-Url", ""),
-                    "error": result.get("error", ""),
+                    "zr_final_url": redact_sensitive(headers.get("Zr-Final-Url", "")),
+                    "error": redact_sensitive(result.get("error", "")),
                 }
             )
 
@@ -884,6 +962,7 @@ def parse_pages(fetch_results, logger):
 
 
 def write_manifest(path, manifest):
+    manifest = redact_sensitive(manifest)
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -895,6 +974,7 @@ def main():
     pages = parse_page_list()
     tasks = [(page, (page - 1) * PAGE_SIZE) for page in pages]
     fetch_results = []
+    recovery_meta = {}
 
     logger.write("=" * 80)
     logger.write(f"RUN_ROOT={RUN_ROOT}")
@@ -907,11 +987,7 @@ def main():
     if MAIN_SOURCE == "api":
         fetch_results = fetch_api_pages(tasks, logger)
     elif MAIN_SOURCE == "html":
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {executor.submit(fetch_page_with_retries, task, logger): task for task in tasks}
-            for future in as_completed(future_map):
-                result = future.result()
-                fetch_results.append(result)
+        fetch_results, recovery_meta = fetch_html_pages_with_recovery(tasks, logger)
     elif MAIN_SOURCE == "local_html":
         fetch_results = fetch_local_html_pages(tasks, logger)
     elif MAIN_SOURCE == "local_state_json":
@@ -959,6 +1035,7 @@ def main():
         "request_params": REQUEST_VARIANTS.get(REQUEST_VARIANT, {}),
         "max_attempts": MAX_ATTEMPTS,
         "retry_status_codes": sorted(RETRY_STATUS_CODES),
+        "main_recovery": recovery_meta,
         "rows": len(rows),
         "unique_omni_item_id": len(seen_ids),
         "successful_http_pages": sum(1 for item in fetch_results if item["status_code"] == 200),

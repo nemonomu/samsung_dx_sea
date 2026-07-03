@@ -37,11 +37,12 @@ def build_rank_map(rows):
         if not product_id or product_id in seen:
             continue
         seen.add(product_id)
-        rank = numeric(row.get("bsr_rank"), len(output) + 1)
+        rank = len(output) + 1
         output.append(
             {
                 "product_group": row.get("product_group", ""),
                 "bsr_rank": rank,
+                "original_bsr_rank": row.get("original_bsr_rank", row.get("bsr_rank", "")),
                 "omni_item_id": row.get("omni_item_id", ""),
                 "item_number": row.get("item_number", ""),
                 "brand": row.get("brand", ""),
@@ -58,6 +59,7 @@ def write_csv(path, rows):
     fieldnames = [
         "product_group",
         "bsr_rank",
+        "original_bsr_rank",
         "omni_item_id",
         "item_number",
         "brand",

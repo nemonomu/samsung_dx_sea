@@ -1,52 +1,76 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-cd /d "%~dp0"
+REM Lowes REF -> LDY daily orchestrator runner.
+REM Runs both categories even if REF fails (for example during DB insert).
+REM Final exit code is non-zero if any category failed, but no category blocks the next one.
 
+cd /d "%~dp0.."
+set "REPO_ROOT=%CD%"
+
+set "PYTHONUNBUFFERED=1"
 set "OVERALL_EXIT_CODE=0"
-set "FAILURE_COUNT=0"
-set "FAILURES="
+set "FAILED_CATEGORIES="
 
-call :run_lowes REF
-call :record_failure LOWES_REF !CATEGORY_EXIT!
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "RUN_TS=%%i"
+set "TASK_LOG_DIR=%~dp0task_logs"
+if not exist "%TASK_LOG_DIR%" mkdir "%TASK_LOG_DIR%"
+set "TASK_LOG=%TASK_LOG_DIR%\ref_ldy_daily_%RUN_TS%.log"
 
-call :run_lowes LDY
-call :record_failure LOWES_LDY !CATEGORY_EXIT!
+echo ==================================================
+echo Lowes REF-LDY daily task started
+echo order=REF LDY
+echo continue_on_category_failure=true
+echo cwd=%CD%
+echo task_log=%TASK_LOG%
+echo ==================================================
 
-if not "%FAILURE_COUNT%"=="0" (
-  echo Lowes REF+LDY daily task completed with failures
-  echo failed_count=%FAILURE_COUNT%
-  echo failures=%FAILURES%
-) else (
-  echo Lowes REF+LDY daily task completed successfully
+(
+  echo ==================================================
+  echo Lowes REF-LDY daily task started
+  echo order=REF LDY
+  echo continue_on_category_failure=true
+  echo cwd=%CD%
+  echo ts=%RUN_TS%
+  echo ==================================================
+) > "%TASK_LOG%"
+
+for %%C in (REF LDY) do (
+  echo.
+  echo ================================================== >> "%TASK_LOG%"
+  echo Lowes %%C task queued at %RUN_TS% >> "%TASK_LOG%"
+  echo ================================================== >> "%TASK_LOG%"
+  echo.
+  echo ==================================================
+  echo Lowes %%C task started
+  echo ==================================================
+  call "%~dp0_lowes_daily_task.bat" %%C "%TASK_LOG%"
+  set "EXIT_CODE=!ERRORLEVEL!"
+  if not "!EXIT_CODE!"=="0" (
+    echo.
+    echo Lowes %%C task failed exit_code=!EXIT_CODE!. Continuing with remaining categories.
+    echo Lowes %%C task failed exit_code=!EXIT_CODE!. Continuing with remaining categories. >> "%TASK_LOG%"
+    set "OVERALL_EXIT_CODE=!EXIT_CODE!"
+    if "!FAILED_CATEGORIES!"=="" (
+      set "FAILED_CATEGORIES=%%C"
+    ) else (
+      set "FAILED_CATEGORIES=!FAILED_CATEGORIES!,%%C"
+    )
+  ) else (
+    echo Lowes %%C task completed successfully. >> "%TASK_LOG%"
+  )
 )
 
-exit /b %OVERALL_EXIT_CODE%
-
-:run_lowes
-set "CATEGORY=%~1"
-set "CATEGORY_EXIT=0"
 echo.
 echo ==================================================
-echo Lowes %CATEGORY% daily task started
-echo ==================================================
-call "%~dp0_lowes_daily_task.bat" %CATEGORY%
-set "CATEGORY_EXIT=!ERRORLEVEL!"
-echo Lowes %CATEGORY% daily task exit_code=!CATEGORY_EXIT!
-exit /b !CATEGORY_EXIT!
-
-:record_failure
-set "FAIL_GROUP=%~1"
-set "FAIL_CODE=%~2"
-if "%FAIL_CODE%"=="" set "FAIL_CODE=0"
-if not "%FAIL_CODE%"=="0" (
-  set /a FAILURE_COUNT+=1
-  set "OVERALL_EXIT_CODE=%FAIL_CODE%"
-  if "!FAILURES!"=="" (
-    set "FAILURES=%FAIL_GROUP%(%FAIL_CODE%)"
-  ) else (
-    set "FAILURES=!FAILURES!, %FAIL_GROUP%(%FAIL_CODE%)"
-  )
-  echo [warn] %FAIL_GROUP% failed exit_code=%FAIL_CODE%; continuing.
+if "%FAILED_CATEGORIES%"=="" (
+  echo Lowes REF-LDY daily task completed successfully
+  echo Lowes REF-LDY daily task completed successfully >> "%TASK_LOG%"
+) else (
+  echo Lowes REF-LDY daily task completed with failures: %FAILED_CATEGORIES%
+  echo Lowes REF-LDY daily task completed with failures: %FAILED_CATEGORIES% >> "%TASK_LOG%"
 )
-exit /b 0
+echo task_log=%TASK_LOG%
+echo ==================================================
+
+exit /b %OVERALL_EXIT_CODE%

@@ -9,7 +9,8 @@ from urllib.parse import parse_qsl, urlencode
 import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from .step00_config import DEFAULT_LOWES_RUN_ROOT, LOWES_BASE_URL, load_env
+from .step00_config import DEFAULT_LOWES_RUN_ROOT, LOWES_BASE_URL, load_env, redact_sensitive
+from .step00_uc import launch_chrome
 from .step01_main_list import (
     API_NEARBY_STORES,
     API_STORE_CITY,
@@ -38,9 +39,20 @@ RUN_ROOT = Path(os.getenv("LOWES_RUN_ROOT", str(DEFAULT_LOWES_RUN_ROOT))) / RUN_
 HEADLESS = os.getenv("LOWES_UC_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
 BOOT_WAIT_SECONDS = float(os.getenv("LOWES_UC_BOOT_WAIT_SECONDS", "25"))
 API_WAIT_SECONDS = int(os.getenv("LOWES_UC_API_WAIT_SECONDS", "45"))
+READY_TIMEOUT_SECONDS = float(os.getenv("LOWES_UC_READY_TIMEOUT_SECONDS", "90"))
+READY_POLL_SECONDS = float(os.getenv("LOWES_UC_READY_POLL_SECONDS", "5"))
+API_MAX_ATTEMPTS = max(1, int(os.getenv("LOWES_UC_API_MAX_ATTEMPTS", "3")))
+API_RETRY_SLEEP_SECONDS = float(os.getenv("LOWES_UC_API_RETRY_SLEEP_SECONDS", "20"))
+API_PAGE_SLEEP_SECONDS = float(os.getenv("LOWES_UC_PAGE_SLEEP_SECONDS", "1"))
+API_RETRY_STATUS_CODES = {
+    int(value.strip())
+    for value in os.getenv("LOWES_UC_API_RETRY_STATUS_CODES", "408,409,425,429,500,502,503,504").split(",")
+    if value.strip()
+}
+STORE_SEED_TIMEOUT_SECONDS = float(os.getenv("LOWES_UC_STORE_SEED_TIMEOUT_SECONDS", "45"))
 USER_DATA_DIR = os.getenv("LOWES_UC_USER_DATA_DIR", "").strip()
 PROFILE_DIR = os.getenv("LOWES_UC_PROFILE_DIR", "").strip()
-SET_STORE_COOKIES = os.getenv("LOWES_SET_STORE_COOKIES", "1").strip().lower() not in {"0", "false", "no"}
+SET_STORE_COOKIES = os.getenv("LOWES_SET_STORE_COOKIES", "0").strip().lower() not in {"0", "false", "no"}
 API_EXTRA_QUERY = os.getenv("LOWES_API_EXTRA_QUERY", "").strip()
 STOP_AT_PAGE_COUNT = os.getenv("LOWES_UC_STOP_AT_PAGE_COUNT", "1").strip().lower() not in {"0", "false", "no"}
 BENCHMARK_ROOT = Path(os.getenv("LOWES_MAIN_BENCHMARK_ROOT", str(RUN_ROOT / "benchmarks")))
@@ -86,10 +98,10 @@ def save_attempt(result):
     status_name = "success" if result["status_code"] == 200 else "fail"
     unit_dir = RUN_ROOT / "raw/main_pages" / f"page_{page:03d}_{status_name}"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    request_path = unit_dir / f"page_{page:03d}_request.json"
-    body_path = unit_dir / f"page_{page:03d}_response.{suffix}"
-    headers_path = unit_dir / f"page_{page:03d}_headers.json"
-    meta_path = unit_dir / f"page_{page:03d}_meta.json"
+    request_path = unit_dir / f"page_{page:03d}_attempt_{attempt:02d}_request.json"
+    body_path = unit_dir / f"page_{page:03d}_attempt_{attempt:02d}_response.{suffix}"
+    headers_path = unit_dir / f"page_{page:03d}_attempt_{attempt:02d}_headers.json"
+    meta_path = unit_dir / f"page_{page:03d}_attempt_{attempt:02d}_meta.json"
     request_path.write_text(
         json.dumps(
             {
@@ -104,13 +116,21 @@ def save_attempt(result):
         ),
         encoding="utf-8",
     )
-    body_path.write_text(result.get("text", "") or result.get("error", ""), encoding="utf-8", errors="replace")
-    headers_path.write_text(json.dumps(result.get("headers", {}), indent=2, ensure_ascii=False), encoding="utf-8")
+    body_path.write_text(
+        redact_sensitive(result.get("text", "") or result.get("error", "")),
+        encoding="utf-8",
+        errors="replace",
+    )
+    headers_path.write_text(
+        json.dumps(redact_sensitive(result.get("headers", {})), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     meta = {key: value for key, value in result.items() if key not in {"text", "headers"}}
     meta["bytes"] = len(result.get("text", ""))
     meta["request_path"] = str(request_path)
     meta["body_path"] = str(body_path)
     meta["headers_path"] = str(headers_path)
+    meta = redact_sensitive(meta)
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta
 
@@ -168,6 +188,47 @@ def summarize_json(result):
     result["pagination_page_count"] = pagination.get("pageCount", "")
 
 
+def is_challenge_response(result):
+    text = (result.get("text") or "").strip()
+    if not text:
+        return False
+    if "cpr_chlge" in text:
+        return True
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return payload.get("cpr_chlge") is True or payload.get("cpr_chlge") == "true"
+
+
+def has_empty_product_payload(result):
+    if result.get("status_code") != 200:
+        return False
+    product_count = result.get("product_count", "")
+    item_count = result.get("item_count", 0)
+    if item_count:
+        return False
+    try:
+        return int(product_count) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def should_retry_result(result):
+    status_code = result.get("status_code")
+    if status_code in {"", None}:
+        return True
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return True
+    return (
+        status_code in API_RETRY_STATUS_CODES
+        or is_challenge_response(result)
+        or has_empty_product_payload(result)
+    )
+
+
 def fetch_api(driver, url):
     script = """
         const url = arguments[0];
@@ -223,43 +284,63 @@ def collect_pages(driver, tasks, logger):
             logger.write(f"STOP  uc-api page={page_number:03d}: page_count={last_page_count}")
             break
         url = build_api_url(offset, adjusted_next_offset)
-        logger.write(
-            f"START uc-api page={page_number:03d} offset={offset} "
-            f"adjusted={adjusted_next_offset if adjusted_next_offset not in (None, '') else '-'}"
-        )
-        started = datetime.now().isoformat(timespec="seconds")
-        start = time.time()
-        try:
-            response = fetch_api(driver, url)
-        except (TimeoutException, WebDriverException) as exc:
-            response = {"status": "", "statusText": "", "headers": {}, "text": "", "error": str(exc)}
-        elapsed = round(time.time() - start, 3)
-        result = {
-            "page": page_number,
-            "offset": offset,
-            "request_adjusted_next_offset": adjusted_next_offset,
-            "url": url,
-            "attempt": 1,
-            "started_at": started,
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-            "elapsed_seconds": elapsed,
-            "status_code": response.get("status", ""),
-            "status_text": response.get("statusText", ""),
-            "headers": response.get("headers", {}),
-            "text": response.get("text", ""),
-            "content_kind": "json",
-            "error": response.get("error", ""),
-        }
-        if result["status_code"] == 200:
-            summarize_json(result)
-            page_count = result.get("pagination_page_count")
-            if page_count not in (None, ""):
-                try:
-                    last_page_count = int(page_count)
-                except (TypeError, ValueError):
-                    pass
-        meta = save_attempt(result)
-        result["attempts"] = [meta]
+        page_attempts = []
+        result = None
+        for attempt in range(1, API_MAX_ATTEMPTS + 1):
+            logger.write(
+                f"START uc-api page={page_number:03d} offset={offset} attempt={attempt}/{API_MAX_ATTEMPTS} "
+                f"adjusted={adjusted_next_offset if adjusted_next_offset not in (None, '') else '-'}"
+            )
+            started = datetime.now().isoformat(timespec="seconds")
+            start = time.time()
+            try:
+                response = fetch_api(driver, url)
+            except (TimeoutException, WebDriverException) as exc:
+                response = {"status": "", "statusText": "", "headers": {}, "text": "", "error": str(exc)}
+            elapsed = round(time.time() - start, 3)
+            result = {
+                "page": page_number,
+                "offset": offset,
+                "request_adjusted_next_offset": adjusted_next_offset,
+                "url": url,
+                "attempt": attempt,
+                "started_at": started,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_seconds": elapsed,
+                "status_code": response.get("status", ""),
+                "status_text": response.get("statusText", ""),
+                "headers": response.get("headers", {}),
+                "text": response.get("text", ""),
+                "content_kind": "json",
+                "error": response.get("error", ""),
+            }
+            if result["status_code"] == 200:
+                summarize_json(result)
+                page_count = result.get("pagination_page_count")
+                if page_count not in (None, ""):
+                    try:
+                        last_page_count = int(page_count)
+                    except (TypeError, ValueError):
+                        pass
+            result["challenge_detected"] = is_challenge_response(result)
+            meta = save_attempt(result)
+            page_attempts.append(meta)
+            logger.write(
+                f"DONE  uc-api page={page_number:03d} attempt={attempt}/{API_MAX_ATTEMPTS} "
+                f"status={result['status_code'] or 'ERR'} elapsed={elapsed}s "
+                f"bytes={len(result.get('text', ''))} itemList={result.get('item_count', 0)} "
+                f"adjustedNext={result.get('adjusted_next_offset', '')} "
+                f"challenge={str(result.get('challenge_detected', False)).lower()}"
+            )
+            if not should_retry_result(result) or attempt >= API_MAX_ATTEMPTS:
+                break
+            sleep_seconds = API_RETRY_SLEEP_SECONDS * attempt
+            logger.write(
+                f"WAIT  uc-api page={page_number:03d} retry_after={sleep_seconds:g}s "
+                f"reason=status:{result['status_code'] or 'ERR'}"
+            )
+            time.sleep(sleep_seconds)
+        result["attempts"] = page_attempts
         results.append(result)
         completed += 1
         success_count += 1 if result["status_code"] == 200 else 0
@@ -306,15 +387,12 @@ def collect_pages(driver, tasks, logger):
                 "last_item": benchmark_row,
             },
         )
-        logger.write(
-            f"DONE  uc-api page={page_number:03d} status={result['status_code'] or 'ERR'} "
-            f"elapsed={elapsed}s bytes={len(result.get('text', ''))} "
-            f"itemList={result.get('item_count', 0)} adjustedNext={result.get('adjusted_next_offset', '')}"
-        )
         if result.get("adjusted_next_offset") not in (None, ""):
             adjusted_next_offset = result["adjusted_next_offset"]
         else:
             adjusted_next_offset = offset + PAGE_SIZE
+        if API_PAGE_SLEEP_SECONDS > 0:
+            time.sleep(API_PAGE_SLEEP_SECONDS)
     return results
 
 
@@ -331,7 +409,7 @@ def launch_driver(logger):
         f"LAUNCH uc headless={HEADLESS} "
         f"user_data_dir={USER_DATA_DIR or '-'} profile={PROFILE_DIR or '-'}"
     )
-    return uc.Chrome(options=options, headless=HEADLESS, use_subprocess=True)
+    return launch_chrome(uc, options=options, headless=HEADLESS)
 
 
 def add_cookie(driver, name, value):
@@ -353,8 +431,12 @@ def seed_store_cookies(driver, logger):
         f"SEED  store cookies store={API_STORE_ID} zip={API_STORE_ZIP} "
         f"state={API_STORE_STATE} nearby={API_NEARBY_STORES}"
     )
-    driver.get(LOWES_BASE_URL)
-    time.sleep(2)
+    try:
+        driver.set_page_load_timeout(STORE_SEED_TIMEOUT_SECONDS)
+        driver.get(LOWES_BASE_URL)
+        time.sleep(2)
+    except (TimeoutException, WebDriverException) as exc:
+        logger.write(f"WARN  store cookie seed page load failed; continue with explicit cookies: {exc}")
     store_data = {
         "id": API_STORE_ID,
         "zip": API_STORE_ZIP,
@@ -378,6 +460,31 @@ def seed_store_cookies(driver, logger):
     add_cookie(driver, "p13n", json.dumps(personalization, separators=(",", ":")))
 
 
+def wait_for_search_ready(driver, logger):
+    deadline = time.time() + READY_TIMEOUT_SECONDS
+    last_state = {}
+    while time.time() < deadline:
+        try:
+            title = driver.title or ""
+            current_url = driver.current_url or ""
+            ready_state = driver.execute_script("return document.readyState") or ""
+        except WebDriverException as exc:
+            last_state = {"error": str(exc)}
+            time.sleep(READY_POLL_SECONDS)
+            continue
+        last_state = {"title": title, "url": current_url, "ready_state": ready_state}
+        title_ok = bool(title.strip()) and "Access Denied" not in title
+        url_ok = "/search" in current_url
+        ready_ok = ready_state in {"interactive", "complete"}
+        if title_ok and url_ok and ready_ok:
+            logger.write(f"READY_CHECK ok title={title!r} ready_state={ready_state} url={current_url}")
+            return True
+        logger.write(f"WAIT  search ready title={title!r} ready_state={ready_state} url={current_url}")
+        time.sleep(READY_POLL_SECONDS)
+    logger.write(f"WARN  search ready timeout last_state={last_state}")
+    return False
+
+
 def main():
     make_dirs()
     logger = RunLogger(RUN_ROOT / "logs/run.log")
@@ -390,7 +497,9 @@ def main():
     logger.write(f"RUN_ROOT={RUN_ROOT}")
     logger.write(
         f"SEARCH_TERM={SEARCH_TERM} pages={pages} page_size={PAGE_SIZE} "
-        f"boot_wait_seconds={BOOT_WAIT_SECONDS} api_wait_seconds={API_WAIT_SECONDS}"
+        f"boot_wait_seconds={BOOT_WAIT_SECONDS} ready_timeout_seconds={READY_TIMEOUT_SECONDS} "
+        f"api_wait_seconds={API_WAIT_SECONDS} api_attempts={API_MAX_ATTEMPTS} "
+        f"api_retry_sleep_seconds={API_RETRY_SLEEP_SECONDS} page_sleep_seconds={API_PAGE_SLEEP_SECONDS}"
     )
 
     driver = launch_driver(logger)
@@ -400,6 +509,7 @@ def main():
         logger.write(f"OPEN  {search_url}")
         driver.get(search_url)
         time.sleep(BOOT_WAIT_SECONDS)
+        wait_for_search_ready(driver, logger)
         logger.write(f"READY title={driver.title!r} url={driver.current_url}")
         fetch_results = collect_pages(driver, tasks, logger)
     finally:
