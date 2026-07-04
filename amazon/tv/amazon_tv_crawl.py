@@ -7,6 +7,9 @@ Amazon TV 통합 크롤러 (운영용)
 STEP 1. Main   - 검색 결과 페이지에서 제품 목록 수집 (최대 300개)
 STEP 2. BSR    - Best Seller 페이지에서 제품 목록 수집 (2페이지)
 STEP 3. Detail - 수집된 모든 제품의 상세 페이지 크롤링 + SKU/item 추출
+STEP 4. Review Auto Recovery - 리뷰 수집률이 임계치(50%) 미만이면
+        dt_update 모드 4(detailed_review_content IS NULL)로 자동 백필.
+        Amazon 리뷰 섹션 신규 레이아웃 간헐 서빙으로 리뷰만 전멸하는 사례 대응.
 
 ================================================================================
 주요 특징
@@ -56,9 +59,16 @@ setup_environment(__file__)
 from amazon.tv.amazon_tv_main import AmazonTVMainCrawler
 from amazon.tv.amazon_tv_bsr import AmazonTVBSRCrawler
 from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+from amazon.tv.amazon_tv_dt_update import AmazonTVDetailUpdateCrawler
 from common.base_crawler import BaseCrawler
 from common.alert_hhp_monitor import format_elapsed_time
 from config import EMAIL_CONFIG
+
+# 리뷰 수집률이 이 비율 미만이면 auto recovery 실행 (STEP 4).
+# 정상 배치는 ~85% 수준이고 리뷰 없는 상품(~30건)이 원래 NULL이므로 50%면 명백한 이상.
+# Amazon이 리뷰 섹션 신규 레이아웃을 간헐 서빙하면 전체 NULL이 되는 사례 대응 (a_20260703_165616).
+REVIEW_RECOVERY_THRESHOLD = 0.5
+REVIEW_RECOVERY_MIN_ROWS = 10
 
 
 def email_config_value(cfg, *keys, default=None):
@@ -95,10 +105,14 @@ def email_config_bool(value, default=False):
     return bool(value)
 
 
-def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed, failed_stages, error_message=None):
+def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed, failed_stages, error_message=None, review_recovery=None):
     detail_report = detail_report or {}
     redirects = detail_report.get('redirects') or []
     run_errors = detail_report.get('run_errors') or []
+    recovery_triggered = bool(review_recovery and review_recovery.get('triggered'))
+    recovery_failed = recovery_triggered and (
+        not review_recovery.get('success') or review_recovery.get('still_low')
+    )
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -118,7 +132,7 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
     detail_blocked = saved_records > 0 and (
         detail_records == 0 or undetailed_records * 2 >= saved_records
     )
-    has_warning = bool(redirects or run_errors or detail_blocked)
+    has_warning = bool(redirects or run_errors or detail_blocked or recovery_triggered)
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
     lines = [
@@ -145,6 +159,23 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
             f"- detail 미수집: {saved_records}건 중 {undetailed_records}건 상세 없이 저장 "
             f"(CAPTCHA/차단 의심)"
         )
+    if recovery_triggered:
+        before_total = review_recovery.get('before_total')
+        before = review_recovery.get('before_with_review')
+        after = review_recovery.get('after_with_review')
+        if review_recovery.get('error'):
+            lines.append(f"- review auto recovery: 실행 실패 ({review_recovery['error']})")
+        else:
+            lines.append(
+                f"- review auto recovery: detailed_review_content "
+                f"{before}/{before_total}건 → {after}/{before_total}건 "
+                f"(복구 {review_recovery.get('recovered', 0)}건)"
+            )
+        if recovery_failed:
+            lines.append(
+                "  - 복구 후에도 리뷰 수집률 임계치 미달 — Amazon 리뷰 레이아웃 변경 "
+                "지속 가능성, 수동 확인 필요"
+            )
     if run_errors:
         lines.append(f"- run errors: {len(run_errors)}건")
         for item in run_errors[:20]:
@@ -235,6 +266,98 @@ class AmazonTVIntegratedCrawler:
         self.base_crawler = BaseCrawler()
         self.korea_tz = pytz.timezone('Asia/Seoul')
 
+    def get_review_coverage(self):
+        """배치의 리뷰 수집 현황 조회: (저장 행 수, detailed_review_content 보유 행 수)"""
+        checker = BaseCrawler()
+        if not checker.connect_db():
+            print("[WARNING] 리뷰 수집률 확인 실패: DB 연결 불가")
+            return None, None
+        try:
+            cursor = checker.db_conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*), COUNT(detailed_review_content)
+                FROM tv_retail_com
+                WHERE account_name = %s AND batch_id = %s
+            """, (self.account_name, self.batch_id))
+            total, with_review = cursor.fetchone()
+            cursor.close()
+            return total, with_review
+        except Exception as e:
+            print(f"[WARNING] 리뷰 수집률 확인 실패: {e}")
+            return None, None
+        finally:
+            try:
+                checker.db_conn.close()
+            except Exception:
+                pass
+
+    def run_review_auto_recovery(self, crawl_results):
+        """STEP 4: 리뷰 수집률이 임계치 미만이면 dt_update 모드 4 백필을 자동 실행.
+
+        Amazon이 리뷰 섹션 신규 레이아웃(인라인 리뷰 없음)을 간헐 서빙하면 별점/가격은
+        정상인데 detailed_review_content만 전멸한다. 이때 새 브라우저 세션으로 재수집하면
+        대부분 복구되므로, 수동 RDP 재실행 대신 오케스트레이터가 직접 1회 시도한다.
+
+        Returns: dict | None — 리커버리 리포트 (미실행 시 None)
+        """
+        detail_ok = (
+            isinstance(crawl_results.get('detail'), dict)
+            and crawl_results['detail'].get('success')
+        )
+        if not detail_ok:
+            return None
+
+        total, with_review = self.get_review_coverage()
+        if total is None:
+            return None
+        if total < REVIEW_RECOVERY_MIN_ROWS:
+            return None
+        if with_review >= total * REVIEW_RECOVERY_THRESHOLD:
+            print(f"\n[STEP 4/4] Review Auto Recovery — 리뷰 수집 정상 "
+                  f"({with_review}/{total}건) → SKIP")
+            return None
+
+        print(f"\n[STEP 4/4] Review Auto Recovery — 리뷰 {with_review}/{total}건, "
+              f"임계치 {REVIEW_RECOVERY_THRESHOLD:.0%} 미달 → mode 4 백필 실행")
+        stage_start = time.time()
+        report = {
+            'triggered': True,
+            'before_total': total,
+            'before_with_review': with_review,
+        }
+        try:
+            update_crawler = AmazonTVDetailUpdateCrawler(
+                batch_id=self.batch_id,
+                mode=AmazonTVDetailUpdateCrawler.MODE_DETAIL_REVIEW_NULL,
+                test_mode=False,
+            )
+            success = update_crawler.run()
+            after_total, after_with_review = self.get_review_coverage()
+            report.update({
+                'success': bool(success),
+                'after_with_review': after_with_review,
+                'recovered': (after_with_review or 0) - with_review,
+                'still_low': (
+                    after_with_review is not None
+                    and after_with_review < total * REVIEW_RECOVERY_THRESHOLD
+                ),
+                'duration': time.time() - stage_start,
+            })
+            print(f"[STEP 4/4] Review Auto Recovery 완료 — "
+                  f"리뷰 {with_review} → {after_with_review}/{total}건")
+            if report['still_low']:
+                print("[WARNING] 복구 후에도 리뷰 수집률 임계치 미달 — "
+                      "Amazon 리뷰 레이아웃 변경 지속 가능성, 수동 확인 필요")
+        except Exception as e:
+            print(f"[ERROR] Review Auto Recovery 실패: {e}")
+            traceback.print_exc()
+            report.update({
+                'success': False,
+                'error': str(e),
+                'duration': time.time() - stage_start,
+            })
+        return report
+
     def run(self):
         """통합 크롤러 실행. Returns: bool"""
         self.start_time_kst = datetime.now(self.korea_tz)
@@ -258,6 +381,7 @@ class AmazonTVIntegratedCrawler:
 
         crawl_results = {'main': None, 'bsr': None, 'detail': None}
         detail_report = None
+        review_recovery = None
 
         try:
             # 결과: {'stage': {'success': bool, 'duration': float}} 형태로 저장
@@ -341,6 +465,14 @@ class AmazonTVIntegratedCrawler:
                     print(f"\n[STEP 3/3] Detail Crawler — BSR 실패로 SKIP")
                 crawl_results['detail'] = 'skipped'
 
+            # STEP 4: 리뷰 수집률 점검 후 필요 시 자동 백필 (dt_update 모드 4)
+            review_recovery = self.run_review_auto_recovery(crawl_results)
+            crawl_results['review_recovery'] = (
+                {'success': bool(review_recovery.get('success')),
+                 'duration': review_recovery.get('duration', 0)}
+                if review_recovery else 'skipped'
+            )
+
             # 결과 출력
             self.end_time = datetime.now()
             elapsed = (self.end_time - self.start_time_server).total_seconds()
@@ -357,10 +489,11 @@ class AmazonTVIntegratedCrawler:
                 print(f"  {step}: {status}")
             print("="*60)
 
-            # 이메일 알림 발송
+            # 이메일 알림 발송 (review_recovery 실패는 SOS가 아니라 WARNING으로 리포트)
             failed_stages = [
                 k for k, v in crawl_results.items()
-                if isinstance(v, dict) and v.get('success') is False
+                if k != 'review_recovery'
+                and isinstance(v, dict) and v.get('success') is False
             ]
             body, severity = build_amazon_tv_email_report(
                 crawl_results=crawl_results,
@@ -368,6 +501,7 @@ class AmazonTVIntegratedCrawler:
                 log_file=log_file,
                 elapsed=elapsed,
                 failed_stages=failed_stages,
+                review_recovery=review_recovery,
             )
             subject = '[USA] AMZN TV crawling report'
             if severity == 'sos':
@@ -380,8 +514,9 @@ class AmazonTVIntegratedCrawler:
             self.base_crawler.stop_logging()
 
             success_count = sum(
-                1 for r in crawl_results.values()
-                if isinstance(r, dict) and r.get('success') is True
+                1 for k, r in crawl_results.items()
+                if k != 'review_recovery'
+                and isinstance(r, dict) and r.get('success') is True
             )
             return success_count > 0
 
@@ -399,6 +534,7 @@ class AmazonTVIntegratedCrawler:
                 elapsed=elapsed,
                 failed_stages=['Fatal error'],
                 error_message=str(e),
+                review_recovery=review_recovery,
             )
             subject = '[USA] AMZN TV crawling report'
             if severity == 'sos':
