@@ -1704,11 +1704,27 @@ def browser_graphql_post(payload, referer_url):
         if navigated and BROWSER_GRAPHQL_WAIT_SECONDS:
             time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
         start = time.perf_counter()
-        envelope = browser_fetch_graphql(
-            BROWSER_GRAPHQL_PAGE,
-            payload,
-            timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
-        )
+        try:
+            envelope = browser_fetch_graphql(
+                BROWSER_GRAPHQL_PAGE,
+                payload,
+                timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
+            )
+        except RuntimeError as exc:
+            if "Failed to fetch" not in str(exc):
+                raise
+            # the page lost its bestbuy.com origin (blocked/error document), so the
+            # relative-URL fetch can never succeed again without a fresh navigation
+            BROWSER_GRAPHQL_PAGE.get(browser_url)
+            BROWSER_GRAPHQL_CURRENT_URL = browser_url
+            navigated = True
+            if BROWSER_GRAPHQL_WAIT_SECONDS:
+                time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+            envelope = browser_fetch_graphql(
+                BROWSER_GRAPHQL_PAGE,
+                payload,
+                timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
+            )
         elapsed = round(time.perf_counter() - start, 3)
     status_code = int(envelope.get("status") or 0)
     text = str(envelope.get("body") or "")
