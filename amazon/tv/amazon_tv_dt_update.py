@@ -4,10 +4,11 @@ Amazon TV Detail 페이지 크롤러 (UPDATE 전용)
 ================================================================================
 실행 모드
 ================================================================================
-- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3] [--start-id N]
-- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3] [--start-id N]
+- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3|4] [--start-id N]
+- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3|4] [--start-id N]
 - batch_id 필수 (인자 또는 stdin)
-- mode: 1=item IS NULL (기본), 2=star_rating/count_of_star_ratings IS NULL, 3=둘 다
+- mode: 1=item IS NULL (기본), 2=star_rating/count_of_star_ratings IS NULL, 3=둘 다,
+        4=detailed_review_content IS NULL (리뷰 본문 백필)
 
 ================================================================================
 주요 기능
@@ -71,6 +72,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
     MODE_ITEM_NULL = '1'
     MODE_REVIEW_NULL = '2'
     MODE_BOTH = '3'
+    MODE_DETAIL_REVIEW_NULL = '4'
     UPDATE_META_FIELDS = {
         'crawl_datetime': 'CURRENT_TIMESTAMP',
     }
@@ -109,6 +111,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             elif self.mode == self.MODE_REVIEW_NULL:
                 condition = f"AND {review_missing_condition}"
                 mode_desc = review_missing_condition
+            elif self.mode == self.MODE_DETAIL_REVIEW_NULL:
+                condition = "AND detailed_review_content IS NULL"
+                mode_desc = "detailed_review_content IS NULL"
             else:
                 condition = "AND item IS NULL"
                 mode_desc = "item IS NULL"
@@ -326,7 +331,7 @@ def main():
     parser = argparse.ArgumentParser(description='Amazon TV Detail Update Crawler')
     parser.add_argument('--batch-id', type=str, help='Batch ID to process')
     parser.add_argument('--start-id', type=int, help='Start from this id (WHERE id >= start_id)')
-    parser.add_argument('--mode', type=str, choices=['1', '2', '3'], help='1: item IS NULL, 2: star_rating/count_of_star_ratings IS NULL, 3: both')
+    parser.add_argument('--mode', type=str, choices=['1', '2', '3', '4'], help='1: item IS NULL, 2: star_rating/count_of_star_ratings IS NULL, 3: both, 4: detailed_review_content IS NULL')
     parser.add_argument('--test', action='store_true', help='Test 모드 — test_tv_retail_com 테이블에서 조회·UPDATE')
     args = parser.parse_args()
 
@@ -367,10 +372,11 @@ def main():
     if not mode:
         print("조회 모드 선택:")
         print("  1: item IS NULL (페이지 에러 재수집)")
-        print("  2: star_rating/count_of_star_ratings IS NULL (리뷰 미수집 재수집)")
+        print("  2: star_rating/count_of_star_ratings IS NULL (별점 미수집 재수집)")
         print("  3: 둘 다 (item IS NULL OR star_rating/count_of_star_ratings IS NULL)")
+        print("  4: detailed_review_content IS NULL (리뷰 본문 미수집 재수집)")
         mode_input = input("모드 입력 (기본: 1): ").strip()
-        mode = mode_input if mode_input in ('1', '2', '3') else '1'
+        mode = mode_input if mode_input in ('1', '2', '3', '4') else '1'
 
     crawler = AmazonTVDetailUpdateCrawler(batch_id=batch_id, start_id=start_id, mode=mode, test_mode=test_mode)
     crawler.run()
