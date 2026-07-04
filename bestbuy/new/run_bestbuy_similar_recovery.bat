@@ -17,7 +17,7 @@ for /f %%i in ('powershell -NoProfile -Command "'%CATEGORY%'.ToLowerInvariant()"
 
 set "RUN_FOLDER=%~2"
 if "%RUN_FOLDER%"=="" (
-  for /f %%i in ('powershell -NoProfile -Command "(Get-ChildItem -LiteralPath '%~dp0bestbuy\data\%CATEGORY_DIR%' -Directory | Sort-Object Name | Select-Object -Last 1).Name"') do set "RUN_FOLDER=%%i"
+  for /f %%i in ('powershell -NoProfile -Command "(Get-ChildItem -LiteralPath '%~dp0bestbuy\data\%CATEGORY_DIR%' -Directory | Where-Object { $_.Name -match '^\d{8}' } | Sort-Object Name | Select-Object -Last 1).Name"') do set "RUN_FOLDER=%%i"
 )
 if "%RUN_FOLDER%"=="" (
   echo [error] no run folder found under bestbuy\data\%CATEGORY_DIR%
