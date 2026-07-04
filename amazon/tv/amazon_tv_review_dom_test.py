@@ -134,9 +134,10 @@ def main():
 
         # 최신 배치에서 상품 10개 조회 (읽기 전용)
         cursor = crawler.db_conn.cursor()
+        # 't_' 테스트 배치가 알파벳순으로 'a_' 뒤에 오므로 운영 배치만 대상
         cursor.execute("""
             SELECT batch_id FROM amazon_tv_product_list
-            WHERE account_name = 'Amazon'
+            WHERE account_name = 'Amazon' AND batch_id LIKE 'a\\_%'
             ORDER BY batch_id DESC LIMIT 1
         """)
         row = cursor.fetchone()
