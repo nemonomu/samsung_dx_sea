@@ -89,6 +89,11 @@ class AmazonBaseCrawler(BaseCrawler):
             except Exception:
                 pass
 
+            # 주의: 쿠키/캐시 선제 삭제를 여기 넣지 말 것. 2026-07-05 실측 결과
+            # amazon.com은 쿠키 없는 신선한 세션에 리뷰 로그인 게이트를 "즉시" 씌운다
+            # (누적 프로필은 정상 → 쿠키 삭제 직후 게이트 → 워밍업 40초로도 미해제).
+            # SIEL(UC, 매 런 임시 프로필)이 무사한 것은 amazon.in에 이 게이트가 없기 때문.
+
             print("[OK] DrissionPage 설정 완료")
 
             zip_code = getattr(self, 'amazon_zip_code', '10001')
