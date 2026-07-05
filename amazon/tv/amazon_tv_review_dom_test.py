@@ -20,12 +20,15 @@ detailed_review_content 전체 NULL 원인 검증용 진단 스크립트.
 
 사용법 (RDP에서):
     python amazon/tv/amazon_tv_review_dom_test.py
+    # 신뢰 프로필(일반 사용 Chrome 프로필 사본)으로 게이트 통과 여부 테스트:
+    python amazon/tv/amazon_tv_review_dom_test.py --user-data-dir "C:\\chrome_profile_amzn"
 """
 
 import sys
 import os
 import json
 import time
+import argparse
 import traceback
 from datetime import datetime
 
@@ -84,6 +87,7 @@ def diagnose(crawler, label):
         'matched_field': matched_field,
         'container_count': len(containers),
         'extracted_review_count': count,
+        'gated': crawler.is_review_gated(page_html),
         'first_review_preview': (content or '')[:150],
         'hook_inventory': hook_inventory(tree),
         'html_markers': {m: page_html.count(m) for m in HTML_MARKERS},
@@ -91,6 +95,11 @@ def diagnose(crawler, label):
 
 
 def main():
+    ap = argparse.ArgumentParser(description='Amazon TV review DOM batch test')
+    ap.add_argument('--user-data-dir', type=str, default=None,
+                    help='신뢰 프로필 사본 경로 — 지정 시 그 프로필로 브라우저 실행 (게이트 통과 테스트)')
+    args = ap.parse_args()
+
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'data', 'review_dom_test', ts)
@@ -112,9 +121,13 @@ def main():
     log(f"COMPUTERNAME: {os.environ.get('COMPUTERNAME', '(없음)')}")
 
     crawler = AmazonTVDetailCrawler(batch_id=f'review_dom_test_{ts}', test_mode=True)
+    if args.user_data_dir:
+        crawler.browser_user_data_dir = args.user_data_dir
+        log(f'신뢰 프로필 모드: {args.user_data_dir}')
     results = {'started_at': ts,
                'sessionname': os.environ.get('SESSIONNAME'),
                'computername': os.environ.get('COMPUTERNAME'),
+               'user_data_dir': args.user_data_dir,
                'products': []}
 
     try:
@@ -224,6 +237,8 @@ def main():
                     entry['verdict'] = 'OK'
                 elif diag2['extracted_review_count'] > 0:
                     entry['verdict'] = 'TIMING (추가 대기 후에만 성공)'
+                elif diag1.get('gated') or diag2.get('gated'):
+                    entry['verdict'] = 'GATED (로그인 게이트)'
                 else:
                     hooks = diag2['hook_inventory'] or {}
                     if 'reviewContainer' in hooks or 'review' in hooks:

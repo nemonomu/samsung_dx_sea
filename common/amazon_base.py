@@ -68,6 +68,15 @@ class AmazonBaseCrawler(BaseCrawler):
             print("[INFO] DrissionPage 설정 중...")
 
             co = ChromiumOptions()
+            # 신뢰 프로필 지정 (opt-in): 리뷰 로그인 게이트는 세션(쿠키 이력) 단위로
+            # 걸리는데, 일반 사용 이력의 익명 프로필은 통과한다(2026-07-05 RDP 실측).
+            # browser_user_data_dir에 그런 프로필의 "사본" 경로를 주면 그 세션 상태로
+            # 크롤링한다. 원본 Chrome과의 충돌을 피하려고 반드시 사본 + 별도 포트 사용.
+            trusted_profile = getattr(self, 'browser_user_data_dir', None)
+            if trusted_profile:
+                co.set_user_data_path(trusted_profile)
+                co.auto_port()
+                print(f"[INFO] 신뢰 프로필로 브라우저 실행: {trusted_profile}")
             # 이미지 허용, 미디어/플러그인 로드는 비활성화
             co.set_pref('profile.managed_default_content_settings.images', 1)
             co.set_pref('profile.managed_default_content_settings.media_stream', 2)
