@@ -43,6 +43,12 @@ setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
 
+# 신뢰 프로필 (리뷰 로그인 게이트 통행권) — detail 스테이지 전용.
+# 일반 사용 Chrome 프로필의 사본으로 브라우저를 띄우면 게이트를 통과한다
+# (2026-07-05 RDP 실측). 사본 생성/리프레시: amazon/tv/make_trusted_profile.bat
+# 폴더가 없으면 기존 기본 프로필로 동작 (하위 호환).
+TRUSTED_PROFILE_DIR = r'C:\chrome_profile_amzn'
+
 # 리뷰 로그인 게이트("account verification") 대응 정책 — 감지/기록/스킵만 한다.
 # 실측 근거(2026-07-04~05):
 #   - 브라우저 재시작(쿠키 유지)으로 안 풀림 (7/4 19:07 recovery, 재시작 직후에도 지속)
@@ -141,6 +147,12 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             'review_gate_restarts': 0,   # 게이트로 인한 브라우저 재시작 횟수
         }
         self._first_detail_html_saved = False
+        # 신뢰 프로필 적용 (detail 전용 — dt_update는 자체적으로 해제함)
+        if os.path.isdir(TRUSTED_PROFILE_DIR):
+            self.browser_user_data_dir = TRUSTED_PROFILE_DIR
+        else:
+            print(f"[INFO] 신뢰 프로필 없음({TRUSTED_PROFILE_DIR}) → 기본 프로필 사용 "
+                  f"(생성: amazon/tv/make_trusted_profile.bat)")
 
     def _normalize_redirect_name(self, value):
         """Compare redirect names by ignoring only whitespace runs and case."""

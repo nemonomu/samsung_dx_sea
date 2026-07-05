@@ -70,12 +70,6 @@ from config import EMAIL_CONFIG
 REVIEW_RECOVERY_THRESHOLD = 0.5
 REVIEW_RECOVERY_MIN_ROWS = 10
 
-# STEP 4 실행 전 게이트 프로브: detail 직후에는 리뷰 로그인 게이트가 아직 안 풀린
-# 전례가 있어(2026-07-04 19:07 recovery 헛런), 상품 1개로 게이트 여부를 먼저 확인하고
-# 게이트면 대기 후 재확인한다. 게이트는 세션 단위(all-or-nothing)라 1개 샘플로 충분.
-RECOVERY_GATE_PROBE_MAX = 4          # 프로브 최대 횟수
-RECOVERY_GATE_PROBE_WAIT_SEC = 1800  # 게이트 감지 시 재프로브까지 대기 (30분)
-
 
 def email_config_value(cfg, *keys, default=None):
     for key in keys:
@@ -179,22 +173,15 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
         before_total = review_recovery.get('before_total')
         before = review_recovery.get('before_with_review')
         after = review_recovery.get('after_with_review')
-        probe_attempts = review_recovery.get('probe_attempts', 0)
-        if review_recovery.get('gate_persisted'):
-            lines.append(
-                f"- review auto recovery: 게이트 프로브 {probe_attempts}회 전부 로그인 게이트 지속 "
-                f"→ 백필 포기 (리뷰 {before}/{before_total}건 유지, 다음 배치에서 재시도)"
-            )
-        elif review_recovery.get('error'):
+        if review_recovery.get('error'):
             lines.append(f"- review auto recovery: 실행 실패 ({review_recovery['error']})")
         else:
-            probe_note = f" (게이트 프로브 {probe_attempts}회 후 진행)" if probe_attempts > 1 else ""
             lines.append(
                 f"- review auto recovery: detailed_review_content "
                 f"{before}/{before_total}건 → {after}/{before_total}건 "
-                f"(복구 {review_recovery.get('recovered', 0)}건){probe_note}"
+                f"(복구 {review_recovery.get('recovered', 0)}건)"
             )
-        if recovery_failed and not review_recovery.get('gate_persisted'):
+        if recovery_failed:
             lines.append(
                 "  - 복구 후에도 리뷰 수집률 임계치 미달 — 로그인 게이트 지속 가능성, "
                 "수동 확인 필요"
@@ -314,90 +301,6 @@ class AmazonTVIntegratedCrawler:
             except Exception:
                 pass
 
-    def _get_sample_product_url(self):
-        """이 배치에서 게이트 프로브에 쓸 상품 URL 1개 조회."""
-        checker = BaseCrawler()
-        if not checker.connect_db():
-            return None
-        try:
-            cursor = checker.db_conn.cursor()
-            cursor.execute("""
-                SELECT product_url FROM tv_retail_com
-                WHERE account_name = %s AND batch_id = %s AND product_url IS NOT NULL
-                LIMIT 1
-            """, (self.account_name, self.batch_id))
-            row = cursor.fetchone()
-            cursor.close()
-            return row[0] if row else None
-        except Exception as e:
-            print(f"[WARNING] 프로브용 상품 URL 조회 실패: {e}")
-            return None
-        finally:
-            try:
-                checker.db_conn.close()
-            except Exception:
-                pass
-
-    def _probe_review_gate_once(self, url):
-        """새 브라우저 세션으로 상품 1개를 열어 리뷰 게이트 여부 확인.
-
-        Returns: True=게이트 감지, False=정상, None=판단 불가(프로브 실패)
-        """
-        crawler = AmazonTVDetailCrawler(batch_id=self.batch_id, test_mode=False)
-        try:
-            if not crawler.setup_browser():
-                return None
-            crawler.page.get(url)
-            time.sleep(3)
-            try:
-                crawler.page.run_js(
-                    "var e = document.getElementById('reviewsMedley')"
-                    " || document.getElementById('customer-reviews_feature_div');"
-                    " if (e) e.scrollIntoView({block: 'center', behavior: 'instant'});"
-                )
-            except Exception:
-                pass
-            time.sleep(3)
-            return crawler.is_review_gated()
-        except Exception as e:
-            print(f"[STEP 4/4] 게이트 프로브 실패: {e}")
-            return None
-        finally:
-            if crawler.page:
-                try:
-                    crawler.page.quit()
-                except Exception:
-                    pass
-
-    def _wait_for_gate_release(self):
-        """게이트가 풀릴 때까지 프로브+대기 반복.
-
-        Returns: (proceed: bool, probe_attempts: int)
-        - 게이트 미감지/판단불가 → True (recovery 진행)
-        - RECOVERY_GATE_PROBE_MAX회 모두 게이트 → False (recovery 포기)
-        """
-        sample_url = self._get_sample_product_url()
-        if not sample_url:
-            print("[STEP 4/4] 프로브용 URL 없음 → 프로브 생략하고 recovery 진행")
-            return True, 0
-
-        for attempt in range(1, RECOVERY_GATE_PROBE_MAX + 1):
-            gated = self._probe_review_gate_once(sample_url)
-            if gated is True:
-                print(f"[STEP 4/4] 게이트 프로브 {attempt}/{RECOVERY_GATE_PROBE_MAX}: "
-                      f"로그인 게이트 지속")
-                if attempt < RECOVERY_GATE_PROBE_MAX:
-                    print(f"[STEP 4/4] {RECOVERY_GATE_PROBE_WAIT_SEC // 60}분 대기 후 재확인")
-                    time.sleep(RECOVERY_GATE_PROBE_WAIT_SEC)
-                continue
-            if gated is False:
-                print(f"[STEP 4/4] 게이트 프로브 {attempt}/{RECOVERY_GATE_PROBE_MAX}: "
-                      f"게이트 해제 확인 → recovery 진행")
-            else:
-                print(f"[STEP 4/4] 게이트 프로브 판단 불가 → recovery 진행 (실행 중 게이트 감지가 재차 방어)")
-            return True, attempt
-        return False, RECOVERY_GATE_PROBE_MAX
-
     def run_review_auto_recovery(self, crawl_results):
         """STEP 4: 리뷰 수집률이 임계치 미만이면 dt_update 모드 4 백필을 자동 실행.
 
@@ -425,31 +328,13 @@ class AmazonTVIntegratedCrawler:
             return None
 
         print(f"\n[STEP 4/4] Review Auto Recovery — 리뷰 {with_review}/{total}건, "
-              f"임계치 {REVIEW_RECOVERY_THRESHOLD:.0%} 미달 → mode 4 백필 준비")
+              f"임계치 {REVIEW_RECOVERY_THRESHOLD:.0%} 미달 → mode 4 백필 실행")
         stage_start = time.time()
         report = {
             'triggered': True,
             'before_total': total,
             'before_with_review': with_review,
         }
-
-        # 게이트 프로브: detail 직후에는 로그인 게이트가 안 풀렸을 수 있어
-        # 상품 1개로 확인 후 진행 (게이트 지속이면 대기→재확인, 끝까지 지속이면 포기)
-        proceed, probe_attempts = self._wait_for_gate_release()
-        report['probe_attempts'] = probe_attempts
-        if not proceed:
-            print("[WARNING] 게이트 프로브 전 회차 로그인 게이트 지속 — recovery 포기 "
-                  "(다음 배치 STEP 4에서 재시도)")
-            report.update({
-                'success': False,
-                'gate_persisted': True,
-                'after_with_review': with_review,
-                'recovered': 0,
-                'still_low': True,
-                'duration': time.time() - stage_start,
-            })
-            return report
-
         try:
             update_crawler = AmazonTVDetailUpdateCrawler(
                 batch_id=self.batch_id,
