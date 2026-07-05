@@ -74,8 +74,20 @@ class AmazonBaseCrawler(BaseCrawler):
             co.set_pref('profile.managed_default_content_settings.plugins', 2)
             # 미디어 자동 재생 차단
             co.set_argument('--autoplay-policy=document-user-activation-required')
+            # 백그라운드/비포커스 상태에서 JS 타이머·렌더러 스로틀링 방지 (SIEL 검증 세트).
+            # RDP 창이 가려지거나 세션이 백그라운드일 때 lazy-load(리뷰 위젯 등)가
+            # 멈춰서 추출이 비는 문제를 차단한다.
+            co.set_argument('--disable-background-timer-throttling')
+            co.set_argument('--disable-backgrounding-occluded-windows')
+            co.set_argument('--disable-renderer-backgrounding')
+            co.set_argument('--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling')
             self.page = ChromiumPage(co)
             self.page.set.window.max()
+            # 포커스 없는 창에서도 focus 상태로 에뮬레이션 — lazy-load 트리거 유지 (SIEL 패턴)
+            try:
+                self.page.run_cdp('Emulation.setFocusEmulationEnabled', enabled=True)
+            except Exception:
+                pass
 
             print("[OK] DrissionPage 설정 완료")
 
@@ -616,6 +628,110 @@ class AmazonBaseCrawler(BaseCrawler):
             print(f"[ERROR] Review extraction failed: {e}")
             traceback.print_exc()
             return None, 0
+
+    # 리뷰 로그인 게이트 감지 마커 — 2026-07-03 배치 캡처에서 확인된 실물 문구
+    # "Customer reviews require account verification. Sign in" (a_20260703_165616 참고)
+    REVIEW_GATE_MARKERS = (
+        'reviews require account verification',
+        'account verification required',
+    )
+
+    def is_review_gated(self, page_html=None):
+        """리뷰 로그인 게이트 감지.
+
+        Amazon이 세션을 의심하면 리뷰 리스트 자리에 계정 인증 배너를 띄우고
+        review 컨테이너를 아예 렌더하지 않는다. 별점/요약/가격은 정상이라
+        게이트를 감지하지 못하면 detailed_review_content만 조용히 전멸한다.
+        """
+        try:
+            source = (page_html if page_html is not None else self.page.html).lower()
+        except Exception:
+            return False
+        return any(marker in source for marker in self.REVIEW_GATE_MARKERS)
+
+    def extract_reviews_with_retry(self, tree, max_reviews=20, page_html=None):
+        """리뷰 추출 + 게이트 감지 + lazy-load 3단 재시도 (SIEL detail.py 검증 패턴 이식).
+
+        - 게이트 감지 시 재시도 없이 즉시 반환 (재시도 무의미 — 세션 단위 차단)
+        - 1차 추출 실패 시: 리뷰 섹션 scrollIntoView → 3초 대기 → 재파싱/재추출
+        - 재실패 시: 3초 추가 대기 → 최종 재추출
+          (SIEL: "같은 product가 timing 따라 fill/null 변동. full-run 0/N 회귀 방지")
+
+        Returns:
+            (content, count, gated): 기존 extract_reviews_from_detail_page 반환값 + 게이트 여부
+        """
+        if page_html is None:
+            try:
+                page_html = self.page.html
+            except Exception:
+                page_html = ''
+
+        if self.is_review_gated(page_html):
+            print("  [리뷰] 로그인 게이트 감지 (account verification) → 추출 불가")
+            return None, 0, True
+
+        content, count = self.extract_reviews_from_detail_page(tree, max_reviews)
+        if count:
+            return content, count, False
+
+        # lazy-load 재시도 1: 리뷰 섹션 중앙 스크롤 + settle
+        try:
+            self.page.run_js(
+                "var e = document.getElementById('reviewsMedley')"
+                " || document.getElementById('customer-reviews_feature_div');"
+                " if (e) e.scrollIntoView({block: 'center', behavior: 'instant'});"
+            )
+        except Exception:
+            pass
+        time.sleep(3)
+        try:
+            tree = html.fromstring(self.page.html)
+        except Exception:
+            return content, count, False
+        content, count = self.extract_reviews_from_detail_page(tree, max_reviews)
+        if count:
+            print("  [리뷰] lazy-load 재시도 1차 성공")
+            return content, count, False
+
+        # lazy-load 재시도 2: 추가 대기 후 최종 시도
+        time.sleep(3)
+        try:
+            page_html = self.page.html
+            tree = html.fromstring(page_html)
+        except Exception:
+            return content, count, False
+        content, count = self.extract_reviews_from_detail_page(tree, max_reviews)
+        if count:
+            print("  [리뷰] lazy-load 재시도 2차 성공")
+            return content, count, False
+
+        # 최종 실패 — 스크롤/렌더 중 게이트가 새로 떴는지 재확인
+        return content, count, self.is_review_gated(page_html)
+
+    def save_debug_html(self, tag, max_files=3):
+        """진단용 HTML 스냅샷을 logs/에 저장 (SIEL maybe_save_html 패턴).
+
+        배치당 max_files개까지만 저장해 디스크 폭주를 막는다.
+        장애 시 캡처 이미지 대신 실제 DOM으로 원인을 즉시 확인하는 용도.
+        """
+        try:
+            if not hasattr(self, '_debug_html_count'):
+                self._debug_html_count = 0
+            if self._debug_html_count >= max_files:
+                return None
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            logs_dir = os.path.join(project_root, 'logs')
+            os.makedirs(logs_dir, exist_ok=True)
+            filename = f"{self.batch_id or 'nobatch'}_{tag}.html"
+            filepath = os.path.join(logs_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(self.page.html)
+            self._debug_html_count += 1
+            print(f"  [진단] HTML 스냅샷 저장: {filename}")
+            return filepath
+        except Exception as e:
+            print(f"  [진단] HTML 스냅샷 저장 실패: {e}")
+            return None
 
     def move_to_review_section(self, has_review_link):
         """리뷰 섹션 이동: top 리뷰 링크 우선, 실패 시 원래 위치에서 review_section 탐색."""

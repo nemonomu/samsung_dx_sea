@@ -43,6 +43,14 @@ setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
 
+# 리뷰 로그인 게이트("account verification") 대응 정책.
+# 게이트는 세션 단위로 걸리므로(2026-07-03 사건: 253/253 전멸) 연속 감지 시
+# 쿠키 초기화 + 대기 + 브라우저 재시작으로 새 세션을 시도하고, 재시작을
+# 소진하면 리뷰만 포기하고 나머지 필드 수집을 계속한다 (백필은 dt_update 모드 4).
+REVIEW_GATE_STREAK_LIMIT = 3      # 연속 게이트 감지 N건이면 세션 재시작
+REVIEW_GATE_RESTART_LIMIT = 2     # 런당 게이트 재시작 최대 횟수
+REVIEW_GATE_RESTART_WAIT_SEC = 300  # 재시작 전 대기 (즉시 재시작은 게이트가 유지된 전례 있음)
+
 
 class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # ========================================================================
@@ -129,7 +137,13 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             'saved_records': 0,
             'redirects': [],
             'run_errors': [],
+            'review_gated_count': 0,     # 리뷰 로그인 게이트 감지 상품 수
+            'review_gate_restarts': 0,   # 게이트로 인한 브라우저 재시작 횟수
         }
+        # 리뷰 게이트 대응 상태 (연속 감지 카운트 / 재시작 사용 횟수)
+        self._review_gate_streak = 0
+        self._review_gate_restarts = 0
+        self._first_detail_html_saved = False
 
     def _normalize_redirect_name(self, value):
         """Compare redirect names by ignoring only whitespace runs and case."""
@@ -478,6 +492,38 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # ========================================================================
     # Detail Crawl
     # ========================================================================
+    def _handle_review_gate(self, item):
+        """리뷰 로그인 게이트 감지 시 대응 정책.
+
+        - 감지 건수/연속 카운트 누적 (이메일 리포트용)
+        - 첫 감지 상품의 DOM 스냅샷 저장 (진단용)
+        - 연속 REVIEW_GATE_STREAK_LIMIT건이면: 쿠키 초기화 → 대기 → 브라우저 재시작
+          (런당 REVIEW_GATE_RESTART_LIMIT회까지 — 소진 후에는 리뷰만 포기하고
+          나머지 필드 수집을 계속한다. 리뷰 백필은 dt_update 모드 4 / STEP 4 몫)
+        """
+        self.detail_report['review_gated_count'] = self.detail_report.get('review_gated_count', 0) + 1
+        self._review_gate_streak += 1
+
+        if self.detail_report['review_gated_count'] == 1:
+            self.save_debug_html(f'review_gate_{item or "unknown"}')
+
+        if (self._review_gate_streak >= REVIEW_GATE_STREAK_LIMIT
+                and self._review_gate_restarts < REVIEW_GATE_RESTART_LIMIT):
+            self._review_gate_restarts += 1
+            self.detail_report['review_gate_restarts'] = self._review_gate_restarts
+            self._review_gate_streak = 0
+            print(f"  [리뷰] 게이트 연속 {REVIEW_GATE_STREAK_LIMIT}건 → 쿠키 초기화 후 브라우저 재시작 "
+                  f"({self._review_gate_restarts}/{REVIEW_GATE_RESTART_LIMIT})")
+            try:
+                self.page.set.cookies.clear()
+                print("  [리뷰] 쿠키 초기화 완료")
+            except Exception as e:
+                print(f"  [리뷰] 쿠키 초기화 실패(무시): {e}")
+            print(f"  [리뷰] 재시작 전 {REVIEW_GATE_RESTART_WAIT_SEC}초 대기 (게이트 해제 유도)")
+            time.sleep(REVIEW_GATE_RESTART_WAIT_SEC)
+            if not self.restart_browser():
+                print("  [리뷰] 게이트 대응 브라우저 재시작 실패 — 다음 상품에서 기존 흐름으로 복구 시도")
+
     def crawl_detail(self, product):
         """상세 페이지 크롤링: 페이지 로드 → 가격/상태 추출 → TV 스펙 추출 → 리뷰 추출"""
         try:
@@ -595,7 +641,13 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             self.move_to_review_section(has_review_link)
             if capture_allowed:
                 self.take_capture(item, 3)
-            tree = html.fromstring(self.page.html)
+            page_html = self.page.html
+            tree = html.fromstring(page_html)
+
+            # 진단용: 런당 첫 상품의 리뷰 섹션 시점 DOM 스냅샷 (장애 시 원인 즉시 확인용)
+            if not self._first_detail_html_saved:
+                self._first_detail_html_saved = True
+                self.save_debug_html(f'detail_first_{item or "unknown"}')
 
             # 리뷰 없음 문구를 먼저 감지하고, 별점/별점 수는 한 번만 추출한다.
             no_review_keywords = ['no customer reviews', 'there are 0 customer reviews']
@@ -615,12 +667,20 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
             detailed_review_content = None
             extracted_count = 0
+            review_gated = False
             if is_no_reviews:
                 print(f"  [리뷰] 리뷰 없음")
+                self._review_gate_streak = 0
             else:
                 print(f"  [리뷰] 상품 상세페이지에서 추출 중...")
-                detailed_review_content, extracted_count = self.extract_reviews_from_detail_page(tree, max_reviews=20)
+                detailed_review_content, extracted_count, review_gated = self.extract_reviews_with_retry(
+                    tree, max_reviews=20, page_html=page_html
+                )
                 print(f"  [리뷰] 상품 상세페이지 추출 완료: {extracted_count}건")
+                if review_gated:
+                    self._handle_review_gate(item)
+                else:
+                    self._review_gate_streak = 0
 
             # 결합된 데이터
             combined_data = product.copy()
@@ -675,7 +735,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             print(f"  ├─ model_year: {model_year or '-'}")
             print(f"  ├─ screen_size: {f'{screen_size} (출처: {spec_source})' if screen_size and spec_source else (screen_size or '-')}")
             print(f"  ├─ summarized_review_content: {'있음' if summarized_review_content else '-'}")
-            print(f"  └─ detailed_review_content: {extracted_count}개")
+            print(f"  └─ detailed_review_content: {extracted_count}개{' (로그인 게이트)' if review_gated else ''}")
 
             return combined_data
 
