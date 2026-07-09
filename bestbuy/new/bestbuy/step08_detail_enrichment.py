@@ -90,6 +90,16 @@ BROWSER_GRAPHQL_WAIT_SECONDS = max(
 BROWSER_GRAPHQL_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT", "120")))
 BROWSER_GRAPHQL_HEADLESS = env_bool("BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS", "1")
 BROWSER_GRAPHQL_LOCAL_PORT = env_int("BESTBUY_DETAIL_BROWSER_GRAPHQL_LOCAL_PORT", "0")
+# Recovery for the "Failed to fetch" dead-page: how many times to retry a batch
+# fetch after the page loses its bestbuy.com origin, and from which attempt to
+# stop just re-navigating and instead recreate the whole browser session (a
+# fresh page clears a poisoned/challenged session that a bare re-nav cannot).
+BROWSER_GRAPHQL_MAX_RECOVERIES = max(0, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_MAX_RECOVERIES", "3")))
+BROWSER_GRAPHQL_RECREATE_AFTER = max(1, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_RECREATE_AFTER", "2")))
+BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS = max(
+    0.0,
+    float(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS", "5")),
+)
 STAGE = os.getenv("BESTBUY_DETAIL_STAGE", "detail").lower()
 SAVE_HTML_MODE = os.getenv("BESTBUY_SAVE_HTML_MODE", "slim").lower()
 DETAIL_SCROLL = os.getenv("BESTBUY_DETAIL_SCROLL", "1").lower() in {"1", "true", "yes", "y"}
@@ -1690,6 +1700,20 @@ def close_detail_browser_page():
     BROWSER_GRAPHQL_CURRENT_URL = ""
 
 
+def recover_detail_browser_session(browser_url, recreate):
+    """Re-establish the browser page after a "Failed to fetch". When recreate is
+    True the poisoned page is closed and a fresh one opened (clears a challenged
+    session a bare re-nav cannot); otherwise the existing page is re-navigated.
+    Leaves BROWSER_GRAPHQL_CURRENT_URL set. Must be called under BROWSER_GRAPHQL_LOCK."""
+    global BROWSER_GRAPHQL_CURRENT_URL
+    if recreate:
+        close_detail_browser_page()
+        open_detail_browser_page()
+    # BROWSER_GRAPHQL_PAGE is the (possibly fresh) module global after open above.
+    BROWSER_GRAPHQL_PAGE.get(browser_url)
+    BROWSER_GRAPHQL_CURRENT_URL = browser_url
+
+
 def browser_graphql_post(payload, referer_url):
     global BROWSER_GRAPHQL_CURRENT_URL
     if BROWSER_GRAPHQL_PAGE is None:
@@ -1713,18 +1737,46 @@ def browser_graphql_post(payload, referer_url):
         except RuntimeError as exc:
             if "Failed to fetch" not in str(exc):
                 raise
-            # the page lost its bestbuy.com origin (blocked/error document), so the
-            # relative-URL fetch can never succeed again without a fresh navigation
-            BROWSER_GRAPHQL_PAGE.get(browser_url)
-            BROWSER_GRAPHQL_CURRENT_URL = browser_url
-            navigated = True
-            if BROWSER_GRAPHQL_WAIT_SECONDS:
-                time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
-            envelope = browser_fetch_graphql(
-                BROWSER_GRAPHQL_PAGE,
-                payload,
-                timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
-            )
+            # The page lost its bestbuy.com origin (blocked/challenge/error
+            # document), so the relative-URL fetch keeps failing. Re-navigate,
+            # and once a bare re-nav has not helped, recreate the whole session;
+            # back off longer each attempt in case it is rate-limit driven.
+            envelope = None
+            last_exc = exc
+            for attempt in range(1, BROWSER_GRAPHQL_MAX_RECOVERIES + 1):
+                recreate = attempt >= BROWSER_GRAPHQL_RECREATE_AFTER
+                print(
+                    format_log_line(
+                        "detail:browser_recover",
+                        attempt=attempt,
+                        of=BROWSER_GRAPHQL_MAX_RECOVERIES,
+                        action="recreate" if recreate else "renavigate",
+                    ),
+                    flush=True,
+                )
+                try:
+                    recover_detail_browser_session(browser_url, recreate)
+                except Exception as recover_exc:  # noqa: BLE001 - browser relaunch can fail many ways
+                    last_exc = recover_exc
+                    continue
+                navigated = True
+                sleep_seconds = BROWSER_GRAPHQL_WAIT_SECONDS + BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS * attempt
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                try:
+                    envelope = browser_fetch_graphql(
+                        BROWSER_GRAPHQL_PAGE,
+                        payload,
+                        timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
+                    )
+                    break
+                except RuntimeError as retry_exc:
+                    if "Failed to fetch" not in str(retry_exc):
+                        raise
+                    last_exc = retry_exc
+                    envelope = None
+            if envelope is None:
+                raise last_exc
         elapsed = round(time.perf_counter() - start, 3)
     status_code = int(envelope.get("status") or 0)
     text = str(envelope.get("body") or "")
