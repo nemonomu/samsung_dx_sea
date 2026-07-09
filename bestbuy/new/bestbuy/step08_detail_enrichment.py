@@ -5079,7 +5079,11 @@ def ref_capacity_from_name(product_name):
     match = re.search(r"(\d+(?:\.\d+)?)\s*(?:cu\.?\s*ft\.?|cuft|cubic\s*feet)", text, re.I)
     if not match:
         return ""
-    amount = match.group(1).rstrip("0").rstrip(".")
+    amount = match.group(1)
+    # only trim trailing zeros of a DECIMAL (e.g. "28.60" -> "28.6", "25.0" -> "25");
+    # never strip zeros from an integer, or "30"/"20"/"100" would become "3"/"2"/"1".
+    if "." in amount:
+        amount = amount.rstrip("0").rstrip(".")
     return f"{amount} cubic feet"
 
 
