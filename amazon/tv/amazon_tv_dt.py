@@ -24,6 +24,8 @@ import sys
 import os
 import time
 import random
+import shutil
+import subprocess
 import traceback
 import re
 from datetime import datetime
@@ -45,9 +47,69 @@ from common.amazon_base import AmazonBaseCrawler
 
 # 신뢰 프로필 (리뷰 로그인 게이트 통행권) — detail 스테이지 전용.
 # 일반 사용 Chrome 프로필의 사본으로 브라우저를 띄우면 게이트를 통과한다
-# (2026-07-05 RDP 실측). 사본 생성/리프레시: amazon/tv/make_trusted_profile.bat
-# 폴더가 없으면 기존 기본 프로필로 동작 (하위 호환).
+# (2026-07-05 RDP 실측). 사본의 유효기간이 ~2일에 불과해(2026-07-08 관측)
+# detail 런 시작 시마다 원본에서 자동 리프레시한다 — 원본은 크롤링에 쓰이지
+# 않아 정상 사용 토큰 회전으로 신뢰가 유지되는 "통행증 발급처" 역할.
+# 원본/사본 둘 다 없으면 기존 기본 프로필로 동작 (하위 호환).
 TRUSTED_PROFILE_DIR = r'C:\chrome_profile_amzn'
+TRUSTED_PROFILE_SOURCE = os.path.join(
+    os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
+# 사본에 필요한 최소 파일 (Cookies가 핵심 — 세션 신원)
+_TRUSTED_PROFILE_FILES = [
+    ('Local State',),
+    ('Default', 'Preferences'),
+    ('Default', 'Network', 'Cookies'),
+]
+
+
+def refresh_trusted_profile(source_dir=None, dest_dir=None):
+    """신뢰 프로필 사본을 원본 Chrome 프로필에서 리프레시.
+
+    Cookies가 Chrome 실행 중 잠금이면 esentutl /vss로 우회 복사한다
+    (make_trusted_profile.bat과 동일 로직의 Python 구현).
+
+    Returns:
+        bool: 핵심 파일(Cookies)까지 갱신 성공 여부. 실패해도 기존 사본은 보존됨.
+    """
+    source_dir = source_dir or TRUSTED_PROFILE_SOURCE
+    dest_dir = dest_dir or TRUSTED_PROFILE_DIR
+
+    if not os.path.exists(os.path.join(source_dir, 'Local State')):
+        print(f"[INFO] 신뢰 프로필 원본 없음({source_dir}) → 리프레시 생략")
+        return False
+
+    cookies_ok = False
+    for parts in _TRUSTED_PROFILE_FILES:
+        src = os.path.join(source_dir, *parts)
+        dst = os.path.join(dest_dir, *parts)
+        if not os.path.exists(src):
+            print(f"[WARNING] 신뢰 프로필 원본 파일 없음: {src}")
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        is_cookies = parts[-1] == 'Cookies'
+        try:
+            shutil.copy2(src, dst)
+            if is_cookies:
+                cookies_ok = True
+        except (PermissionError, OSError):
+            # Chrome 실행 중 잠금 — VSS 스냅샷 복사로 우회
+            try:
+                result = subprocess.run(
+                    ['esentutl', '/y', src, '/vss', '/d', dst],
+                    capture_output=True, timeout=120,
+                )
+                if result.returncode == 0 and is_cookies:
+                    cookies_ok = True
+                elif result.returncode != 0:
+                    print(f"[WARNING] 신뢰 프로필 VSS 복사 실패({parts[-1]}): rc={result.returncode}")
+            except Exception as e:
+                print(f"[WARNING] 신뢰 프로필 복사 실패({parts[-1]}): {e}")
+
+    if cookies_ok:
+        print(f"[INFO] 신뢰 프로필 리프레시 완료: {source_dir} → {dest_dir}")
+    else:
+        print("[WARNING] 신뢰 프로필 Cookies 갱신 실패 — 기존 사본으로 진행")
+    return cookies_ok
 
 # 리뷰 로그인 게이트("account verification") 대응 정책 — 감지/기록/스킵만 한다.
 # 실측 근거(2026-07-04~05):
@@ -147,12 +209,9 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             'review_gate_restarts': 0,   # 게이트로 인한 브라우저 재시작 횟수
         }
         self._first_detail_html_saved = False
-        # 신뢰 프로필 적용 (detail 전용 — dt_update는 자체적으로 해제함)
-        if os.path.isdir(TRUSTED_PROFILE_DIR):
-            self.browser_user_data_dir = TRUSTED_PROFILE_DIR
-        else:
-            print(f"[INFO] 신뢰 프로필 없음({TRUSTED_PROFILE_DIR}) → 기본 프로필 사용 "
-                  f"(생성: amazon/tv/make_trusted_profile.bat)")
+        # 신뢰 프로필 사용 여부 — detail 전용 (dt_update는 __init__에서 False로 해제).
+        # 실제 리프레시/적용은 initialize()에서 브라우저 실행 직전에 수행.
+        self.use_trusted_profile = True
 
     def _normalize_redirect_name(self, value):
         """Compare redirect names by ignoring only whitespace runs and case."""
@@ -400,6 +459,16 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         # 3. XPath 로드
         if not self.load_xpaths(self.account_name, self.page_type, 'SEA', 'TV'):
             return False
+
+        # 3.5. 신뢰 프로필 리프레시 + 적용 (detail 전용) — 사본 유효기간이 ~2일이라
+        # 매 런 원본에서 새로 발급. 리프레시 실패 시 기존 사본, 그것도 없으면 기본 프로필.
+        if getattr(self, 'use_trusted_profile', False):
+            refresh_trusted_profile()
+            cookies_path = os.path.join(TRUSTED_PROFILE_DIR, 'Default', 'Network', 'Cookies')
+            if os.path.exists(cookies_path):
+                self.browser_user_data_dir = TRUSTED_PROFILE_DIR
+            else:
+                print(f"[INFO] 신뢰 프로필 사본 없음({TRUSTED_PROFILE_DIR}) → 기본 프로필 사용")
 
         # 4. 브라우저 설정 (DrissionPage)
         try:

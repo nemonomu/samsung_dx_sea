@@ -86,6 +86,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
         # UPDATE 모드는 재추출 검증용이라 캡처 불필요
         self.capture_enabled = False
         # 신뢰 프로필은 detail 스테이지 전용 — UPDATE 크롤러는 기본 프로필 사용
+        self.use_trusted_profile = False
         self.browser_user_data_dir = None
 
     @property
