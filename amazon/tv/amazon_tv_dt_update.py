@@ -85,9 +85,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
 
         # UPDATE 모드는 재추출 검증용이라 캡처 불필요
         self.capture_enabled = False
-        # 신뢰 프로필은 detail 스테이지 전용 — UPDATE 크롤러는 기본 프로필 사용
-        self.use_trusted_profile = False
-        self.browser_user_data_dir = None
+        # 신뢰 프로필 사용 (detail과 동일) — 리뷰 게이트 통과용.
+        # 부모 initialize()가 매 런 원본에서 사본을 리프레시해 적용한다.
+        self.use_trusted_profile = True
 
     @property
     def target_table(self):
