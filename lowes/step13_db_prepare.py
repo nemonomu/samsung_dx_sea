@@ -21,6 +21,15 @@ TARGET_SCHEMA = os.getenv("LOWES_DB_SCHEMA", "public").strip() or "public"
 TARGET_TABLE = lowes_output_table()
 PRODUCT_TYPE = lowes_product_type().upper()
 TARGET_COLUMNS = erd_field_order(PRODUCT_TYPE)
+REF_ITEM_MST_TABLE = os.getenv("LOWES_REF_ITEM_MST_TABLE", "ref_item_mst").strip() or "ref_item_mst"
+REF_ITEM_MST_COLUMNS = [
+    "sku",
+    "ref_capacity",
+    "ref_refrigerator_type",
+    "product_url",
+    "retailer_sku_name",
+    "account_name",
+]
 DRY_RUN = os.getenv("LOWES_DB_PREPARE_DRY_RUN", os.getenv("LOWES_DB_DRY_RUN", "0")).strip().lower() in {
     "1",
     "true",
@@ -94,6 +103,50 @@ def ensure_table(cur):
         )
 
 
+def ensure_ref_item_mst_table(cur):
+    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(TARGET_SCHEMA)}")
+    column_defs = ",\n          ".join(f"{quote_ident(column_name)} text" for column_name in REF_ITEM_MST_COLUMNS)
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {quote_ident(TARGET_SCHEMA)}.{quote_ident(REF_ITEM_MST_TABLE)} (
+          id bigserial PRIMARY KEY,
+          {column_defs}
+        )
+        """
+    )
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        """,
+        (TARGET_SCHEMA, REF_ITEM_MST_TABLE),
+    )
+    columns = {row[0] for row in cur.fetchall()}
+    for column_name in REF_ITEM_MST_COLUMNS:
+        if column_name in columns:
+            continue
+        cur.execute(
+            f"""
+            ALTER TABLE {quote_ident(TARGET_SCHEMA)}.{quote_ident(REF_ITEM_MST_TABLE)}
+            ADD COLUMN IF NOT EXISTS {quote_ident(column_name)} text
+            """
+        )
+    index_prefix = REF_ITEM_MST_TABLE[:45]
+    indexes = [
+        (f"idx_{index_prefix}_sku", "sku"),
+        (f"idx_{index_prefix}_account_sku", "account_name, sku"),
+    ]
+    for index_name, column_sql in indexes:
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {quote_ident(index_name)}
+            ON {quote_ident(TARGET_SCHEMA)}.{quote_ident(REF_ITEM_MST_TABLE)}
+            USING btree ({", ".join(quote_ident(part.strip()) for part in column_sql.split(","))})
+            """
+        )
+
+
 def main():
     started_at = now()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -108,10 +161,12 @@ def main():
             "output_root": rel_path(OUTPUT_ROOT),
             "schema": TARGET_SCHEMA,
             "table": TARGET_TABLE,
+            "ref_item_mst_table": REF_ITEM_MST_TABLE if PRODUCT_TYPE == "REF" else None,
             "success": True,
             "skipped": True,
             "dry_run": True,
             "planned_columns": TARGET_COLUMNS,
+            "planned_ref_item_mst_columns": REF_ITEM_MST_COLUMNS if PRODUCT_TYPE == "REF" else [],
         }
         (OUTPUT_ROOT / "manifest_db_prepare.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False),
@@ -137,6 +192,8 @@ def main():
     with conn:
         with conn.cursor() as cur:
             ensure_table(cur)
+            if PRODUCT_TYPE == "REF":
+                ensure_ref_item_mst_table(cur)
     conn.close()
 
     manifest = {
@@ -149,6 +206,7 @@ def main():
         "output_root": rel_path(OUTPUT_ROOT),
         "schema": TARGET_SCHEMA,
         "table": TARGET_TABLE,
+        "ref_item_mst_table": REF_ITEM_MST_TABLE if PRODUCT_TYPE == "REF" else None,
         "success": True,
         "skipped": False,
         "dry_run": False,
