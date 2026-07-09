@@ -911,6 +911,10 @@ class AmazonBaseCrawler(BaseCrawler):
                     parts.append(
                         f"screen_size: mst={d['mst_screen_size']!r} / extracted={d.get('screen_size')!r}"
                     )
+                if d.get('mst_model_year') and d.get('page_model_year') and d['mst_model_year'] != d.get('page_model_year'):
+                    parts.append(
+                        f"model_year: mst={d['mst_model_year']!r} / extracted={d.get('page_model_year')!r}"
+                    )
                 print("  " + " | ".join(parts))
             print(f"{'=' * 80}\n")
         else:
