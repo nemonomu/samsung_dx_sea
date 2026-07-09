@@ -648,14 +648,22 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     product['fastest_delivery'] = fastest_delivery
                     detail_extracted_fields.add('fastest_delivery')
 
-            # BSR 상세 페이지에서 최신 배송/구매/할인/재고 정보를 보정
-            if product.get('page_type') == 'bsr':
+            # number_of_units: PDP 소셜프루핑 뱃지에서 추출 (detail xpath:
+            # //span[@id='social-proofing-faceout-title-tk_bought']). main/bsr 공통.
+            #  - bsr: 기존대로 PDP 값으로 보정(덮어쓰기)
+            #  - main 등: 리스팅에서 못 잡았으면 PDP에서 보강(fill-if-empty)
+            # 리스팅 수집률이 main 4~41%로 불안정한데 PDP 추출은 bsr 82%로 안정적이라,
+            # main도 PDP에서 뽑으면 동일 수준으로 회복된다.
+            is_bsr = product.get('page_type') == 'bsr'
+            if is_bsr or not product.get('number_of_units_purchased_past_month'):
                 number_of_units_purchased_past_month_raw = self.safe_extract_chain(tree, 'number_of_units_purchased_past_month')
                 number_of_units_purchased_past_month = self.convert_first_number(number_of_units_purchased_past_month_raw)
                 if number_of_units_purchased_past_month:
                     product['number_of_units_purchased_past_month'] = number_of_units_purchased_past_month
                     detail_extracted_fields.add('number_of_units_purchased_past_month')
 
+            # BSR 상세 페이지에서 할인 정보 보정 (bsr 전용 유지)
+            if is_bsr:
                 discount_type = self.safe_extract_chain_join(tree, 'discount_type', separator=' ')
                 if discount_type:
                     product['discount_type'] = discount_type
@@ -682,12 +690,14 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 self.take_capture(item, 2)
 
             # 마스터 테이블에서 기존 TV 스펙 조회
-            mst_screen_size, mst_sku = self.get_tv_specs_from_mst(item)
+            mst_screen_size, mst_sku, mst_model_year = self.get_tv_specs_from_mst(item)
 
             sku, sku_source, page_sku = self.extract_sku(tree, mst_sku, found_section, self.product_type)
-            model_year = self.extract_model_year(tree)
+            page_model_year = self.extract_model_year(tree)
+            model_year = mst_model_year or page_model_year
+            model_year_source = "MST" if mst_model_year else ("Details" if page_model_year else None)
 
-            screen_size, spec_source = self.extract_screen_size(
+            screen_size, spec_source, page_screen_size = self.extract_screen_size(
                 product.get('retailer_sku_name'),
                 tree,
                 mst_screen_size,
@@ -756,14 +766,17 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
             # 마스터 vs 이번 상세 크롤링 결과 비교 — 다르면 누적 (run() 끝에 일괄 출력)
             has_sku_diff = mst_sku and page_sku and mst_sku != page_sku
-            has_screen_size_diff = mst_screen_size and screen_size and mst_screen_size != screen_size
-            if has_sku_diff or has_screen_size_diff:
+            has_screen_size_diff = mst_screen_size and page_screen_size and mst_screen_size != page_screen_size
+            has_model_year_diff = mst_model_year and page_model_year and mst_model_year != page_model_year
+            if has_sku_diff or has_screen_size_diff or has_model_year_diff:
                 self.spec_diffs.append({
                     'item': item,
                     'mst_sku': mst_sku,
                     'page_sku': page_sku,
                     'mst_screen_size': mst_screen_size,
-                    'screen_size': screen_size,
+                    'screen_size': page_screen_size,
+                    'mst_model_year': mst_model_year,
+                    'page_model_year': page_model_year,
                 })
 
             # ──── 결과 요약 (트리 구조) ────
@@ -785,7 +798,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 print(f"  ├─ fastest_delivery: {product.get('fastest_delivery') or '-'}")
             if 'available_quantity_for_purchase' in detail_extracted_fields:
                 print(f"  ├─ available_quantity_for_purchase: {product.get('available_quantity_for_purchase') or '-'}")
-            print(f"  ├─ model_year: {model_year or '-'}")
+            print(f"  ├─ model_year: {f'{model_year} (출처: {model_year_source})' if model_year and model_year_source else (model_year or '-')}")
             print(f"  ├─ screen_size: {f'{screen_size} (출처: {spec_source})' if screen_size and spec_source else (screen_size or '-')}")
             print(f"  ├─ summarized_review_content: {'있음' if summarized_review_content else '-'}")
             print(f"  └─ detailed_review_content: {extracted_count}개{' (로그인 게이트)' if review_gated else ''}")
@@ -828,10 +841,11 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             new_sku = product.get('sku') or 'no sku'
             product_url = product.get('product_url')
             new_screen_size = product.get('screen_size') or None
+            new_model_year = product.get('model_year') or None
 
             # 기존 데이터 조회
             cursor.execute("""
-                SELECT sku, screen_size FROM tv_item_mst
+                SELECT sku, screen_size, model_year FROM tv_item_mst
                 WHERE item = %s AND account_name = %s
             """, (item, self.account_name))
 
@@ -840,14 +854,14 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             if row is None:
                 # 조회 결과 없음 → INSERT
                 cursor.execute("""
-                    INSERT INTO tv_item_mst (item, account_name, sku, product_url, screen_size)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (item, self.account_name, new_sku, product_url, new_screen_size))
+                    INSERT INTO tv_item_mst (item, account_name, sku, product_url, screen_size, model_year)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (item, self.account_name, new_sku, product_url, new_screen_size, new_model_year))
                 self.db_conn.commit()
                 print(f"  → DB: ITEM_MST INSERT")
             else:
                 # 기존 값이 없는 필드만 업데이트
-                existing_sku, existing_screen_size = row
+                existing_sku, existing_screen_size, existing_model_year = row
                 updates = []
                 params = []
                 existing_sku_value = str(existing_sku).strip() if existing_sku else ''
@@ -863,6 +877,9 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 if not existing_screen_size and new_screen_size:
                     updates.append("screen_size = %s")
                     params.append(new_screen_size)
+                if not existing_model_year and new_model_year:
+                    updates.append("model_year = %s")
+                    params.append(new_model_year)
 
                 if updates:
                     # 업데이트할 필드와 값 저장 (로그용)
@@ -871,6 +888,8 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                         updated_info.append(f"sku={new_sku}")
                     if not existing_screen_size and new_screen_size:
                         updated_info.append(f"screen_size={new_screen_size}")
+                    if not existing_model_year and new_model_year:
+                        updated_info.append(f"model_year={new_model_year}")
 
                     updates.append("product_url = %s")
                     params.append(product_url)
@@ -886,7 +905,6 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     print(f"  → DB: ITEM_MST UPDATE ({', '.join(updated_info)})")
                 else:
                     pass  # ITEM_MST 업데이트할 필드 없음
-
             cursor.close()
 
         except Exception as e:
@@ -954,30 +972,30 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # Item / MST
     # ========================================================================
     def get_tv_specs_from_mst(self, item):
-        """마스터 테이블에서 TV 스펙 및 SKU 조회"""
+        """마스터 테이블에서 TV 고정 스펙과 SKU를 조회한다."""
         if not item:
-            return None, None
+            return None, None, None
 
         if not self.ensure_db_connection():
             print("  [WARNING] get_tv_specs_from_mst skipped (no DB)")
-            return None, None
+            return None, None, None
 
         try:
             cursor = self.db_conn.cursor()
             cursor.execute("""
-                SELECT screen_size, sku FROM tv_item_mst
+                SELECT screen_size, sku, model_year FROM tv_item_mst
                 WHERE item = %s AND account_name = %s AND is_product = TRUE
             """, (item, self.account_name))
             row = cursor.fetchone()
             cursor.close()
 
             if row:
-                return row[0], row[1]
-            return None, None
+                return row[0], row[1], row[2]
+            return None, None, None
         except Exception as e:
+            self.safe_rollback()
             print(f"  [WARNING] get_tv_specs_from_mst failed: {e}")
-            return None, None
-
+            return None, None, None
     # ========================================================================
     # Extract Helpers
     # ========================================================================
@@ -1018,12 +1036,10 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         return None
 
     def extract_screen_size(self, retailer_sku_name, tree, mst_screen_size):
-        """screen_size 최종값 결정.
+        """screen_size 최종값 결정. MST 값이 있으면 우선 사용하고, 없을 때만 페이지 추출값을 사용한다."""
+        page_screen_size = None
+        page_source = None
 
-        1. 상품명 정규식: SAMSUNG 77" Class / 50-Inch / 98" Q Series → N inches
-        2. XPath 추출: 숫자만 추출해 N inches로 정규화
-        3. 마스터 값 사용
-        """
         if retailer_sku_name:
             screen_size = self.extract_screen_size_by_regex(
                 retailer_sku_name,
@@ -1031,9 +1047,10 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 'retailer_sku_name',
             )
             if screen_size:
-                return screen_size, "제품명"
+                page_screen_size = screen_size
+                page_source = "제품명"
 
-        if tree is not None:
+        if not page_screen_size and tree is not None:
             screen_size = self.safe_extract_chain(tree, 'screen_size')
             if screen_size:
                 screen_size = self.extract_screen_size_by_regex(
@@ -1042,12 +1059,15 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     'XPath',
                 )
                 if screen_size:
-                    return screen_size, "Details"
+                    page_screen_size = screen_size
+                    page_source = "Details"
 
         if mst_screen_size:
-            return mst_screen_size, "마스터"
+            return mst_screen_size, "MST", page_screen_size
+        if page_screen_size:
+            return page_screen_size, page_source, page_screen_size
 
-        return None, None
+        return None, None, None
 
     def extract_screen_size_by_regex(self, text, pattern, source):
         """정규식으로 screen_size 숫자를 추출해 'N inches'로 반환한다."""

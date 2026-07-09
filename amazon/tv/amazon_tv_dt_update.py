@@ -4,11 +4,12 @@ Amazon TV Detail 페이지 크롤러 (UPDATE 전용)
 ================================================================================
 실행 모드
 ================================================================================
-- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3|4] [--start-id N]
-- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3|4] [--start-id N]
+- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3|4|5] [--start-id N]
+- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3|4|5] [--start-id N]
 - batch_id 필수 (인자 또는 stdin)
 - mode: 1=item IS NULL (기본), 2=star_rating/count_of_star_ratings IS NULL, 3=둘 다,
-        4=detailed_review_content IS NULL (리뷰 본문 백필)
+        4=detailed_review_content IS NULL (리뷰 본문 백필),
+        5=number_of_units_purchased_past_month IS NULL (구매수 뱃지 백필)
 
 ================================================================================
 주요 기능
@@ -73,6 +74,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
     MODE_REVIEW_NULL = '2'
     MODE_BOTH = '3'
     MODE_DETAIL_REVIEW_NULL = '4'
+    MODE_UNITS_NULL = '5'
     UPDATE_META_FIELDS = {
         'crawl_datetime': 'CURRENT_TIMESTAMP',
     }
@@ -117,6 +119,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             elif self.mode == self.MODE_DETAIL_REVIEW_NULL:
                 condition = "AND detailed_review_content IS NULL"
                 mode_desc = "detailed_review_content IS NULL"
+            elif self.mode == self.MODE_UNITS_NULL:
+                condition = "AND number_of_units_purchased_past_month IS NULL"
+                mode_desc = "number_of_units_purchased_past_month IS NULL"
             else:
                 condition = "AND item IS NULL"
                 mode_desc = "item IS NULL"
@@ -128,7 +133,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     offer, pick_up_availability, fastest_delivery,
                     delivery_availability, sku_status,
                     main_rank, bsr_rank, product_url, calendar_week,
-                    crawl_datetime, page_type
+                    crawl_datetime, page_type,
+                    number_of_units_purchased_past_month
                 FROM {self.target_table}
                 WHERE account_name = %s AND batch_id = %s AND product_url IS NOT NULL {condition}
                 ORDER BY id
@@ -159,6 +165,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     'calendar_week': row[10],
                     'crawl_datetime': row[11],
                     'page_type': row[12],
+                    # 기존 units 값을 실어, 재크롤 시 PDP에서 못 찾아도 NULL로
+                    # 덮어쓰지 않고 보존한다 (crawl_detail은 fill-if-empty).
+                    'number_of_units_purchased_past_month': row[13],
                 }
                 product_list.append(product)
 
@@ -334,7 +343,7 @@ def main():
     parser = argparse.ArgumentParser(description='Amazon TV Detail Update Crawler')
     parser.add_argument('--batch-id', type=str, help='Batch ID to process')
     parser.add_argument('--start-id', type=int, help='Start from this id (WHERE id >= start_id)')
-    parser.add_argument('--mode', type=str, choices=['1', '2', '3', '4'], help='1: item IS NULL, 2: star_rating/count_of_star_ratings IS NULL, 3: both, 4: detailed_review_content IS NULL')
+    parser.add_argument('--mode', type=str, choices=['1', '2', '3', '4', '5'], help='1: item IS NULL, 2: star_rating/count_of_star_ratings IS NULL, 3: both, 4: detailed_review_content IS NULL, 5: number_of_units_purchased_past_month IS NULL')
     parser.add_argument('--test', action='store_true', help='Test 모드 — test_tv_retail_com 테이블에서 조회·UPDATE')
     args = parser.parse_args()
 
@@ -378,8 +387,9 @@ def main():
         print("  2: star_rating/count_of_star_ratings IS NULL (별점 미수집 재수집)")
         print("  3: 둘 다 (item IS NULL OR star_rating/count_of_star_ratings IS NULL)")
         print("  4: detailed_review_content IS NULL (리뷰 본문 미수집 재수집)")
+        print("  5: number_of_units_purchased_past_month IS NULL (구매수 뱃지 재수집)")
         mode_input = input("모드 입력 (기본: 1): ").strip()
-        mode = mode_input if mode_input in ('1', '2', '3', '4') else '1'
+        mode = mode_input if mode_input in ('1', '2', '3', '4', '5') else '1'
 
     crawler = AmazonTVDetailUpdateCrawler(batch_id=batch_id, start_id=start_id, mode=mode, test_mode=test_mode)
     crawler.run()
