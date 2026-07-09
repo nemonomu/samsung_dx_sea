@@ -567,26 +567,39 @@ def collected_count_issues(category, collected_count):
 
 
 def detail_fetch_failure_issues(run_root):
-    """Flag the step08 detail dead-page pattern: many SKUs were fetched this run
-    but almost all failed (e.g. "TypeError: Failed to fetch" once the browser page
-    loses its bestbuy.com origin), which silently wipes retailer_sku_name_similar.
+    """Flag the step08 detail dead-page pattern where SKU batches die with
+    "TypeError: Failed to fetch" once the browser page loses its bestbuy.com
+    origin, which silently wipes retailer_sku_name_similar (and cascades to the
+    compare/review ops bundled in the same batch call).
+
+    Two independent triggers:
+      1. "Failed to fetch" count >= threshold -- this error is NEVER a normal
+         outcome, so even a partial dead-page (e.g. 130/300, 57% overall
+         success) is caught. This is the primary signal.
+      2. overall success rate <= threshold -- catches near-total failures whose
+         errors are something other than "Failed to fetch".
 
     Reads per-SKU detail metas (not the run manifest) because the review stage
     overwrites the shared manifest's success/failure counts, so only the metas
     carry a reliable detail-stage signal. Counts only metas fetched THIS run
     (fetched_this_run is True); cached-skip successes keep their old True/True
     meta and count as success, and max_attempts_exceeded placeholders (no
-    fetched_this_run) are excluded, so healthy and partial runs never trip this."""
+    fetched_this_run) are excluded, so healthy runs never trip this."""
     try:
         min_attempts = int(os.getenv("BESTBUY_DETAIL_ALERT_MIN_ATTEMPTS", "10"))
     except ValueError:
         min_attempts = 10
+    try:
+        min_failed_to_fetch = int(os.getenv("BESTBUY_DETAIL_ALERT_MIN_FAILED_TO_FETCH", "5"))
+    except ValueError:
+        min_failed_to_fetch = 5
     min_success_rate = as_float(os.getenv("BESTBUY_DETAIL_ALERT_MIN_SUCCESS_RATE", "0.2"))
     if min_success_rate <= 0:
         min_success_rate = 0.2
 
     attempted = 0
     succeeded = 0
+    failed_to_fetch = 0
     error_counts = {}
     for path in detail_meta_paths(run_root, DETAIL_STAGE_DIRS["detail"]):
         meta = read_json(path)
@@ -600,6 +613,7 @@ def detail_fetch_failure_issues(run_root):
             continue
         raw_error = str(meta.get("attempt_errors") or meta.get("error") or "").strip()
         if "Failed to fetch" in raw_error:
+            failed_to_fetch += 1
             key = "Failed to fetch (페이지가 bestbuy.com origin 상실)"
         elif raw_error:
             key = " ".join(raw_error.split())[:80]
@@ -610,14 +624,16 @@ def detail_fetch_failure_issues(run_root):
     if attempted < min_attempts:
         return []
     success_rate = succeeded / attempted
-    if success_rate > min_success_rate:
+    trip_failed_to_fetch = failed_to_fetch >= min_failed_to_fetch
+    trip_low_rate = success_rate <= min_success_rate
+    if not (trip_failed_to_fetch or trip_low_rate):
         return []
     dominant = ""
     if error_counts:
         top_key = max(error_counts, key=error_counts.get)
         dominant = f", 주 원인: {top_key} ({error_counts[top_key]}건)"
     return [
-        f"detail 수집 실패율 {attempted - succeeded}/{attempted} "
+        f"detail 수집 실패 {attempted - succeeded}/{attempted} "
         f"(성공률 {round(success_rate * 100)}%){dominant} "
         f"→ run_bestbuy_similar_recovery.bat 로 복구 필요"
     ]
