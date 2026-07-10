@@ -46,7 +46,8 @@ class AmazonTVMainCrawler(AmazonBaseCrawler):
         self.current_rank = 0
         self.saved_items = set()  # 중복 item 체크용
 
-        # 스크린샷 캡처 설정
+        # 스크린샷 캡처 설정 — 속도 위해 비활성화 (데이터 무영향, 진단은 save_debug_html)
+        self.capture_enabled = False
         self.capture_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
 
         # 통계 변수

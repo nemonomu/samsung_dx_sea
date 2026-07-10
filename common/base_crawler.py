@@ -533,6 +533,11 @@ class BaseCrawler:
 
     def capture_page_with_scroll(self):
         """스크롤하면서 전체 화면을 캡처한다. 파일명 prefix는 self.page_type을 사용한다."""
+        # capture_enabled=False면 스킵 (기본 True — 미설정 크롤러는 기존대로 캡처).
+        # 리스팅 캡처는 페이지 전체를 800px씩 스크롤하며 매 스텝 스크린샷+sleep(1)이라
+        # 1페이지에 ~17회로 느리다. 진단은 save_debug_html(HTML 스냅샷)로 대체.
+        if not getattr(self, 'capture_enabled', True):
+            return
         try:
             # 오래된 캡처 폴더 삭제
             self.cleanup_old_capture_folders(days=2)

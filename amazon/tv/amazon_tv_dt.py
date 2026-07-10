@@ -186,7 +186,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         self.page = None  # DrissionPage 객체
 
         # 스크린샷 캡처 설정
-        self.capture_enabled = True  # False로 변경하면 캡처 비활성화
+        self.capture_enabled = False  # 속도 위해 비활성화 (데이터 무영향, 진단은 save_debug_html)
         self.capture_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
         # page_type별 캡처 제한 (main 10개, bsr 10개)
         self.capture_main_count = 0
