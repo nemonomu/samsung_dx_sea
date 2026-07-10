@@ -44,6 +44,10 @@ REQUEST_TIMEOUT = int(os.getenv("ZENROWS_TIMEOUT", "180"))
 FETCH_MODE = os.getenv("BESTBUY_PROMOTION_FETCH_MODE", "browser_dom").strip().lower()
 BROWSER_WAIT_SECONDS = max(0, int(os.getenv("BESTBUY_PROMOTION_BROWSER_WAIT_SECONDS", "8")))
 BROWSER_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_PROMOTION_BROWSER_JS_TIMEOUT", "120")))
+# Lazy-load scroll run_js timeout. A hung/challenged tab makes even window.scrollTo
+# block; keep it short and non-fatal so one stuck scroll does not skip the whole
+# promotion collection (the batch is retried with a fresh page instead).
+PROMOTION_SCROLL_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_PROMOTION_SCROLL_JS_TIMEOUT", "10")))
 BROWSER_HEADLESS = env_bool("BESTBUY_PROMOTION_BROWSER_HEADLESS", "1")
 BROWSER_LOCAL_PORT = env_int("BESTBUY_PROMOTION_BROWSER_LOCAL_PORT", "0")
 PROMOTION_MAX_ATTEMPTS = max(1, int(os.getenv("BESTBUY_PROMOTION_MAX_ATTEMPTS", "5")))
@@ -750,50 +754,87 @@ def run_browser_dom():
 
     raw_dir = RUN_ROOT / "raw" / "browser_dom"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    page = None
-    browser_meta = {}
-    start = time.perf_counter()
-    try:
-        page, browser_meta = create_browser_page(
-            run_root=RUN_ROOT,
-            name="promotion_dom",
-            headless=BROWSER_HEADLESS,
-            local_port=BROWSER_LOCAL_PORT,
-        )
-        browser_url = add_intl_nosplash(REFERER)
-        page.get(browser_url)
-        if BROWSER_WAIT_SECONDS:
-            time.sleep(BROWSER_WAIT_SECONDS)
-        for y in (0, 500, 900, 1300, 1700):
-            page.run_js(f"window.scrollTo(0, {y});", timeout=10)
-            time.sleep(0.4)
-        payload = extract_browser_dom_items(page)
-        html_text = browser_outer_html(page, timeout=BROWSER_JS_TIMEOUT)
-    finally:
-        close_browser_page(page)
-
-    elapsed = round(time.perf_counter() - start, 3)
     html_path = raw_dir / "promotion_page.html"
     payload_path = raw_dir / "promotion_dom_items.json"
-    html_path.write_text(html_text, encoding="utf-8", errors="replace")
-    payload_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    rows = parse_dom_items(payload.get("items") or [])
-    summary = {
-        "started_at": now(),
-        "fetch_mode": "browser_dom",
-        "url": REFERER,
-        "browser_url": browser_url,
-        "elapsed_seconds": elapsed,
-        "x_request_cost": "0",
-        "container_found": bool(payload.get("containerFound")),
-        "raw_link_count": payload.get("linkCount", 0),
-        "raw_item_count": payload.get("itemCount", 0),
-        "row_count": len(rows),
-        "html": rel_path(html_path),
-        "dom_items": rel_path(payload_path),
-        "browser": browser_meta,
-    }
-    return rows, summary
+    browser_url = add_intl_nosplash(REFERER)
+    attempts = max(1, PROMOTION_MAX_ATTEMPTS)
+    last_exc = None
+    best = None
+    summary = None
+    for attempt in range(1, attempts + 1):
+        page = None
+        browser_meta = {}
+        payload = {}
+        html_text = ""
+        error = ""
+        start = time.perf_counter()
+        try:
+            page, browser_meta = create_browser_page(
+                run_root=RUN_ROOT,
+                name="promotion_dom",
+                headless=BROWSER_HEADLESS,
+                local_port=BROWSER_LOCAL_PORT,
+            )
+            page.get(browser_url)
+            if BROWSER_WAIT_SECONDS:
+                time.sleep(BROWSER_WAIT_SECONDS)
+            for y in (0, 500, 900, 1300, 1700):
+                try:
+                    page.run_js(f"window.scrollTo(0, {y});", timeout=PROMOTION_SCROLL_JS_TIMEOUT)
+                except Exception as scroll_exc:  # noqa: BLE001 - a hung tab must not abort collection
+                    print(
+                        f"[promotion] attempt {attempt}/{attempts} scroll y={y} skipped: "
+                        f"{type(scroll_exc).__name__}: {scroll_exc}",
+                        flush=True,
+                    )
+                    break
+                time.sleep(0.4)
+            payload = extract_browser_dom_items(page)
+            html_text = browser_outer_html(page, timeout=BROWSER_JS_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - retry a hung/blocked page with a fresh session
+            error = f"{type(exc).__name__}: {exc}"
+            last_exc = exc
+            print(f"[promotion] attempt {attempt}/{attempts} browser_dom failed: {error}", flush=True)
+        finally:
+            close_browser_page(page)
+
+        elapsed = round(time.perf_counter() - start, 3)
+        rows = parse_dom_items(payload.get("items") or [])
+        html_path.write_text(html_text, encoding="utf-8", errors="replace")
+        payload_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        summary = {
+            "started_at": now(),
+            "fetch_mode": "browser_dom",
+            "url": REFERER,
+            "browser_url": browser_url,
+            "elapsed_seconds": elapsed,
+            "x_request_cost": "0",
+            "attempt": attempt,
+            "attempts": attempts,
+            "error": error,
+            "container_found": bool(payload.get("containerFound")),
+            "raw_link_count": payload.get("linkCount", 0),
+            "raw_item_count": payload.get("itemCount", 0),
+            "row_count": len(rows),
+            "html": rel_path(html_path),
+            "dom_items": rel_path(payload_path),
+            "browser": browser_meta,
+        }
+        enough = bool(rows) and (not PROMOTION_EXPECTED_MIN_ROWS or len(rows) >= PROMOTION_EXPECTED_MIN_ROWS)
+        if enough:
+            return rows, summary
+        if best is None or len(rows) > len(best[0]):
+            best = (rows, summary)
+        if attempt < attempts and PROMOTION_RETRY_SLEEP_SECONDS > 0:
+            time.sleep(PROMOTION_RETRY_SLEEP_SECONDS)
+
+    # Return the best partial result if any attempt scraped rows; only surface the
+    # exception (-> collection_failed summary) when every attempt errored with none.
+    if best is not None and (best[0] or last_exc is None):
+        return best
+    if last_exc is not None:
+        raise last_exc
+    return best if best is not None else ([], summary)
 
 
 def run_batch_with_retries(client, html_text, placements, browser_page=None):
