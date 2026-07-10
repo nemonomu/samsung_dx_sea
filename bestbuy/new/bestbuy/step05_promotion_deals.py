@@ -1013,7 +1013,9 @@ def main():
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
 
-    html_text = QUERY_TEMPLATE_HTML.read_text(encoding="utf-8", errors="ignore")
+    # The sample template is an optional supplement to the live page HTML; browser_graphql
+    # collects the real page below, so a missing template must not abort collection.
+    html_text = QUERY_TEMPLATE_HTML.read_text(encoding="utf-8", errors="ignore") if QUERY_TEMPLATE_HTML.exists() else ""
     browser_page = None
     browser_meta = {}
     client = None
