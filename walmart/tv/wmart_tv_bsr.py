@@ -212,6 +212,10 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
                 print("[ERROR] base_container XPath not found")
                 raise ValueError("base_container XPath not found")
 
+            if self.page is None:
+                print("[ERROR] Browser page is not initialized")
+                raise RuntimeError("Browser page is not initialized")
+
             # 첫 페이지는 &page= 파라미터 없이 URL 생성
             if page_number == 1:
                 url = self.url_template.replace('&page={page}', '')

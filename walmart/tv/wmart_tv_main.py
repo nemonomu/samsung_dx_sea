@@ -133,7 +133,8 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                 if page_num % self.browser_restart_interval == 0 and page_num < self.max_pages:
                     print(f"[INFO] {page_num}페이지 완료, 브라우저 재시작...")
                     if not self.restart_browser():
-                        print("[WARNING] 브라우저 재시작 실패, 계속 진행...")
+                        print("[ERROR] Browser restart failed; aborting listing to avoid partial pipeline execution")
+                        return False
                     time.sleep(random.uniform(5, 8))
 
                 time.sleep(random.uniform(8, 12))  # 페이지 간 대기 시간 증가
@@ -214,6 +215,10 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             if not base_container_xpath:
                 print("[ERROR] base_container XPath not found")
                 raise ValueError("base_container XPath not found")
+
+            if self.page is None:
+                print("[ERROR] Browser page is not initialized")
+                raise RuntimeError("Browser page is not initialized")
 
             url = self.url_template.replace('{page}', str(page_number))
 

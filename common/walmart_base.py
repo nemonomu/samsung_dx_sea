@@ -38,30 +38,43 @@ class WalmartBaseCrawler(BaseCrawler):
     # 함수 목록:
     # - setup_browser: DrissionPage 브라우저 설정
     def setup_browser(self):
-        """DrissionPage 브라우저 설정."""
-        try:
-            print("[INFO] DrissionPage 설정 중...")
+        """DrissionPage browser setup with retry for Chrome/9222 startup races."""
+        last_error = None
 
-            co = ChromiumOptions()
-            co.set_pref('profile.managed_default_content_settings.images', 1)
-            co.set_pref('profile.managed_default_content_settings.media_stream', 2)
-            co.set_pref('profile.managed_default_content_settings.plugins', 2)
-            co.set_argument('--autoplay-policy=document-user-activation-required')
-            self.page = ChromiumPage(co)
-            self.page.run_cdp('Network.enable')
-            self.page.run_cdp('Network.setBlockedURLs', urls=[
-                '*://play.eko.com/*',
-                '*://assets.eko.com/*',
-            ])
-            self.page.set.window.max()
+        for attempt in range(1, 4):
+            try:
+                print(f"[INFO] DrissionPage setup... (attempt {attempt}/3)")
 
-            print("[OK] DrissionPage 설정 완료")
-            return True
+                co = ChromiumOptions()
+                co.set_pref('profile.managed_default_content_settings.images', 1)
+                co.set_pref('profile.managed_default_content_settings.media_stream', 2)
+                co.set_pref('profile.managed_default_content_settings.plugins', 2)
+                co.set_argument('--autoplay-policy=document-user-activation-required')
+                self.page = ChromiumPage(co)
+                self.page.run_cdp('Network.enable')
+                self.page.run_cdp('Network.setBlockedURLs', urls=[
+                    '*://play.eko.com/*',
+                    '*://assets.eko.com/*',
+                ])
+                self.page.set.window.max()
 
-        except Exception as e:
-            print(f"[ERROR] Failed to setup browser: {e}")
-            traceback.print_exc()
-            return False
+                print("[OK] DrissionPage setup completed")
+                return True
+
+            except Exception as e:
+                last_error = e
+                self.page = None
+                print(f"[ERROR] Failed to setup browser (attempt {attempt}/3): {e}")
+                traceback.print_exc()
+
+                if attempt < 3:
+                    subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
+                    wait_seconds = 5 * attempt
+                    print(f"[INFO] Waiting {wait_seconds}s before browser setup retry...")
+                    time.sleep(wait_seconds)
+
+        print(f"[ERROR] Browser setup failed after retries: {last_error}")
+        return False
 
     # ========================================================================
     # Bot Detection / Session
@@ -472,7 +485,7 @@ class WalmartBaseCrawler(BaseCrawler):
 
             subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
             print("[INFO] 브라우저 종료 완료, 잠시 대기...")
-            time.sleep(random.uniform(3, 5))
+            time.sleep(random.uniform(6, 10))
 
             if not self.setup_browser():
                 print("[ERROR] 브라우저 재시작 실패")
