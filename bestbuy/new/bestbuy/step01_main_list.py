@@ -31,6 +31,15 @@ BESTBUY_BASE_URL = "https://www.bestbuy.com"
 GRAPHQL_ENDPOINT = os.getenv("BESTBUY_GRAPHQL_ENDPOINT", "https://www.bestbuy.com/gateway/graphql")
 SEARCH_SORT = os.getenv("BESTBUY_SEARCH_SORT", "")
 SEARCH_PAGES = int(os.getenv("BESTBUY_MAIN_PAGES", "13"))
+# Dynamic page collection: when > 0, keep fetching pages until this many organic
+# occurrences are collected (or the best-seller list runs dry / the safety cap is
+# hit) instead of a fixed SEARCH_PAGES count. Needed for BSR because Best Buy now
+# fills ~1/3 of each best-seller page with combo/bundle documents (no product.skuId,
+# skipped as non-organic and mostly duplicates of existing singles), so a fixed 6
+# pages under-collects the unique organic ranks it used to reach.
+LISTING_ORGANIC_TARGET = max(0, int(os.getenv("BESTBUY_LISTING_ORGANIC_TARGET", "0")))
+LISTING_MAX_PAGES = max(SEARCH_PAGES, int(os.getenv("BESTBUY_LISTING_MAX_PAGES", "24")))
+LISTING_ORGANIC_TARGET_DRY_PAGES = max(1, int(os.getenv("BESTBUY_LISTING_ORGANIC_TARGET_DRY_PAGES", "2")))
 ORGANIC_OFFSET = int(os.getenv("BESTBUY_MAIN_ORGANIC_OFFSET", "18"))
 INCLUDE_SPONSORED_CAROUSEL = os.getenv("BESTBUY_INCLUDE_SPONSORED_CAROUSEL", "0").lower() in {
     "1",
@@ -125,6 +134,13 @@ LISTING_HTML_FALLBACK_ENABLED = os.getenv("BESTBUY_LISTING_HTML_FALLBACK_ENABLED
 }
 LISTING_HTML_FALLBACK_WAIT_MS = max(0, int(os.getenv("BESTBUY_LISTING_HTML_FALLBACK_WAIT_MS", "15000")))
 LISTING_HTML_FALLBACK_MIN_ROWS = max(0, int(os.getenv("BESTBUY_LISTING_HTML_FALLBACK_MIN_ROWS", "24")))
+# Rows-per-page needed to consider a page "complete" (not failed / no retry).
+# Defaults to the HTML-fallback minimum for back-compat, but BSR best-seller pages
+# carry ~1/3 combo docs (dropped) so a full page has far fewer than 24 parsed rows;
+# BSR sets this lower so those pages are not endlessly retried as false failures.
+LISTING_PAGE_COMPLETE_MIN_ROWS = max(
+    0, int(os.getenv("BESTBUY_LISTING_PAGE_COMPLETE_MIN_ROWS", str(LISTING_HTML_FALLBACK_MIN_ROWS)))
+)
 LISTING_HTML_FALLBACK_SCROLL_ENABLED = os.getenv("BESTBUY_LISTING_HTML_FALLBACK_SCROLL", "1").lower() in {
     "1",
     "true",
@@ -1426,9 +1442,9 @@ def listing_rows_complete(rows):
 def listing_occurrence_count_complete(occurrence_count):
     if occurrence_count <= 0:
         return False
-    if LISTING_HTML_FALLBACK_MIN_ROWS <= 0:
+    if LISTING_PAGE_COMPLETE_MIN_ROWS <= 0:
         return True
-    return occurrence_count >= LISTING_HTML_FALLBACK_MIN_ROWS
+    return occurrence_count >= LISTING_PAGE_COMPLETE_MIN_ROWS
 
 
 def listing_retry_delay(attempt):
@@ -2236,7 +2252,23 @@ def main():
     )
     print(f"benchmark_start={run_started_at}")
 
-    for page in range(1, SEARCH_PAGES + 1):
+    page = 0
+    organic_collected = 0
+    consecutive_dry = 0
+    while True:
+        page += 1
+        if LISTING_ORGANIC_TARGET > 0:
+            if organic_collected >= LISTING_ORGANIC_TARGET:
+                break
+            if page > LISTING_MAX_PAGES:
+                print(
+                    f"[listing_dynamic] stop max_pages={LISTING_MAX_PAGES} "
+                    f"organic={organic_collected}/{LISTING_ORGANIC_TARGET}",
+                    flush=True,
+                )
+                break
+        elif page > SEARCH_PAGES:
+            break
         if page > 1 and LISTING_PAGE_SLEEP_SECONDS > 0:
             print(f"[listing_page_sleep] before_page={page:03d} sleep={LISTING_PAGE_SLEEP_SECONDS:g}s", flush=True)
             time.sleep(LISTING_PAGE_SLEEP_SECONDS)
@@ -2277,6 +2309,20 @@ def main():
             f"rows_any_availability={summary['rows_with_any_availability']}",
             flush=True,
         )
+        if LISTING_ORGANIC_TARGET > 0:
+            organic_this = int(summary.get("organic_count") or 0)
+            organic_collected += organic_this
+            if organic_this <= 0:
+                consecutive_dry += 1
+                if consecutive_dry >= LISTING_ORGANIC_TARGET_DRY_PAGES:
+                    print(
+                        f"[listing_dynamic] stop dry_pages={consecutive_dry} "
+                        f"organic={organic_collected}/{LISTING_ORGANIC_TARGET}",
+                        flush=True,
+                    )
+                    break
+            else:
+                consecutive_dry = 0
 
     retry_failed_pages_with_delay(
         operation,
@@ -2336,7 +2382,8 @@ def main():
         "elapsed_seconds": run_elapsed,
         "search_term": SEARCH_TERM,
         "search_sort": SEARCH_SORT,
-        "search_pages": SEARCH_PAGES,
+        "search_pages": len(page_benchmarks) if LISTING_ORGANIC_TARGET > 0 else SEARCH_PAGES,
+        "organic_target": LISTING_ORGANIC_TARGET,
         "organic_offset": ORGANIC_OFFSET,
         "graphql_endpoint": GRAPHQL_ENDPOINT,
         "fetch_mode": FETCH_MODE,
@@ -2347,7 +2394,11 @@ def main():
         "allow_html_template": ALLOW_HTML_TEMPLATE,
         "source_template": operation.get("source_path", ""),
         "source_template_type": operation.get("source_type", ""),
-        "expected_post_calls": SEARCH_PAGES if LISTING_COLLECTION_MODE in {"graphql", "browser_graphql"} else 0,
+        "expected_post_calls": (
+            (len(page_benchmarks) if LISTING_ORGANIC_TARGET > 0 else SEARCH_PAGES)
+            if LISTING_COLLECTION_MODE in {"graphql", "browser_graphql"}
+            else 0
+        ),
         "actual_post_calls": graphql_post_calls,
         "total_request_calls": total_request_calls,
         "listing_request_calls": listing_request_calls,

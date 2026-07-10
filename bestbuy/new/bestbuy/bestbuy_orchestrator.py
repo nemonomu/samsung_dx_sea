@@ -90,6 +90,14 @@ STEPS = [
             "BESTBUY_MAIN_RUN_ID": "bsr",
             "BESTBUY_MAIN_ORGANIC_OFFSET": "18",
             "BESTBUY_SEARCH_SORT": "Best-Selling",
+            # Best Buy now fills ~1/3 of each best-seller page with combo/bundle docs
+            # (skipped as non-organic, mostly duplicates), so a fixed 6 pages only
+            # yields ~69 unique organic ranks. Collect pages until 100 organic (the
+            # BSR limit) are gathered, capped at 20 pages, and treat best-seller
+            # pages (fewer parsed rows than a main page) as complete at >=8 rows.
+            "BESTBUY_LISTING_ORGANIC_TARGET": "100",
+            "BESTBUY_LISTING_MAX_PAGES": "20",
+            "BESTBUY_LISTING_PAGE_COMPLETE_MIN_ROWS": "8",
             "BESTBUY_LISTING_COLLECTION_MODE": "browser_graphql",
             "BESTBUY_BROWSER_GRAPHQL_WAIT_SECONDS": "8",
             "BESTBUY_BROWSER_GRAPHQL_JS_TIMEOUT": "120",
