@@ -248,14 +248,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         # DrissionPage 드라이버 (Selenium driver 대신 사용)
         self.page = None
 
-        # 스크린샷 캡처 설정
-        self.capture_enabled = True  # False로 변경하면 캡처 비활성화
-        self.capture_all = test_mode or (batch_id is None)  # 테스트/개별실행: 모든 제품, 운영: page_type별 제한
-        self.capture_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
-        # 운영 모드: page_type별 캡처 제한 (main 10개, bsr 10개)
-        self.capture_main_count = 0
-        self.capture_bsr_count = 0
-        self.capture_limit_per_type = 10
 
         # SPEC DIFF 누적 (run() 끝에 일괄 출력용)
         # 각 entry: {'item': str, 'mst_sku': str|None, 'extracted_sku': str|None,
@@ -525,9 +517,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         """상세 페이지 크롤링: 페이지 로드 → 데이터 추출 → 스펙 추출 → 유사제품 추출 → 리뷰 추출 (DrissionPage 사용)"""
         try:
             product_url = product.get('product_url')
-            # take_capture()에 넘기기 위해 product_list의 page_type('main' 또는 'bsr')을 로컬 변수로 추출
-            # 운영 모드에서 page_type별로 캡처 갯수를 제한(main 10개 / bsr 10개)하기 위함
-            page_type = product.get('page_type')
             if not product_url:
                 print(f"  [SKIP] product_url 없음 → 크롤링/저장 건너뜀")
                 return None
@@ -545,11 +534,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             # item ID 추출 (페이지 로드 후 추출 - 에러 시 item NULL로 식별)
             item = self.extract_item(product_url)
             print(f"[item] item ID 추출 {'완료' if item else '실패'}")
-
-            # 캡처 1: 상품 페이지 로드 후 (성공/실패 로그는 take_capture 내부에서 처리, 스킵 시 무로그)
-            capture_allowed = self.should_take_capture(page_type)
-            if capture_allowed and self.take_capture(item, 1):
-                self.mark_capture_count(page_type)
 
             # ========== 1단계: 상단 정보 ==========
             # ========== 1-1단계: 상단 리뷰 정보 추출 ==========
@@ -601,10 +585,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             # ========== 3단계: 유사 제품 ==========
             # 섹션 탐색(스크롤 fallback) → 절대경로 XPath로 카드 이름 한번에 추출 → ' ||| '로 join
             self.scroll_find_element('similar_products_section', max_scrolls=5, label='유사제품 섹션 탐색')
-
-            # 캡처 2: 유사제품 섹션 (찾았으면 해당 위치, 못찾았으면 현재 위치)
-            if capture_allowed:
-                self.take_capture(item, 2)
 
             # HTML 재파싱 후 절대경로로 카드 이름 일괄 추출
             page_html = self.page.run_js('return document.documentElement.outerHTML')
@@ -663,7 +643,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 detailed_review_content, count_of_reviews = self.extract_detailed_reviews(
                     item,
                     count_of_reviews,
-                    capture_allowed,
                 )
 
             # 결합된 데이터

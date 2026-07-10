@@ -220,6 +220,13 @@ class WalmartBaseCrawler(BaseCrawler):
             time.sleep(random.uniform(8, 12))
             self.handle_captcha()
 
+            if getattr(self, 'skip_walmart_search', False):
+                if zip_code:
+                    self.set_walmart_zip_code(zip_code)
+                print("[INFO] Walmart search step skipped; crawler will load listing URL directly")
+                print("[OK] Session initialized")
+                return True
+
             self.add_random_mouse_movements()
             for _ in range(random.randint(2, 4)):
                 scroll_y = random.randint(200, 500)

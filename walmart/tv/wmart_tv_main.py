@@ -71,13 +71,12 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
         self.max_pages = 10  # 최대 페이지 수
         self.current_rank = 0
         self.browser_restart_interval = 5  # N페이지마다 브라우저 재시작
+        self.skip_walmart_search = True  # Load configured listing URL directly instead of relying on Walmart home search.
         self.saved_items = set()  # 중복 item 체크용
         self.preowned_keywords = [
             'Pre-Owned', 'Pre Owned', 'Open Box', 'Open-Box', 'Refurbished'
         ]  # Preowned 제외 키워드 리스트 (retailer_sku_name에 포함 시 수집 제외)
 
-        # 스크린샷 캡처 설정
-        self.capture_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
 
         # 통계 변수
         self.stats = {
@@ -222,15 +221,11 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
 
             url = self.url_template.replace('{page}', str(page_number))
 
-            # 첫 페이지는 세션 초기화에서 이미 검색 결과 페이지에 있으므로 최초 URL 로드는 스킵
-            skip_url_load = page_number == 1
-
-            if skip_url_load:
-                print(f"[INFO] Page 1: 검색 결과 페이지에서 바로 추출 시작")
-            else:
-                self.page.get(url)
-                time.sleep(random.uniform(10, 15))
-                self.add_random_mouse_movements()
+            # Always load the configured listing URL. Walmart home search can silently fail and leave us on walmart.com.
+            self.page.get(url)
+            time.sleep(random.uniform(10, 15))
+            self.add_random_mouse_movements()
+            skip_url_load = False
 
             self.handle_captcha()
             time.sleep(random.uniform(3, 5))
@@ -251,11 +246,6 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                 )
 
             print(f"[INFO] Page {page_number}: {len(base_containers)} products found")
-
-            # 1페이지 캡처
-            if page_number == 1:
-                print(f"[INFO] Page 1: 캡처 모드 실행")
-                self.capture_page_with_scroll()
 
             products = []
             for idx, item in enumerate(base_containers, 1):

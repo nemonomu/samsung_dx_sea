@@ -75,8 +75,6 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
             'Pre-Owned', 'Pre Owned', 'Open Box', 'Open-Box', 'Refurbished'
         ]  # Preowned 제외 키워드 리스트 (retailer_sku_name에 포함 시 수집 제외)
 
-        # 스크린샷 캡처 설정
-        self.capture_base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
 
         # 통계 변수
         self.stats = {
@@ -232,11 +230,6 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
             base_containers = self.find_product_containers(base_container_xpath, page_number, expected_products)
 
             print(f"[INFO] Page {page_number}: {len(base_containers)} products found")
-
-            # 1페이지 캡처
-            if page_number == 1:
-                print(f"[INFO] Page 1: 캡처 모드 실행")
-                self.capture_page_with_scroll()
 
             products = []
             for idx, item in enumerate(base_containers, 1):
