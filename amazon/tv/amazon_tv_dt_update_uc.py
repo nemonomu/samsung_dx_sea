@@ -53,6 +53,7 @@ from amazon.tv.amazon_tv_dt import (
     TRUSTED_PROFILE_DIR, refresh_trusted_profile,
 )
 from common.amazon_base import AmazonBaseCrawler
+from common.base_crawler import BaseCrawler
 
 REVIEW_GATE_MARKERS = AmazonBaseCrawler.REVIEW_GATE_MARKERS
 
@@ -225,24 +226,50 @@ def extract_reviews(driver, xpaths, max_reviews=20):
     return ' ||| '.join(formatted), len(reviews)
 
 
+def select_batch_id():
+    """batch_id 미지정 시 오늘 Amazon TV batch_id 목록 조회 → 번호 선택 (dt_update와 동일 UX)."""
+    today_batch_ids = BaseCrawler.fetch_today_batch_ids(
+        table_name='tv_retail_com', account_name='Amazon', test_mode=False)
+    if today_batch_ids:
+        print(f"\n오늘({datetime.now().strftime('%Y-%m-%d')}) Amazon batch_id 목록:")
+        for i, bid in enumerate(today_batch_ids, 1):
+            print(f"  {i}. {bid}")
+        print("  0. 직접 입력")
+        choice = input("\n번호 선택 ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(today_batch_ids):
+            return today_batch_ids[int(choice) - 1]
+        if choice == '0':
+            return input("batch_id 입력: ").strip()
+        if choice and not choice.isdigit():
+            return choice
+    else:
+        print(f"오늘({datetime.now().strftime('%Y-%m-%d')}) Amazon batch_id가 없습니다.")
+    return input("batch_id 직접 입력: ").strip()
+
+
 def main():
-    ap = argparse.ArgumentParser(description='Amazon TV dt_update UC 게이트 소진 측정')
-    ap.add_argument('--batch-id', required=True)
+    ap = argparse.ArgumentParser(description='Amazon TV dt_update UC — 리뷰(detailed_review_content) 백필/게이트 측정')
+    ap.add_argument('--batch-id', help='대상 batch_id (미지정 시 오늘 배치 목록에서 선택)')
     ap.add_argument('--limit', type=int, default=0, help='대상 상품 수 제한 (0=전체)')
     ap.add_argument('--sleep', type=float, default=2.5, help='상품 간 대기(초)')
     ap.add_argument('--no-profile', action='store_true', help='신뢰 프로필 미사용 (기본 사용)')
     ap.add_argument('--write', action='store_true', help='detailed_review_content 실제 UPDATE (기본 dry-run)')
     args = ap.parse_args()
 
+    batch_id = args.batch_id or select_batch_id()
+    if not batch_id:
+        print("[ERROR] batch_id가 필요합니다.")
+        return
+
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'uc_gate_test')
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f'{args.batch_id}_{ts}.json')
+    out_path = os.path.join(out_dir, f'{batch_id}_{ts}.json')
 
     conn = db_connect()
     xpaths = load_review_xpaths(conn)
-    targets = load_targets(conn, args.batch_id, args.limit)
-    print(f"[INFO] UC 게이트 테스트 — batch={args.batch_id}, 대상={len(targets)}개, "
+    targets = load_targets(conn, batch_id, args.limit)
+    print(f"[INFO] UC 리뷰 백필 — batch={batch_id}, 대상={len(targets)}개, "
           f"write={args.write}, profile={'off' if args.no_profile else 'on'}")
     print(f"[INFO] review xpaths: {sorted(xpaths)}")
     if not targets:
@@ -260,7 +287,7 @@ def main():
     driver = make_uc_driver(user_data_dir=user_data_dir)
     set_amazon_zip(driver)
 
-    results = {'batch_id': args.batch_id, 'started_at': ts, 'write': args.write,
+    results = {'batch_id': batch_id, 'started_at': ts, 'write': args.write,
                'use_profile': not args.no_profile, 'products': []}
     first_gate_at = None
     ok = gated = 0
