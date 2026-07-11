@@ -963,6 +963,20 @@ class WalmartBaseCrawler(BaseCrawler):
 
         return None
 
+    # Walmart 'Sorry / technical issues' 페이지 실제 문구 (정확한 매칭)
+    SORRY_KEYWORDS = (
+        "we're having technical issues",
+        "we'll be back in a flash",
+        "this page isn't available right now",
+        "this page isn't available",
+    )
+
+    def is_sorry_page(self, page_html=None):
+        """Walmart Sorry 페이지 여부 검사. page_html을 주면 재-fetch 없이 그 HTML로 판단한다."""
+        content = page_html if page_html is not None else self.page.html
+        content = (content or '').lower()
+        return any(keyword in content for keyword in self.SORRY_KEYWORDS)
+
     def handle_sorry_page(self, max_button_attempts=3, max_refresh_attempts=5):
         """
         Sorry 페이지 감지 및 Try Again 버튼 클릭 처리
@@ -975,17 +989,8 @@ class WalmartBaseCrawler(BaseCrawler):
             bool: 페이지가 정상으로 복구되면 True, 실패하면 False
         """
         try:
-            # Walmart Sorry 페이지 실제 문구 (정확한 매칭)
-            sorry_keywords = [
-                "we're having technical issues",
-                "we'll be back in a flash",
-                "this page isn't available right now",
-                "this page isn't available"
-            ]
-
             # Sorry 페이지 체크 (정상 페이지면 바로 리턴)
-            page_content = self.page.html.lower()
-            if not any(keyword in page_content for keyword in sorry_keywords):
+            if not self.is_sorry_page():
                 return True
 
             # Sorry 페이지 감지됨 - 복구 시도
@@ -1149,11 +1154,15 @@ class WalmartBaseCrawler(BaseCrawler):
                 # (상한 5s = 기존 최대 대기와 동일 → 안정성 유지, 준비되면 즉시 진행)
                 self.wait_for_review_page_ready(prev_first_review, timeout=5)
 
-                if not self.handle_sorry_page():
-                    print(f"  [WARNING] 리뷰 페이지 {current_page} Sorry 감지 - 리뷰 수집 중단")
-                    break
-
+                # 전체 HTML은 한 번만 취득해 sorry 감지 + 파싱에 재사용.
+                # sorry는 드무므로 감지됐을 때만 복구 루틴을 돌리고 최신 HTML을 다시 취득한다.
                 page_html = self.page.run_js('return document.documentElement.outerHTML')
+                if self.is_sorry_page(page_html):
+                    if not self.handle_sorry_page():
+                        print(f"  [WARNING] 리뷰 페이지 {current_page} Sorry 감지 - 리뷰 수집 중단")
+                        break
+                    page_html = self.page.run_js('return document.documentElement.outerHTML')
+
                 tree = html.fromstring(page_html)
 
                 # 페이지 1: 3차 count_of_reviews 재추출 (K/M 또는 미추출 케이스)
