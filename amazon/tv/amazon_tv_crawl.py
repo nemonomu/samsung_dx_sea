@@ -7,9 +7,10 @@ Amazon TV 통합 크롤러 (운영용)
 STEP 1. Main   - 검색 결과 페이지에서 제품 목록 수집 (최대 300개)
 STEP 2. BSR    - Best Seller 페이지에서 제품 목록 수집 (2페이지)
 STEP 3. Detail - 수집된 모든 제품의 상세 페이지 크롤링 + SKU/item 추출
-STEP 4. Review Auto Recovery - 리뷰 수집률이 임계치(50%) 미만이면
-        dt_update 모드 4(detailed_review_content IS NULL)로 자동 백필.
-        Amazon 리뷰 섹션 신규 레이아웃 간헐 서빙으로 리뷰만 전멸하는 사례 대응.
+STEP 4. Review Coverage - 리뷰 수집률이 임계치(50%) 미만이면 이메일에 WARNING만.
+        즉시 백필은 안 한다 — detail 직후엔 리뷰 로그인 게이트로 세션 신원이
+        고갈 상태라 백필이 매번 0건 실패하고 신원만 더 소진시킨다(2026-07 실측).
+        실제 리뷰 백필은 신원 회복 후 별도 스케줄로 `dt_update --mode 4` 실행.
 
 ================================================================================
 주요 특징
@@ -110,9 +111,7 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
     redirects = detail_report.get('redirects') or []
     run_errors = detail_report.get('run_errors') or []
     recovery_triggered = bool(review_recovery and review_recovery.get('triggered'))
-    recovery_failed = recovery_triggered and (
-        not review_recovery.get('success') or review_recovery.get('still_low')
-    )
+    recovery_deferred = recovery_triggered and review_recovery.get('deferred')
     review_gated_count = detail_report.get('review_gated_count', 0) or 0
     review_gate_restarts = detail_report.get('review_gate_restarts', 0) or 0
 
@@ -169,23 +168,17 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
             f"- review 로그인 게이트: {review_gated_count}건 감지"
             + (f", 브라우저 재시작 {review_gate_restarts}회" if review_gate_restarts else "")
         )
-    if recovery_triggered:
+    if recovery_deferred:
         before_total = review_recovery.get('before_total')
         before = review_recovery.get('before_with_review')
-        after = review_recovery.get('after_with_review')
-        if review_recovery.get('error'):
-            lines.append(f"- review auto recovery: 실행 실패 ({review_recovery['error']})")
-        else:
-            lines.append(
-                f"- review auto recovery: detailed_review_content "
-                f"{before}/{before_total}건 → {after}/{before_total}건 "
-                f"(복구 {review_recovery.get('recovered', 0)}건)"
-            )
-        if recovery_failed:
-            lines.append(
-                "  - 복구 후에도 리뷰 수집률 임계치 미달 — 로그인 게이트 지속 가능성, "
-                "수동 확인 필요"
-            )
+        lines.append(
+            f"- review 수집률 미달: detailed_review_content {before}/{before_total}건 "
+            f"(임계 {REVIEW_RECOVERY_THRESHOLD:.0%})"
+        )
+        lines.append(
+            "  - 즉시 백필 안 함(고갈된 세션 신원 보존). 신원 회복 후 별도로 "
+            "`dt_update --mode 4` 실행 필요"
+        )
     if run_errors:
         lines.append(f"- run errors: {len(run_errors)}건")
         for item in run_errors[:20]:
@@ -302,13 +295,15 @@ class AmazonTVIntegratedCrawler:
                 pass
 
     def run_review_auto_recovery(self, crawl_results):
-        """STEP 4: 리뷰 수집률이 임계치 미만이면 dt_update 모드 4 백필을 자동 실행.
+        """STEP 4: 리뷰 수집률 점검만 한다 (즉시 백필은 하지 않음).
 
-        Amazon이 리뷰 섹션 신규 레이아웃(인라인 리뷰 없음)을 간헐 서빙하면 별점/가격은
-        정상인데 detailed_review_content만 전멸한다. 이때 새 브라우저 세션으로 재수집하면
-        대부분 복구되므로, 수동 RDP 재실행 대신 오케스트레이터가 직접 1회 시도한다.
+        detail 직후에는 리뷰 로그인 게이트가 걸린 세션 신원이 아직 고갈 상태라,
+        여기서 dt_update 모드 4를 즉시 돌리면 매번 0건 복구로 실패하고 신원을 더
+        소진시킬 뿐이다(2026-07 실측). 그래서 즉시 백필을 제거하고, 수집률이 낮으면
+        이메일에 WARNING만 남긴다. 실제 백필은 신원이 회복된 뒤(몇 시간~다음날)
+        별도 스케줄로 `dt_update --mode 4`를 돌려야 한다.
 
-        Returns: dict | None — 리커버리 리포트 (미실행 시 None)
+        Returns: dict | None — 커버리지 리포트 (정상/판단불가 시 None)
         """
         detail_ok = (
             isinstance(crawl_results.get('detail'), dict)
@@ -323,50 +318,20 @@ class AmazonTVIntegratedCrawler:
         if total < REVIEW_RECOVERY_MIN_ROWS:
             return None
         if with_review >= total * REVIEW_RECOVERY_THRESHOLD:
-            print(f"\n[STEP 4/4] Review Auto Recovery — 리뷰 수집 정상 "
-                  f"({with_review}/{total}건) → SKIP")
+            print(f"\n[STEP 4/4] Review Coverage — 리뷰 수집 정상 "
+                  f"({with_review}/{total}건) → OK")
             return None
 
-        print(f"\n[STEP 4/4] Review Auto Recovery — 리뷰 {with_review}/{total}건, "
-              f"임계치 {REVIEW_RECOVERY_THRESHOLD:.0%} 미달 → mode 4 백필 실행")
-        stage_start = time.time()
-        report = {
+        # 수집률 미달 — 즉시 백필하지 않고 리포트만. 백필은 신원 회복 후 별도 실행.
+        print(f"\n[STEP 4/4] Review Coverage — 리뷰 {with_review}/{total}건, "
+              f"임계치 {REVIEW_RECOVERY_THRESHOLD:.0%} 미달 → 백필 보류 "
+              f"(신원 회복 후 dt_update --mode 4 필요)")
+        return {
             'triggered': True,
+            'deferred': True,
             'before_total': total,
             'before_with_review': with_review,
         }
-        try:
-            update_crawler = AmazonTVDetailUpdateCrawler(
-                batch_id=self.batch_id,
-                mode=AmazonTVDetailUpdateCrawler.MODE_DETAIL_REVIEW_NULL,
-                test_mode=False,
-            )
-            success = update_crawler.run()
-            after_total, after_with_review = self.get_review_coverage()
-            report.update({
-                'success': bool(success),
-                'after_with_review': after_with_review,
-                'recovered': (after_with_review or 0) - with_review,
-                'still_low': (
-                    after_with_review is not None
-                    and after_with_review < total * REVIEW_RECOVERY_THRESHOLD
-                ),
-                'duration': time.time() - stage_start,
-            })
-            print(f"[STEP 4/4] Review Auto Recovery 완료 — "
-                  f"리뷰 {with_review} → {after_with_review}/{total}건")
-            if report['still_low']:
-                print("[WARNING] 복구 후에도 리뷰 수집률 임계치 미달 — "
-                      "Amazon 리뷰 레이아웃 변경 지속 가능성, 수동 확인 필요")
-        except Exception as e:
-            print(f"[ERROR] Review Auto Recovery 실패: {e}")
-            traceback.print_exc()
-            report.update({
-                'success': False,
-                'error': str(e),
-                'duration': time.time() - stage_start,
-            })
-        return report
 
     def run(self):
         """통합 크롤러 실행. Returns: bool"""
@@ -475,13 +440,9 @@ class AmazonTVIntegratedCrawler:
                     print(f"\n[STEP 3/3] Detail Crawler — BSR 실패로 SKIP")
                 crawl_results['detail'] = 'skipped'
 
-            # STEP 4: 리뷰 수집률 점검 후 필요 시 자동 백필 (dt_update 모드 4)
+            # STEP 4: 리뷰 수집률 점검만 (즉시 백필 없음 — 신원 보존)
             review_recovery = self.run_review_auto_recovery(crawl_results)
-            crawl_results['review_recovery'] = (
-                {'success': bool(review_recovery.get('success')),
-                 'duration': review_recovery.get('duration', 0)}
-                if review_recovery else 'skipped'
-            )
+            crawl_results['review_recovery'] = 'deferred' if review_recovery else 'skipped'
 
             # 결과 출력
             self.end_time = datetime.now()
@@ -492,6 +453,8 @@ class AmazonTVIntegratedCrawler:
             for step, result in crawl_results.items():
                 if result == 'skipped':
                     status = "SKIP"
+                elif result == 'deferred':
+                    status = "DEFER"
                 elif isinstance(result, dict):
                     status = "OK" if result.get('success') else "FAIL"
                 else:
