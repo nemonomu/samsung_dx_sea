@@ -12,13 +12,13 @@ Amazon TV dt_update — UC(undetected-chromedriver) 테스트 버전 (측정 전
     기본은 DB 미기록 dry-run — 게이트/성공 여부와 소진 곡선만 측정.
   - 브라우저만 UC로 교체, 나머지(신뢰 프로필, XPath 체인, 게이트 마커)는
     운영 코드에서 그대로 빌려온다.
-  - --write 지정 시에만 detailed_review_content 를 실제 UPDATE (백필 겸용).
+  - 기본으로 detailed_review_content 를 실제 UPDATE (백필). 측정만 하려면 --dry-run.
 
 사용법 (RDP):
-  # dry-run 측정 (기본)
-  python amazon/tv/amazon_tv_dt_update_uc.py --batch-id a_20260708_170013 --limit 150
-  # 실제 백필까지
-  python amazon/tv/amazon_tv_dt_update_uc.py --batch-id a_20260708_170013 --write
+  # 리뷰 백필 (기본 — DB 저장)
+  python amazon/tv/amazon_tv_dt_update_uc.py            # batch 선택 프롬프트
+  # 측정만 (DB 미기록)
+  python amazon/tv/amazon_tv_dt_update_uc.py --dry-run --limit 150
 
 결과: amazon/tv/data/uc_gate_test/<batch>_<ts>.json  (per-product + 소진 곡선)
 """
@@ -253,8 +253,9 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='대상 상품 수 제한 (0=전체)')
     ap.add_argument('--sleep', type=float, default=2.5, help='상품 간 대기(초)')
     ap.add_argument('--no-profile', action='store_true', help='신뢰 프로필 미사용 (기본 사용)')
-    ap.add_argument('--write', action='store_true', help='detailed_review_content 실제 UPDATE (기본 dry-run)')
+    ap.add_argument('--dry-run', action='store_true', help='DB 미기록(측정만). 기본은 detailed_review_content 실제 UPDATE')
     args = ap.parse_args()
+    write = not args.dry_run
 
     batch_id = args.batch_id or select_batch_id()
     if not batch_id:
@@ -270,7 +271,7 @@ def main():
     xpaths = load_review_xpaths(conn)
     targets = load_targets(conn, batch_id, args.limit)
     print(f"[INFO] UC 리뷰 백필 — batch={batch_id}, 대상={len(targets)}개, "
-          f"write={args.write}, profile={'off' if args.no_profile else 'on'}")
+          f"write={write}, profile={'off' if args.no_profile else 'on'}")
     print(f"[INFO] review xpaths: {sorted(xpaths)}")
     if not targets:
         print("[INFO] 대상 없음 — 종료")
@@ -287,7 +288,7 @@ def main():
     driver = make_uc_driver(user_data_dir=user_data_dir)
     set_amazon_zip(driver)
 
-    results = {'batch_id': batch_id, 'started_at': ts, 'write': args.write,
+    results = {'batch_id': batch_id, 'started_at': ts, 'write': write,
                'use_profile': not args.no_profile, 'products': []}
     first_gate_at = None
     ok = gated = 0
@@ -310,7 +311,7 @@ def main():
                         first_gate_at = i
                 elif count > 0:
                     ok += 1
-                    if args.write:
+                    if write:
                         cur = conn.cursor()
                         cur.execute(
                             "UPDATE tv_retail_com SET detailed_review_content=%s, "
@@ -343,9 +344,11 @@ def main():
         results['summary']['buckets'] = buckets
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        print("\n===== UC 게이트 테스트 요약 =====")
-        print(f"대상 {len(targets)} | 리뷰수집 {ok} | 게이트 {gated} | "
-              f"첫 게이트 순번: {first_gate_at}")
+        written = sum(1 for p in results['products'] if p.get('written'))
+        print("\n===== UC 리뷰 백필 요약 =====")
+        print(f"대상 {len(targets)} | 리뷰추출 {ok} | "
+              f"{'DB저장 ' + str(written) if write else 'DRY-RUN(DB 미기록)'} | "
+              f"게이트 {gated} | 첫 게이트 순번: {first_gate_at}")
         print("소진 곡선 (25개 버킷): 순번 | ok | gated")
         for b in sorted(buckets):
             v = buckets[b]
