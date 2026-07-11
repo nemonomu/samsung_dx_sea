@@ -748,34 +748,31 @@ class AmazonBaseCrawler(BaseCrawler):
             return None
 
     def move_to_review_section(self, has_review_link):
-        """리뷰 섹션 이동: top 리뷰 링크 우선, 실패 시 원래 위치에서 review_section 탐색."""
-        original_position = 0
+        """리뷰 섹션으로 이동한다 — 리뷰 링크 '클릭' 없이 scrollIntoView 로만.
+
+        acrCustomerReviewLink.click() 이 리뷰 로그인 게이트("account verification")를
+        유발한다(2026-07-11 실측: 같은 배치 250개에서 클릭 시 게이트 100%, 클릭을
+        scrollIntoView 로 바꾸면 게이트 0·리뷰 정상 수집). 스펙 버튼 클릭·ZIP 팝업은
+        무관하고 오직 이 리뷰링크 클릭만이 트리거였다. 그래서 클릭을 제거하고
+        reviewsMedley(없으면 customer-reviews_feature_div)로 스크롤만 한다.
+        요소가 없는 드문 경우엔 클릭 없는 scroll_to_section fallback 을 쓴다.
+        (호출부가 반환값을 쓰지 않으므로 반환은 참고용. has_review_link 인자는
+        호출부 호환 위해 유지하며 현재 미사용.)
+        """
         try:
-            original_position = self.page.run_js("return window.pageYOffset") or 0
+            moved = self.page.run_js(
+                "var e = document.getElementById('reviewsMedley')"
+                " || document.getElementById('customer-reviews_feature_div');"
+                " if (e) { e.scrollIntoView({block: 'center', behavior: 'instant'}); return true; }"
+                " return false;")
         except Exception:
-            pass
+            moved = None
+        time.sleep(1)
+        if moved:
+            return True
 
-        if has_review_link:
-            review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
-            try:
-                review_link = self.page.ele(f'xpath:{review_link_xpath}', timeout=3)
-                if review_link:
-                    self.page.run_js("window.scrollTo(0, 0)")
-                    time.sleep(0.5)
-                    review_link = self.page.ele(f'xpath:{review_link_xpath}', timeout=3)
-                    review_link.click()
-                    time.sleep(1)
-                    print(f"  [INFO] review_link 클릭 → 리뷰 섹션 이동")
-                    return True
-            except Exception as e:
-                print(f"  [INFO] review_link 클릭 실패 → review_section fallback 시도: {e}")
-
-        try:
-            self.page.run_js(f"window.scrollTo(0, {original_position})")
-            time.sleep(0.5)
-        except Exception:
-            pass
-
+        # reviewsMedley/feature_div 부재 시: 클릭 없는 기존 fallback (scroll_to_section 은
+        # .ele 탐색 + scroll.to_see/scroll.down 만 하고 클릭하지 않음 — 게이트 안전).
         return bool(self.scroll_to_section('review_section', max_scrolls=10, label='리뷰 섹션'))
 
     # ====================================================================
