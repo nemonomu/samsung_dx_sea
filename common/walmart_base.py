@@ -1142,10 +1142,12 @@ class WalmartBaseCrawler(BaseCrawler):
             all_reviews = []
             current_page = 1
             max_reviews = 20
+            prev_first_review = None  # 페이지네이션 stale-read 방지: 직전 페이지 첫 리뷰
 
             while len(all_reviews) < max_reviews:
-                # 페이지 진입(리뷰 버튼 클릭 또는 페이지네이션) 직후 안정화 대기 + Sorry 감지
-                time.sleep(random.uniform(3, 5))
+                # 페이지 진입/페이지네이션 직후: 고정 sleep(3~5) 대신 리뷰가 렌더될 때까지만 대기
+                # (상한 5s = 기존 최대 대기와 동일 → 안정성 유지, 준비되면 즉시 진행)
+                self.wait_for_review_page_ready(prev_first_review, timeout=5)
 
                 if not self.handle_sorry_page():
                     print(f"  [WARNING] 리뷰 페이지 {current_page} Sorry 감지 - 리뷰 수집 중단")
@@ -1173,6 +1175,10 @@ class WalmartBaseCrawler(BaseCrawler):
                 page_review_count = 0
 
                 if reviews_list:
+                    # 다음 페이지 stale-read 판정 기준: 이 페이지의 첫 리뷰 텍스트
+                    _first = reviews_list[0]
+                    _first_text = _first.text_content() if hasattr(_first, 'text_content') else _first
+                    prev_first_review = ' '.join(str(_first_text).split())
                     for review in reviews_list:
                         if len(all_reviews) >= max_reviews:
                             break
@@ -1207,6 +1213,45 @@ class WalmartBaseCrawler(BaseCrawler):
         review_count = detailed_review_content.count(' ||| ') + 1 if detailed_review_content else 0
         print(f"  → reviews: 버튼클릭 O ({review_click_method}), {review_pages_crawled}페이지, {review_count}개 수집")
         return detailed_review_content, count_of_reviews
+
+    def wait_for_review_page_ready(self, prev_first_review=None, timeout=5, poll=0.3):
+        """리뷰 페이지 진입/페이지네이션 직후, 리뷰 컨텐츠가 실제로 렌더될 때까지만 대기한다.
+
+        기존 고정 sleep(3~5) 대체용. 상한(timeout)은 기존 최대 대기와 동일하게 두어
+        느린 페이지도 동일하게 기다리므로 수집 안정성은 유지하고, 렌더가 끝나면 즉시 진행한다.
+        prev_first_review가 주어지면(=페이지네이션) 첫 리뷰가 그 값과 달라질 때까지 기다려
+        이전 페이지 내용을 다시 읽는 stale-read를 방지한다.
+
+        Returns:
+            bool: 리뷰 컨텐츠 감지 시 True, timeout까지 못 뜨면 False(호출부는 기존대로 진행).
+        """
+        review_xpaths = self.get_chain_xpaths('detailed_review_content')
+        if not review_xpaths:
+            # 리뷰 xpath가 없으면 판단 근거가 없으므로 기존 방식(고정 대기) 유지
+            time.sleep(random.uniform(3, 5))
+            return False
+
+        end = time.time() + timeout
+        while time.time() < end:
+            for _name, xpath in review_xpaths:
+                try:
+                    elem = self.page.ele(f'xpath:{xpath}', timeout=0)
+                except Exception:
+                    elem = None
+                if not elem:
+                    continue
+                try:
+                    text = elem.text
+                except Exception:
+                    text = None
+                norm = ' '.join(text.split()) if text else ''
+                # 페이지1(prev 없음): 리뷰가 보이면 바로 준비 완료
+                # 페이지네이션: 첫 리뷰가 이전 페이지와 달라졌을 때만 준비 완료
+                if prev_first_review is None or (norm and norm != prev_first_review):
+                    return True
+                break  # 아직 이전 페이지 내용 → 더 기다림
+            time.sleep(poll)
+        return False
 
     def click_to_navigate(self, element, url_before, label, matched_xpath_name=None):
         """요소 클릭으로 페이지 이동 유도 (URL 변경으로 성공 판정)."""
