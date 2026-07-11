@@ -41,8 +41,31 @@ import config
 import psycopg2
 from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
 from amazon.tv.amazon_tv_uc import AmazonTVDetailUC
+from common.base_crawler import BaseCrawler
+from datetime import datetime as _dt
 
 FIELDS = AmazonTVDetailCrawler.EXTRACTED_FIELDS
+
+
+def select_batch_id():
+    """batch_id 미지정 시 오늘 Amazon TV batch_id 목록 조회 → 번호 선택 (dt_update와 동일 UX)."""
+    ids = BaseCrawler.fetch_today_batch_ids(
+        table_name='tv_retail_com', account_name='Amazon', test_mode=False)
+    if ids:
+        print(f"\n오늘({_dt.now().strftime('%Y-%m-%d')}) Amazon batch_id 목록:")
+        for i, bid in enumerate(ids, 1):
+            print(f"  {i}. {bid}")
+        print("  0. 직접 입력")
+        choice = input("\n번호 선택 ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(ids):
+            return ids[int(choice) - 1]
+        if choice == '0':
+            return input("batch_id 입력: ").strip()
+        if choice and not choice.isdigit():
+            return choice
+    else:
+        print(f"오늘({_dt.now().strftime('%Y-%m-%d')}) Amazon batch_id가 없습니다.")
+    return input("batch_id 직접 입력: ").strip()
 
 
 def db_connect():
@@ -112,16 +135,21 @@ def crawl_all(crawler, products, label):
 
 def main():
     ap = argparse.ArgumentParser(description='UC vs DrissionPage 필드 패리티 검증')
-    ap.add_argument('--batch-id', required=True)
+    ap.add_argument('--batch-id', help='대상 batch_id (미지정 시 오늘 배치 목록에서 선택)')
     ap.add_argument('--count', type=int, default=5)
     args = ap.parse_args()
 
+    batch_id = args.batch_id or select_batch_id()
+    if not batch_id:
+        print("[ERROR] batch_id가 필요합니다.")
+        return
+
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    products = load_products(args.batch_id, args.count)
+    products = load_products(batch_id, args.count)
     if not products:
         print("[ERROR] 대상 상품 없음")
         return
-    print(f"[INFO] 패리티 검증 — batch={args.batch_id}, 상품 {len(products)}개")
+    print(f"[INFO] 패리티 검증 — batch={batch_id}, 상품 {len(products)}개")
 
     # DrissionPage 먼저 → 종료 후 UC (프로필 락 충돌 방지: 순차)
     dp = crawl_all(AmazonTVDetailCrawler(batch_id=f'parity_dp_{ts}', test_mode=True), products, 'DrissionPage')
@@ -136,7 +164,7 @@ def main():
                        'count_of_star_ratings', 'sku_popularity']
     review_fields = ['summarized_review_content', 'detailed_review_content']
 
-    summary = {'batch_id': args.batch_id, 'count': len(products), 'rows': []}
+    summary = {'batch_id': batch_id, 'count': len(products), 'rows': []}
     dp_rev = uc_rev = 0
     stable_mismatch = 0
     for i, (a, b) in enumerate(zip(dp, uc), 1):
@@ -175,7 +203,7 @@ def main():
 
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'uc_parity')
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f'{args.batch_id}_{ts}.json')
+    out_path = os.path.join(out_dir, f'{batch_id}_{ts}.json')
     summary['stable_mismatch'] = stable_mismatch
     summary['review'] = {'dp': dp_rev, 'uc': uc_rev}
     with open(out_path, 'w', encoding='utf-8') as f:
