@@ -36,6 +36,9 @@ REF_ITEM_MST_TABLE = os.getenv("LOWES_REF_ITEM_MST_TABLE", "ref_item_mst").strip
 DRY_RUN = os.getenv("LOWES_DB_LOAD_DRY_RUN", os.getenv("LOWES_DB_DRY_RUN", "0")).strip().lower() in {
     "1", "true", "yes", "y",
 }
+REF_ITEM_MST_WRITE_ENABLED = os.getenv("LOWES_REF_ITEM_MST_WRITE_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "y",
+}
 
 
 # DB column order — these are the columns we will attempt to write
@@ -439,6 +442,8 @@ def main():
             "sample_mapped_row": mapped_rows[0] if mapped_rows else None,
             "ref_item_mst": {
                 "table": REF_ITEM_MST_TABLE if PRODUCT_TYPE == "REF" else None,
+                "write_enabled": REF_ITEM_MST_WRITE_ENABLED if PRODUCT_TYPE == "REF" else False,
+                "skipped": PRODUCT_TYPE != "REF" or not REF_ITEM_MST_WRITE_ENABLED,
                 "planned_rows": len(ref_item_mst_rows),
                 "planned_columns": REF_ITEM_MST_COLUMNS if PRODUCT_TYPE == "REF" else [],
                 "sample_mapped_row": ref_item_mst_rows[0] if ref_item_mst_rows else None,
@@ -472,13 +477,14 @@ def main():
             mst_inserted = 0
             mst_updated_cells = 0
             mst_columns_used = []
-            if PRODUCT_TYPE == "REF":
+            if PRODUCT_TYPE == "REF" and REF_ITEM_MST_WRITE_ENABLED:
                 ensure_ref_item_mst_table(cur)
                 mst_filled_cells = hydrate_rows_from_ref_item_mst(cur, mapped_rows)
                 ref_item_mst_rows = build_ref_item_mst_rows(mapped_rows)
             deleted = delete_existing_batch(cur, mapped_rows)
             inserted, columns_used = insert_rows(cur, mapped_rows)
-            if PRODUCT_TYPE == "REF":
+            # Temporarily disabled by default. Enable with LOWES_REF_ITEM_MST_WRITE_ENABLED=1.
+            if PRODUCT_TYPE == "REF" and REF_ITEM_MST_WRITE_ENABLED:
                 mst_inserted, mst_updated_cells, mst_columns_used = sync_ref_item_mst_rows(cur, ref_item_mst_rows)
     conn.close()
 
@@ -497,6 +503,8 @@ def main():
         "inserted_columns": columns_used,
         "ref_item_mst": {
             "table": REF_ITEM_MST_TABLE if PRODUCT_TYPE == "REF" else None,
+            "write_enabled": REF_ITEM_MST_WRITE_ENABLED if PRODUCT_TYPE == "REF" else False,
+            "skipped": PRODUCT_TYPE != "REF" or not REF_ITEM_MST_WRITE_ENABLED,
             "mapped_rows": len(ref_item_mst_rows),
             "filled_retail_cells_from_mst": mst_filled_cells if PRODUCT_TYPE == "REF" else 0,
             "inserted": mst_inserted if PRODUCT_TYPE == "REF" else 0,
