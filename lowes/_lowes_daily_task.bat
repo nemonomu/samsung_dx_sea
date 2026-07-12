@@ -17,6 +17,11 @@ set "PARENT_LOG=%PARENT_LOG:"=%"
 
 set "PYTHONUNBUFFERED=1"
 
+rem Local disk retention: prune run folders older than 3 days; delete by age
+rem regardless of S3 (s3_sync is not relied on here) to avoid filling the disk.
+if not defined LOCAL_RETENTION_DAYS set "LOCAL_RETENTION_DAYS=3"
+set "LOCAL_CLEANUP_REQUIRE_S3_SUCCESS=0"
+
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "RUN_TS=%%i"
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd"') do set "RUN_DATE=%%i"
 for /f %%i in ('powershell -NoProfile -Command "'%CATEGORY%'.ToLowerInvariant()"') do set "CATEGORY_DIR=%%i"
@@ -37,6 +42,11 @@ echo Lowes %CATEGORY% full run started
 echo run_date=%RUN_DATE%
 echo task_log=%TASK_LOG%
 echo ==================================================
+
+rem Prune old run folders up front so this run has disk headroom (non-fatal).
+echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days
+echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days >> "%TASK_LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m lowes.lowes_orchestrator --product-type '%CATEGORY%' 12 2>&1 | Tee-Object -FilePath '%TASK_LOG%' -Append"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m lowes.lowes_orchestrator --product-type '%CATEGORY%' --all 2>&1 | Tee-Object -FilePath '%TASK_LOG%' -Append; exit $LASTEXITCODE"
 set "EXIT_CODE=%ERRORLEVEL%"

@@ -51,6 +51,12 @@ set "BESTBUY_DB_UPDATE_SIMILAR_ONLY=0"
 set "BESTBUY_DB_UPDATE_AVAILABILITY_ONLY=0"
 if not defined BESTBUY_DB_LOAD_DRY_RUN set "BESTBUY_DB_LOAD_DRY_RUN=0"
 if not defined BESTBUY_FORCE_STEP_ENV set "BESTBUY_FORCE_STEP_ENV=1"
+rem Local disk retention: run folders accumulate ~0.4-0.5 GB each and were filling
+rem the disk (OSError Errno 28). Prune folders older than 3 days at run start;
+rem delete by age regardless of S3 since this pipeline does not run s3_sync.
+if not defined LOCAL_RETENTION_DAYS set "LOCAL_RETENTION_DAYS=3"
+set "LOCAL_CLEANUP_REQUIRE_S3_SUCCESS=0"
+set "BESTBUY_LOCAL_CLEANUP_SKIP=0"
 set "PYTHONUNBUFFERED=1"
 
 set "LOG_DIR=%BESTBUY_RUN_ROOT%\logs"
@@ -69,6 +75,11 @@ echo BestBuy %CATEGORY% full run started > "%LOG_FILE%"
 echo batch_id=%BESTBUY_BATCH_ID% >> "%LOG_FILE%"
 echo run_folder=%BESTBUY_RUN_DATE% >> "%LOG_FILE%"
 echo run_root=%BESTBUY_RUN_ROOT% >> "%LOG_FILE%"
+
+rem Prune old run folders up front so this run has disk headroom (non-fatal).
+echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days
+echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days >> "%LOG_FILE%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m bestbuy.bestbuy_orchestrator --category '%CATEGORY%' 13 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
 
 call :run_step 01 14 "main_list" 01
 if errorlevel 1 goto :fail
