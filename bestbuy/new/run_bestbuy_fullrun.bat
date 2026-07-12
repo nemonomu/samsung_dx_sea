@@ -76,6 +76,11 @@ echo batch_id=%BESTBUY_BATCH_ID% >> "%LOG_FILE%"
 echo run_folder=%BESTBUY_RUN_DATE% >> "%LOG_FILE%"
 echo run_root=%BESTBUY_RUN_ROOT% >> "%LOG_FILE%"
 
+rem Release stale idle-in-transaction locks left by a force-killed run (non-fatal).
+echo [db_unlock] releasing stale DB locks
+echo [db_unlock] releasing stale DB locks >> "%LOG_FILE%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m bestbuy.db_unlock 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
+
 rem Prune old run folders up front so this run has disk headroom (non-fatal).
 echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days
 echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days >> "%LOG_FILE%"

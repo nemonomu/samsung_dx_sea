@@ -43,6 +43,11 @@ echo run_date=%RUN_DATE%
 echo task_log=%TASK_LOG%
 echo ==================================================
 
+rem Release stale idle-in-transaction locks left by a force-killed run (non-fatal).
+echo [db_unlock] releasing stale DB locks
+echo [db_unlock] releasing stale DB locks >> "%TASK_LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m lowes.db_unlock 2>&1 | Tee-Object -FilePath '%TASK_LOG%' -Append"
+
 rem Prune old run folders up front so this run has disk headroom (non-fatal).
 echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days
 echo [cleanup] pruning %CATEGORY% run folders older than %LOCAL_RETENTION_DAYS% days >> "%TASK_LOG%"
