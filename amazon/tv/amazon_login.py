@@ -7,7 +7,6 @@ in this module builds or opens an Amazon review-page URL.
 import time
 
 HOME_URL = "https://www.amazon.com"
-SIGNIN_URL = "https://www.amazon.com/ap/signin"
 SIGNOUT_URL = (
     "https://www.amazon.com/gp/flex/sign-out.html"
     "?path=%2F&signIn=1&useRedirectOnSuccess=1&action=sign-out"
@@ -18,7 +17,12 @@ AUTH_COOKIES = {"at-main", "sess-at-main"}
 def load_amazon_login_credentials(config_module=None):
     """Read amazon.config.AMAZON_LOGIN_2 without printing credentials."""
     if config_module is None:
-        from amazon import config as config_module
+        try:
+            from amazon import config as config_module
+        except ImportError as exc:
+            raise RuntimeError(
+                "amazon/config.py could not be imported."
+            ) from exc
     source = "AMAZON_LOGIN_2"
     value = getattr(config_module, source, None)
     if not isinstance(value, dict):
@@ -202,6 +206,100 @@ def _challenge(adapter):
     ))
 
 
+def _broken_signin_page(adapter):
+    value = (adapter.url + " " + adapter.html).casefold()
+    return (
+        "looking for something?" in value
+        and "not a functioning page" in value
+    )
+
+
+def _signin_surface_present(adapter):
+    if _broken_signin_page(adapter):
+        return False
+    if _challenge(adapter):
+        return True
+    if _first(adapter, (
+        "#ap_email",
+        "#ap_password",
+        "input[name='email']",
+        "input[name='password']",
+        "#ap-other-account",
+        "[data-testid*='use-different-account']",
+    ), timeout=0.5):
+        return True
+    return any(adapter.find_all(selector) for selector in (
+        "div[data-a-input-name='accountSelectionSelect'] span.a-button-text",
+        "div[data-testid*='account-list-item']",
+        "div.cvf-account-switcher-account",
+    ))
+
+
+def _wait_signin_surface(adapter, timeout_seconds=10):
+    deadline = time.time() + max(float(timeout_seconds), 1)
+    while time.time() < deadline:
+        if _signin_surface_present(adapter):
+            return True
+        if _broken_signin_page(adapter):
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _handle_continue_shopping(adapter):
+    button = adapter.find_xpath(
+        "//button[contains(normalize-space(.), 'Continue shopping')]",
+        timeout=2,
+    )
+    if not button:
+        return
+    try:
+        adapter.click(button)
+        time.sleep(2)
+        print("[LOGIN] Continue shopping page cleared.")
+    except Exception:
+        pass
+
+
+def _open_signin_from_home(adapter):
+    """Open sign-in by clicking Amazon home's own navigation element."""
+    adapter.get(HOME_URL)
+    time.sleep(3)
+    _handle_continue_shopping(adapter)
+    if _logged_in(adapter):
+        print("[LOGIN] Previous account session is still active after sign-out.")
+        return False
+
+    account_link = _first(adapter, (
+        "#nav-link-accountList",
+        "a[data-nav-role='signin']",
+    ), timeout=5)
+    if not account_link:
+        account_link = adapter.find_xpath(
+            "//a[contains(@href, 'ap/signin')]",
+            timeout=5,
+        )
+    if not account_link:
+        print("[LOGIN] Amazon home Sign in element was not found.")
+        return False
+
+    try:
+        adapter.click(account_link)
+    except Exception as exc:
+        print(f"[LOGIN] Amazon home Sign in click failed: {exc}")
+        return False
+
+    if not _wait_signin_surface(adapter):
+        if _broken_signin_page(adapter):
+            print("[LOGIN] Amazon returned a non-functioning sign-in page.")
+        else:
+            print("[LOGIN] Amazon sign-in form did not appear.")
+        return False
+
+    print("[LOGIN] Sign-in form reached through Amazon home navigation.")
+    return True
+
+
 def _wait_login(adapter, timeout_seconds):
     reported = False
     deadline = time.time() + max(int(timeout_seconds), 1)
@@ -262,7 +360,7 @@ def _finish_login(adapter):
     """Finish on Amazon home and require an explicit logged-in nav state."""
     adapter.get(HOME_URL)
     time.sleep(2)
-    if not _verified_login(adapter):
+    if not _verified_login(adapter) or _nav_login_state(adapter) is not True:
         print("[LOGIN] 홈 화면에서 로그인 상태를 재확인하지 못했습니다.")
         return False
     print("[LOGIN] Amazon 로그인 확인 완료")
@@ -281,8 +379,8 @@ def _login(adapter, credentials, timeout_seconds=180):
         adapter.get(SIGNOUT_URL)
         time.sleep(2)
 
-    adapter.get(SIGNIN_URL)
-    time.sleep(2)
+    if not _open_signin_from_home(adapter):
+        return False
     if _verified_login(adapter):
         print("[LOGIN] 기존 계정 세션을 종료하지 못해 LOGIN_2 인증을 중단합니다.")
         return False

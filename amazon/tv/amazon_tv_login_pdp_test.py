@@ -32,7 +32,11 @@ from amazon.tv.amazon_login import (
     is_amazon_login_verified_dp,
     load_amazon_login_credentials,
 )
-from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+from amazon.tv.amazon_tv_dt import (
+    TRUSTED_PROFILE_DIR,
+    AmazonTVDetailCrawler,
+    refresh_trusted_profile,
+)
 from amazon.tv.amazon_tv_login_pdp_test_urls import DEFAULT_TEST_URLS
 
 
@@ -53,6 +57,7 @@ class FieldComparisonCrawler(AmazonTVDetailCrawler):
     """Production extractor with all persistence and MST fallback disabled."""
 
     skip_detailed_review = False
+    skip_initial_zip = False
 
     def get_tv_specs_from_mst(self, item):
         return None, None, None
@@ -65,6 +70,15 @@ class FieldComparisonCrawler(AmazonTVDetailCrawler):
 
     def save_to_retail_com(self, product):
         raise AssertionError("DB write is forbidden in the login PDP test")
+
+    def set_amazon_zip_code(self, zip_code="10001", max_retries=3):
+        if self.skip_initial_zip:
+            print("[LOGIN SMOKE] Initial ZIP setup skipped until login succeeds")
+            return True
+        return super().set_amazon_zip_code(
+            zip_code=zip_code,
+            max_retries=max_retries,
+        )
 
     def extract_reviews_with_retry(self, tree, max_reviews=20, page_html=None):
         if self.skip_detailed_review:
@@ -419,6 +433,31 @@ def enforce_read_only_db(crawler):
         return False
 
 
+def initialize_login_browser(crawler):
+    """Set up the production browser/profile without DB, XPath, or initial ZIP."""
+    if getattr(crawler, "use_trusted_profile", False):
+        refresh_trusted_profile()
+        cookies_path = os.path.join(
+            TRUSTED_PROFILE_DIR,
+            "Default",
+            "Network",
+            "Cookies",
+        )
+        if os.path.exists(cookies_path):
+            crawler.browser_user_data_dir = TRUSTED_PROFILE_DIR
+        else:
+            print("[LOGIN SMOKE] Trusted profile copy unavailable; using default")
+
+    crawler.skip_initial_zip = True
+    try:
+        return crawler.setup_browser()
+    except Exception as exc:
+        print(f"[LOGIN SMOKE] Browser setup failed: {exc}")
+        return False
+    finally:
+        crawler.skip_initial_zip = False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -438,6 +477,11 @@ def parse_args():
         type=int,
         default=int(os.environ.get("AMAZON_LOGIN_TIMEOUT", "180")),
     )
+    parser.add_argument(
+        "--login-only",
+        action="store_true",
+        help="Validate LOGIN_2 automation only; do not open any PDP URL",
+    )
     parser.add_argument("--no-profile", action="store_true")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     return parser.parse_args()
@@ -445,17 +489,27 @@ def parse_args():
 
 def main():
     args = parse_args()
-    urls = load_test_urls(args.urls_file, args.limit)
+    urls = (
+        []
+        if args.login_only
+        else load_test_urls(args.urls_file, args.limit)
+    )
     try:
         load_amazon_login_credentials()
     except RuntimeError as exc:
         print(f"[ERROR] {exc}")
         return 3
+    if args.login_only:
+        print(
+            "[LOGIN PREFLIGHT] amazon/config.py AMAZON_LOGIN_2: "
+            "configured (values hidden)"
+        )
     os.makedirs(args.output_dir, exist_ok=True)
 
     started_at = datetime.now()
+    run_name = "login_smoke" if args.login_only else "login_pdp_test"
     crawler = FieldComparisonCrawler(
-        batch_id=f"login_pdp_test_{started_at.strftime('%Y%m%d_%H%M%S')}",
+        batch_id=f"{run_name}_{started_at.strftime('%Y%m%d_%H%M%S')}",
         test_mode=True,
         require_amazon_login=False,
     )
@@ -465,6 +519,7 @@ def main():
 
     result = {
         "started_at": started_at.isoformat(timespec="seconds"),
+        "test_scope": "login_only" if args.login_only else "field_comparison",
         "credentials_source": "AMAZON_LOGIN_2",
         "same_browser_session": True,
         "comparison_fields": list(COMPARISON_FIELDS),
@@ -472,16 +527,22 @@ def main():
         "pre_login_detailed_review_skipped": True,
         "login_attempts": 0,
         "login_ok": False,
+        "login_smoke_passed": False,
         "logged_out_baseline_ok": False,
         "review_page_navigation": False,
         "db_write": False,
+        "db_not_used": bool(args.login_only),
         "db_session_read_only": False,
         "mst_fallback": False,
         "extraction_page_type": "bsr",
         "urls_source": (
-            os.path.abspath(args.urls_file)
-            if args.urls_file
-            else "built-in fixture"
+            "not_used"
+            if args.login_only
+            else (
+                os.path.abspath(args.urls_file)
+                if args.urls_file
+                else "built-in fixture"
+            )
         ),
         "requested_count": len(urls),
         "modes": {
@@ -493,9 +554,36 @@ def main():
     exit_code = 0
 
     try:
-        if not crawler.initialize():
-            result["fatal_error"] = "Crawler initialization failed"
+        initialized = (
+            initialize_login_browser(crawler)
+            if args.login_only
+            else crawler.initialize()
+        )
+        if not initialized:
+            result["fatal_error"] = "Browser/crawler initialization failed"
             exit_code = 1
+        elif args.login_only:
+            result["login_attempts"] = 1
+            print("[LOGIN SMOKE] Starting AMAZON_LOGIN_2 automation")
+            result["login_ok"] = ensure_amazon_login_dp(
+                crawler.page,
+                timeout_seconds=args.login_timeout,
+            )
+            if not result["login_ok"]:
+                result["fatal_error"] = "Amazon LOGIN_2 authentication failed"
+                exit_code = 3
+            elif not crawler.set_amazon_zip_code(crawler.amazon_zip_code):
+                result["fatal_error"] = "ZIP reset failed after login"
+                exit_code = 3
+            elif not is_amazon_login_verified_dp(crawler.page):
+                result["fatal_error"] = "Login session verification failed"
+                exit_code = 3
+            else:
+                result["login_smoke_passed"] = True
+                print(
+                    "[LOGIN SMOKE] PASS: authenticated session and ZIP "
+                    "verified; no PDP URL opened"
+                )
         elif not enforce_read_only_db(crawler):
             result["fatal_error"] = "Could not enforce a read-only DB session"
             exit_code = 1
@@ -618,22 +706,30 @@ def main():
         print_final_comparison_log(result["comparisons"])
 
     stamp = started_at.strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(args.output_dir, f"login_pdp_test_{stamp}.json")
+    output_path = os.path.join(args.output_dir, f"{run_name}_{stamp}.json")
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=2)
 
-    print(
-        "[SUMMARY] "
-        f"login_attempts={result['login_attempts']} "
-        f"login_ok={result['login_ok']} "
-        f"logged_out={dict(out_statuses)} "
-        f"logged_in={dict(in_statuses)} "
-        f"lost_fields={lost_field_count} "
-        f"changed_fields={changed_field_count} "
-        f"detailed_review_content="
-        f"{detailed_review_collected}/{len(in_rows)} "
-        f"review_login_gate={review_login_gate_count}"
-    )
+    if args.login_only:
+        print(
+            "[LOGIN SMOKE RESULT] "
+            f"{'PASS' if result['login_smoke_passed'] else 'FAIL'} "
+            f"login_ok={result['login_ok']} "
+            "pdp_opened=False"
+        )
+    else:
+        print(
+            "[SUMMARY] "
+            f"login_attempts={result['login_attempts']} "
+            f"login_ok={result['login_ok']} "
+            f"logged_out={dict(out_statuses)} "
+            f"logged_in={dict(in_statuses)} "
+            f"lost_fields={lost_field_count} "
+            f"changed_fields={changed_field_count} "
+            f"detailed_review_content="
+            f"{detailed_review_collected}/{len(in_rows)} "
+            f"review_login_gate={review_login_gate_count}"
+        )
     print(f"[RESULT] {output_path}")
     return exit_code
 
