@@ -26,6 +26,7 @@ import time
 import random
 import traceback
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from lxml import html
 from DrissionPage import ChromiumPage
@@ -50,6 +51,7 @@ from walmart.tv.wmart_tv_next_data import (
     format_reviews,
     normalize_int,
     parse_detail_product,
+    parse_discount_type_from_html,
     parse_review_page,
 )
 
@@ -258,6 +260,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         self.page = None
         self.next_data_client = WalmartNextDataClient()
         self.skip_walmart_search = True
+        self.detail_next_data_workers = self._env_int('WALMART_TV_DETAIL_WORKERS', 4)
+        self.detail_next_data_chunk_size = self._env_int('WALMART_TV_DETAIL_CHUNK_SIZE', 40)
 
 
         # SPEC DIFF 누적 (run() 끝에 일괄 출력용)
@@ -297,7 +301,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         })
 
     def run(self):
-        """실행: initialize() → load_product_list() → 제품별 crawl_detail() → save_to_retail_com() → 리소스 정리"""
+        """실행: initialize() → load_product_list() → 제품별 detail 수집/저장 → 리소스 정리"""
         try:
             if not self.initialize():
                 print("[ERROR] Initialization failed")
@@ -321,73 +325,89 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             )
 
             total_saved = 0
-            for i, product in enumerate(product_list, 1):
-                try:
-                    retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
-                    product_url = product.get('product_url', 'N/A')
-                    url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
-                    print(f"\n[{i}/{len(product_list)}] {retailer_sku_name}")
-                    print(f"  URL: {url_display}")
+            indexed_products = list(enumerate(product_list, 1))
+            total_products = len(product_list)
 
-                    combined_data = self.crawl_detail(product)
-                    if combined_data:
-                        detail_loaded = combined_data is not product
-                        self.upsert_item_mst(combined_data)
-                        if self.save_to_retail_com(combined_data):
-                            total_saved += 1
-                            self._record_saved(detail=detail_loaded)
+            for chunk_start in range(0, len(indexed_products), self.detail_next_data_chunk_size):
+                chunk = indexed_products[chunk_start:chunk_start + self.detail_next_data_chunk_size]
+                fast_results = self.collect_detail_next_data_parallel(chunk)
 
-                    if combined_data and combined_data is not product and combined_data.get('_detail_source') in ('direct', 'zenrows_static', 'zenrows_js'):
-                        time.sleep(random.uniform(0.2, 0.8))
-                    else:
-                        time.sleep(random.uniform(2, 4))
+                for i, product in chunk:
+                    combined_data = None
+                    try:
+                        retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
+                        product_url = product.get('product_url', 'N/A')
+                        url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
+                        print(f"\n[{i}/{total_products}] {retailer_sku_name}")
+                        print(f"  URL: {url_display}")
 
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    print(f"[ERROR] Product {i} failed: {e}")
+                        combined_data = fast_results.get(i)
+                        if combined_data:
+                            review_count = self._formatted_review_count(combined_data.get('detailed_review_content'))
+                            print(
+                                f"  [NEXT_DATA parallel HIT] source={combined_data.get('_detail_source')}, "
+                                f"item={combined_data.get('item') or '-'}, "
+                                f"price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}"
+                            )
+                        else:
+                            combined_data = self.crawl_detail(product, skip_fast=True)
 
-                    # DOM 타임아웃 → 브라우저 재시작만 하고 해당 제품은 스킵 (재시도 안 함)
-                    if "dom timeout" in error_msg:
-                        print(f"[INFO] DOM 타임아웃 - 브라우저 재시작 후 다음 제품으로")
-                        self.restart_browser()
-                        if self.save_to_retail_com(product):
+                        if combined_data:
+                            detail_loaded = combined_data is not product
+                            if self.save_detail_result(combined_data):
+                                total_saved += 1
+                                self._record_saved(detail=detail_loaded)
+
+                        if combined_data and combined_data is not product and combined_data.get('_detail_source') in ('direct', 'zenrows_static', 'zenrows_js'):
+                            time.sleep(random.uniform(0.05, 0.15))
+                        else:
+                            time.sleep(random.uniform(2, 4))
+
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        print(f"[ERROR] Product {i} failed: {e}")
+
+                        # DOM 타임아웃 → 브라우저 재시작만 하고 해당 제품은 스킵 (재시도 안 함)
+                        if "dom timeout" in error_msg:
+                            print(f"[INFO] DOM 타임아웃 - 브라우저 재시작 후 다음 제품으로")
+                            self.restart_browser()
+                            if self.save_detail_result(product):
+                                total_saved += 1
+                                self._record_saved()
+                            self._record_run_error('detail', product, e)
+                            continue
+
+                        if "redirect detected" in error_msg:
+                            print("[INFO] 리다이렉트 감지 - product_list 기본 정보만 저장")
+                            if self.save_detail_result(product):
+                                total_saved += 1
+                                self._record_saved()
+                            self._record_redirect(product, e)
+                            continue
+
+                        # 일반 타임아웃 또는 페이지 로드 실패 → 브라우저 재시작 후 재시도
+                        if "timeout" in error_msg or "time out" in error_msg or "url unchanged" in error_msg:
+                            print(f"[INFO] 브라우저 재시작 후 재시도")
+                            if self.restart_browser():
+                                try:
+                                    combined_data = self.crawl_detail(product, skip_fast=True)
+                                    if combined_data:
+                                        detail_loaded = combined_data is not product
+                                        if self.save_detail_result(combined_data):
+                                            total_saved += 1
+                                            self._record_saved(detail=detail_loaded)
+                                    print(f"[SUCCESS] 재시도 성공: {retailer_sku_name[:30]}")
+                                    continue
+                                except Exception as retry_e:
+                                    print(f"[ERROR] 재시도 실패: {retry_e}")
+                                    self._record_run_error('detail_retry', product, retry_e)
+
+                        # 모든 에러 발생 시 product_list 기본 정보는 저장
+                        if self.save_detail_result(product):
                             total_saved += 1
                             self._record_saved()
                         self._record_run_error('detail', product, e)
                         continue
-
-                    if "redirect detected" in error_msg:
-                        print("[INFO] 리다이렉트 감지 - product_list 기본 정보만 저장")
-                        if self.save_to_retail_com(product):
-                            total_saved += 1
-                            self._record_saved()
-                        self._record_redirect(product, e)
-                        continue
-
-                    # 일반 타임아웃 또는 페이지 로드 실패 → 브라우저 재시작 후 재시도
-                    if "timeout" in error_msg or "time out" in error_msg or "url unchanged" in error_msg:
-                        print(f"[INFO] 브라우저 재시작 후 재시도")
-                        if self.restart_browser():
-                            try:
-                                combined_data = self.crawl_detail(product)
-                                if combined_data:
-                                    detail_loaded = combined_data is not product
-                                    self.upsert_item_mst(combined_data)
-                                    if self.save_to_retail_com(combined_data):
-                                        total_saved += 1
-                                        self._record_saved(detail=detail_loaded)
-                                print(f"[SUCCESS] 재시도 성공: {retailer_sku_name[:30]}")
-                                continue
-                            except Exception as retry_e:
-                                print(f"[ERROR] 재시도 실패: {retry_e}")
-                                self._record_run_error('detail_retry', product, retry_e)
-
-                    # 모든 에러 발생 시 product_list 기본 정보는 저장
-                    if self.save_to_retail_com(product):
-                        total_saved += 1
-                        self._record_saved()
-                    self._record_run_error('detail', product, e)
-                    continue
 
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
             print(f"[DONE] Processed: {len(product_list)}, Saved: {total_saved}, Table: {table_name}, batch_id: {self.batch_id}")
@@ -565,7 +585,147 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         page_suffix = f" page{page_number}" if page_number else ''
         print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
 
-    def collect_reviews_next_data(self, item, count_of_reviews, inline_reviews, product):
+    def load_mst_specs_cache(self, products):
+        items = []
+        seen = set()
+        for product in products:
+            item = self.extract_item(product.get('product_url'))
+            if not item:
+                continue
+            item_key = str(item)
+            if item_key in seen:
+                continue
+            seen.add(item_key)
+            items.append(item_key)
+
+        if not items:
+            return {}
+
+        try:
+            if not self.ensure_db_connection():
+                return {}
+
+            placeholders = ', '.join(['%s'] * len(items))
+            cursor = self.db_conn.cursor()
+            cursor.execute(f"""
+                SELECT item, screen_size, sku
+                FROM tv_item_mst
+                WHERE account_name = %s
+                  AND is_product = TRUE
+                  AND item IN ({placeholders})
+            """, [self.account_name, *items])
+            rows = cursor.fetchall()
+            cursor.close()
+            return {
+                str(row[0]): (row[1], row[2])
+                for row in rows
+            }
+        except Exception as e:
+            print(f"  [WARNING] load_mst_specs_cache failed: {e}")
+            try:
+                if self.db_conn and not self.db_conn.closed:
+                    self.db_conn.rollback()
+            except Exception:
+                pass
+            return {}
+
+    def _crawl_detail_next_data_worker(self, index, product, mst_specs):
+        try:
+            client = WalmartNextDataClient()
+            combined_data = self.crawl_detail_next_data(
+                product,
+                next_data_client=client,
+                mst_specs=mst_specs,
+                record_errors=False,
+                collect_spec_diff=False,
+                log=False,
+            )
+            return index, combined_data, None
+        except Exception as e:
+            return index, None, e
+
+    def collect_detail_next_data_parallel(self, indexed_products):
+        if not indexed_products:
+            return {}
+
+        workers = min(self.detail_next_data_workers, len(indexed_products))
+        products = [product for _, product in indexed_products]
+        mst_specs = self.load_mst_specs_cache(products)
+        results = {}
+
+        print(
+            f"[INFO] NextData detail parallel fetch: "
+            f"{len(indexed_products)} products, workers={workers}"
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(self._crawl_detail_next_data_worker, index, product, mst_specs): (index, product)
+                for index, product in indexed_products
+            }
+            for future in as_completed(future_map):
+                index, product = future_map[future]
+                try:
+                    result_index, combined_data, error = future.result()
+                except Exception as e:
+                    result_index, combined_data, error = index, None, e
+
+                if error:
+                    self._record_run_error('detail_next_data_parallel', product, error)
+                    continue
+
+                if combined_data:
+                    results[result_index] = combined_data
+
+        print(f"[INFO] NextData detail parallel result: {len(results)}/{len(indexed_products)} loaded")
+        return results
+
+    def _apply_fast_artifacts(self, combined_data):
+        if not combined_data:
+            return
+
+        spec_diff = combined_data.pop('_spec_diff', None)
+        if spec_diff:
+            self.spec_diffs.append(spec_diff)
+
+        fast_errors = combined_data.pop('_fast_errors', None) or []
+        for error in fast_errors:
+            self._record_run_error(
+                error.get('stage') or 'detail_next_data',
+                error.get('product') or combined_data,
+                error.get('message') or '',
+            )
+
+    def save_detail_result(self, combined_data):
+        if not combined_data:
+            return False
+
+        self._apply_fast_artifacts(combined_data)
+        self.upsert_item_mst(combined_data)
+        return self.save_to_retail_com(combined_data)
+
+    def collect_reviews_next_data(
+        self,
+        item,
+        count_of_reviews,
+        inline_reviews,
+        product,
+        next_data_client=None,
+        record_errors=True,
+        error_collector=None,
+        log=True,
+    ):
+        client = next_data_client or self.next_data_client
+
+        def add_error(stage, message):
+            if record_errors:
+                self._record_run_error(stage, product, message)
+            elif error_collector is not None:
+                error_collector.append({
+                    'stage': stage,
+                    'product': product,
+                    'message': str(message),
+                })
+
         review_total = normalize_int(count_of_reviews) or 0
         if review_total <= 0:
             return None, count_of_reviews, True
@@ -574,7 +734,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         inline_reviews = inline_reviews or []
         if inline_reviews:
             review_texts.extend(inline_reviews)
-            print(f"  [NEXT_DATA review] page1: reused {len(inline_reviews)} inline reviews from detail payload")
+            if log:
+                print(f"  [NEXT_DATA review] page1: reused {len(inline_reviews)} inline reviews from detail payload")
 
         page_limit = 2 if review_total >= 20 else 1
         retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_RETRIES', 1)
@@ -586,17 +747,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             for retry_index in range(1, retry_total + 1):
                 review_url = build_review_url(item, page_number)
-                result = self.next_data_client.fetch_next_data(
+                result = client.fetch_next_data(
                     review_url,
                     direct_retries=1,
                     use_zenrows=True,
                     js_render_fallback=True,
                 )
-                self._log_next_data_attempts('review', item, page_number, result)
+                if log:
+                    self._log_next_data_attempts('review', item, page_number, result)
 
                 next_data = result.get('next_data')
                 if not next_data:
-                    if retry_index < retry_total:
+                    if log and retry_index < retry_total:
                         print(f"  [NEXT_DATA review] page{page_number}: empty result, retrying ({retry_index + 1}/{retry_total})")
                     continue
 
@@ -611,11 +773,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     break
 
                 last_reason = 'no parsed reviews'
-                if retry_index < retry_total:
+                if log and retry_index < retry_total:
                     print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{retry_total})")
 
             if not page_added:
-                self._record_run_error(f'review_page{page_number}_next_data', product, last_reason)
+                add_error(f'review_page{page_number}_next_data', last_reason)
 
         detailed_review_content = format_reviews(review_texts, limit=20)
         collected_reviews = self._formatted_review_count(detailed_review_content)
@@ -623,12 +785,34 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         if not complete:
             message = f'expected 20 reviews from {review_total}, collected {collected_reviews}'
-            print(f"  [NEXT_DATA review WARNING] {message}")
-            self._record_run_error('review_next_data_incomplete', product, message)
+            if log:
+                print(f"  [NEXT_DATA review WARNING] {message}")
+            add_error('review_next_data_incomplete', message)
 
         return detailed_review_content, count_of_reviews, complete
 
-    def crawl_detail_next_data(self, product):
+    def crawl_detail_next_data(
+        self,
+        product,
+        next_data_client=None,
+        mst_specs=None,
+        record_errors=True,
+        collect_spec_diff=True,
+        log=True,
+    ):
+        client = next_data_client or self.next_data_client
+        fast_errors = []
+
+        def add_error(stage, message):
+            if record_errors:
+                self._record_run_error(stage, product, message)
+            else:
+                fast_errors.append({
+                    'stage': stage,
+                    'product': product,
+                    'message': str(message),
+                })
+
         product_url = product.get('product_url')
         requested_item = self.extract_item(product_url)
         candidate_urls = []
@@ -637,58 +821,78 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 candidate_urls.append(url)
 
         for url in candidate_urls:
-            result = self.next_data_client.fetch_next_data(
+            result = client.fetch_next_data(
                 url,
                 direct_retries=1,
                 use_zenrows=True,
                 js_render_fallback=True,
             )
-            attempts = result.get('attempts') or []
-            if attempts:
-                summary = ' -> '.join(
-                    f"{item.get('source')}:{item.get('status')}/blocked={item.get('blocked')}"
-                    for item in attempts
-                )
-                print(f"  [NEXT_DATA detail] {requested_item or '-'}: {summary}")
+            if log:
+                self._log_next_data_attempts('detail', requested_item, None, result)
 
             next_data = result.get('next_data')
             if not next_data:
                 continue
 
             parsed = parse_detail_product(next_data)
+            if not parsed.get('discount_type'):
+                parsed['discount_type'] = parse_discount_type_from_html(result.get('html'))
+
             item = parsed.get('item') or requested_item
             if requested_item and item and str(requested_item) != str(item):
                 listing_name = product.get('retailer_sku_name')
                 detail_name = parsed.get('retailer_sku_name')
                 if not self.redirect_product_names_match(listing_name, detail_name):
-                    print(f"  [NEXT_DATA detail] redirect mismatch rejected: {requested_item} -> {item}")
+                    if log:
+                        print(f"  [NEXT_DATA detail] redirect mismatch rejected: {requested_item} -> {item}")
                     continue
 
             if not item:
                 continue
 
             if not self._has_required_price(parsed.get('final_sku_price')):
-                print(f"  [NEXT_DATA detail] price missing for item={item}; trying next candidate/browser fallback")
+                if log:
+                    print(f"  [NEXT_DATA detail] price missing for item={item}; trying next candidate/browser fallback")
                 continue
 
             spec_product = product.copy()
             if parsed.get('retailer_sku_name'):
                 spec_product['retailer_sku_name'] = parsed.get('retailer_sku_name')
 
-            mst_screen_size, mst_sku = self.get_tv_specs_from_mst(item)
-            sku, sku_source, brand_sku, page_sku, brand_name = self.extract_sku(spec_product, product_url, None, mst_sku)
-            screen_size, spec_source, name_screen_size, page_screen_size = self.extract_screen_size(spec_product, None, mst_screen_size)
+            if mst_specs is not None:
+                mst_screen_size, mst_sku = mst_specs.get(str(item), (None, None))
+            else:
+                mst_screen_size, mst_sku = self.get_tv_specs_from_mst(item)
+
+            sku, sku_source, brand_sku, page_sku, brand_name = self.extract_sku(
+                spec_product,
+                product_url,
+                None,
+                mst_sku,
+                log=log,
+            )
+            screen_size, spec_source, name_screen_size, page_screen_size = self.extract_screen_size(
+                spec_product,
+                None,
+                mst_screen_size,
+                log=log,
+            )
             detailed_review_content, count_of_reviews, review_complete = self.collect_reviews_next_data(
                 item,
                 parsed.get('count_of_reviews'),
                 parsed.get('inline_reviews') or [],
                 product,
+                next_data_client=client,
+                record_errors=record_errors,
+                error_collector=fast_errors,
+                log=log,
             )
             if not review_complete:
-                print(
-                    f"  [NEXT_DATA detail] review incomplete for item={item}; "
-                    "browser fallback required"
-                )
+                if log:
+                    print(
+                        f"  [NEXT_DATA detail] review incomplete for item={item}; "
+                        "browser fallback required"
+                    )
                 return None
 
             source = result.get('source') or 'next_data'
@@ -698,7 +902,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'sku': sku,
                 'count_of_reviews': count_of_reviews or parsed.get('count_of_reviews') or '0',
                 'star_rating': parsed.get('star_rating'),
-                'count_of_star_ratings': count_of_reviews or parsed.get('count_of_star_ratings'),
+                'count_of_star_ratings': parsed.get('count_of_star_ratings') or count_of_reviews,
                 'final_sku_price': parsed.get('final_sku_price'),
                 'original_sku_price': parsed.get('original_sku_price'),
                 'savings': parsed.get('savings'),
@@ -718,7 +922,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             has_sku_diff = (mst_sku or extracted_sku) and mst_sku != extracted_sku
             has_screen_size_diff = (mst_screen_size or extracted_screen_size) and mst_screen_size != extracted_screen_size
             if has_sku_diff or has_screen_size_diff:
-                self.spec_diffs.append({
+                spec_diff = {
                     'item': item,
                     'mst_sku': mst_sku,
                     'extracted_sku': extracted_sku,
@@ -729,15 +933,23 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     'extracted_screen_size': extracted_screen_size,
                     'name_screen_size': name_screen_size,
                     'page_screen_size': page_screen_size,
-                })
+                }
+                if collect_spec_diff:
+                    self.spec_diffs.append(spec_diff)
+                else:
+                    combined_data['_spec_diff'] = spec_diff
 
-            review_count = self._formatted_review_count(detailed_review_content)
-            print(f"  [NEXT_DATA detail OK] source={source}, item={item}, price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}")
+            if fast_errors:
+                combined_data['_fast_errors'] = fast_errors
+
+            if log:
+                review_count = self._formatted_review_count(detailed_review_content)
+                print(f"  [NEXT_DATA detail OK] source={source}, item={item}, price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}")
             return combined_data
 
         return None
 
-    def crawl_detail(self, product):
+    def crawl_detail(self, product, skip_fast=False):
         """상세 페이지 크롤링: 페이지 로드 → 데이터 추출 → 스펙 추출 → 유사제품 추출 → 리뷰 추출 (DrissionPage 사용)"""
         try:
             product_url = product.get('product_url')
@@ -746,9 +958,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 return None
 
 
-            fast_data = self.crawl_detail_next_data(product)
-            if fast_data:
-                return fast_data
+            if not skip_fast:
+                fast_data = self.crawl_detail_next_data(product)
+                if fast_data:
+                    return fast_data
 
             if self.page is None and not self.ensure_browser_ready():
                 print("[ERROR] Browser fallback setup failed")
@@ -1174,19 +1387,20 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         return None, None
 
-    def extract_sku(self, product, product_url, modal_tree, mst_sku):
+    def extract_sku(self, product, product_url, modal_tree, mst_sku, log=True):
         """SKU 최종값 결정: 마스터 → 브랜드 정규식 → 모달."""
         brand_sku, brand_name = self.extract_sku_by_brand(
             product.get('retailer_sku_name'),
             product_url,
         )
-        if brand_name:
-            if brand_sku:
-                print(f"  [sku 브랜드 추출] {brand_name} → {brand_sku}")
+        if log:
+            if brand_name:
+                if brand_sku:
+                    print(f"  [sku 브랜드 추출] {brand_name} → {brand_sku}")
+                else:
+                    print(f"  [sku 브랜드 추출] {brand_name} 매칭됐으나 정규식 실패")
             else:
-                print(f"  [sku 브랜드 추출] {brand_name} 매칭됐으나 정규식 실패")
-        else:
-            print(f"  [sku 브랜드 추출] 브랜드 매칭 없음 → page_sku로 fallback")
+                print(f"  [sku 브랜드 추출] 브랜드 매칭 없음 → page_sku로 fallback")
 
         page_sku = self.safe_extract_chain(modal_tree, 'sku') if modal_tree is not None else None
 
@@ -1253,14 +1467,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             print(f"  [WARNING] {label} failed: {e}")
             return None
 
-    def extract_screen_size(self, product, modal_tree, mst_screen_size):
+    def extract_screen_size(self, product, modal_tree, mst_screen_size, log=True):
         """screen_size 최종값 결정: 상품명 정규식 → 모달 → 마스터."""
         name_screen_size = self.extract_screen_size_by_regex(
             product.get('retailer_sku_name'),
             r'(\d+\.?\d*)(?:[\s-]*inch(?:es)?|["“”″])',
             'extract_screen_size_name',
         )
-        if name_screen_size:
+        if name_screen_size and log:
             print(f"  [screen_size 상품명 추출] {name_screen_size}")
 
         page_screen_size = None

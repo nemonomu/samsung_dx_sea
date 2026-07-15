@@ -58,6 +58,11 @@ def normalize_count_text(value):
     return str(count) if count is not None else None
 
 
+def format_count_text(value):
+    count = normalize_int(value)
+    return f"{count:,}" if count is not None else None
+
+
 def format_money(value):
     if value in (None, ""):
         return None
@@ -405,6 +410,19 @@ def _was_price_string(price_info):
     return None
 
 
+def _dollar_amount_string(value):
+    text = collapse_ws(value)
+    if text:
+        match = re.search(r"\$\s*[\d,]+(?:\.\d{1,2})?", text)
+        if match:
+            return match.group(0).replace("$ ", "$")
+
+    formatted = format_money(value)
+    if formatted and formatted.startswith("$"):
+        return formatted
+    return None
+
+
 def _savings_string(price_info):
     if not isinstance(price_info, dict):
         return None
@@ -412,12 +430,12 @@ def _savings_string(price_info):
         value = price_info.get(key)
         if isinstance(value, dict):
             for nested_key in ("priceString", "priceDisplay", "linePrice", "linePriceDisplay", "price"):
-                formatted = format_money(value.get(nested_key))
-                if formatted:
+                formatted = _dollar_amount_string(value.get(nested_key))
+                if formatted and formatted not in ("$0.00", "$0"):
                     return formatted
         else:
-            formatted = format_money(value)
-            if formatted and formatted not in ("$0.00", "0"):
+            formatted = _dollar_amount_string(value)
+            if formatted and formatted not in ("$0.00", "$0"):
                 return formatted
     return None
 
@@ -453,7 +471,7 @@ def parse_review_page(next_data, limit=10):
         return {"reviews": [], "total_review_count": None, "star_rating": None}
     return {
         "reviews": _review_texts_from_reviews_node(reviews_node, limit=limit),
-        "total_review_count": normalize_count_text(reviews_node.get("totalReviewCount") or reviews_node.get("reviewsWithTextCount")),
+        "total_review_count": parse_text_review_count(reviews_node),
         "star_rating": collapse_ws(reviews_node.get("averageOverallRating") or reviews_node.get("roundedAverageOverallRating")),
     }
 
@@ -477,32 +495,99 @@ def format_reviews(review_texts, limit=20):
     return " ||| ".join(f"review{index} - {text}" for index, text in enumerate(rows, 1))
 
 
+SKU_POPULARITY_BADGE_VALUES = {
+    "overall pick",
+    "best seller",
+    "rollback",
+    "clearance",
+    "reduced price",
+    "flash deal",
+    "sale",
+    "popular pick",
+}
+
+
+def parse_text_review_count(*nodes):
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for key in (
+            "reviewsWithTextCount",
+            "reviewWithTextCount",
+            "textReviewCount",
+            "customerReviewCount",
+        ):
+            value = format_count_text(node.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def parse_star_rating_count(*nodes):
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for key in (
+            "numberOfReviews",
+            "totalReviewCount",
+            "ratingCount",
+            "ratingsCount",
+            "totalRatings",
+            "reviewsCount",
+        ):
+            value = format_count_text(node.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def parse_sku_popularity(product):
+    values = []
+    for text in _badge_texts(product):
+        lower = text.lower()
+        if any(token in lower for token in ("cart", "bought", "purchased", "pickup", "delivery", "shipping", "left")):
+            continue
+        if lower == "price when purchased online":
+            continue
+        if lower in SKU_POPULARITY_BADGE_VALUES:
+            values.append(text)
+    values = _unique_texts(values)
+    return ", ".join(values) if values else None
+
+
 def parse_social_counts(product):
     texts = _badge_texts(product)
     added_to_carts = None
     purchased_yesterday = None
-    sku_popularity = None
     for text in texts:
         lower = text.lower()
         if "cart" in lower and added_to_carts is None:
             added_to_carts = normalize_count_text(text)
-            sku_popularity = text
         if ("bought" in lower or "purchased" in lower) and purchased_yesterday is None:
             purchased_yesterday = normalize_count_text(text)
-            sku_popularity = sku_popularity or text
     return {
         "number_of_ppl_added_to_carts": added_to_carts,
         "number_of_ppl_purchased_yesterday": purchased_yesterday,
-        "sku_popularity": sku_popularity,
+        "sku_popularity": parse_sku_popularity(product),
     }
 
 
-def parse_discount_type(product):
-    for text in _badge_texts(product):
-        if text.lower() in ("rollback", "clearance", "reduced price", "best seller", "sale"):
-            return text
-    badge = product.get("badge") or {}
-    return collapse_ws(badge.get("text")) if isinstance(badge, dict) else None
+def parse_discount_type(product, price_info=None):
+    price_info = price_info if isinstance(price_info, dict) else product.get("priceInfo") or {}
+    for text in _content_values(price_info):
+        if collapse_ws(text) == "Price when purchased online":
+            return "Price when purchased online"
+    try:
+        if "Price when purchased online" in json.dumps(price_info, ensure_ascii=False):
+            return "Price when purchased online"
+    except TypeError:
+        pass
+    return None
+
+
+def parse_discount_type_from_html(html_text):
+    text = html_unescape(html_text or "")
+    return "Price when purchased online" if "Price when purchased online" in text else None
 
 
 def parse_similar_product_names(next_data, current_item=None, limit=30):
@@ -533,18 +618,22 @@ def parse_detail_product(next_data):
     price_info = product.get("priceInfo") or {}
     social = parse_social_counts(product)
     item = product.get("usItemId") or product.get("id") or item_id_from_url(product.get("canonicalUrl") or "")
-    count_of_reviews = normalize_count_text(product.get("numberOfReviews") or reviews_node.get("totalReviewCount") or reviews_node.get("reviewsWithTextCount"))
-    star_rating = collapse_ws(product.get("averageRating") or reviews_node.get("averageOverallRating"))
+    count_of_reviews = parse_text_review_count(reviews_node, product)
+    count_of_star_ratings = parse_star_rating_count(product, reviews_node) or count_of_reviews
+    star_rating = collapse_ws(product.get("averageRating") or reviews_node.get("averageOverallRating")) or "No ratings yet"
+    if count_of_reviews is None and count_of_star_ratings is None:
+        count_of_reviews = "0"
+        count_of_star_ratings = "0"
     return {
         "item": str(item) if item else None,
         "retailer_sku_name": collapse_ws(product.get("name")),
         "count_of_reviews": count_of_reviews,
         "star_rating": star_rating,
-        "count_of_star_ratings": count_of_reviews,
+        "count_of_star_ratings": count_of_star_ratings,
         "final_sku_price": _price_string(price_info),
         "original_sku_price": _was_price_string(price_info),
         "savings": _savings_string(price_info),
-        "discount_type": parse_discount_type(product),
+        "discount_type": parse_discount_type(product, price_info),
         "sku_popularity": social["sku_popularity"],
         "number_of_ppl_purchased_yesterday": social["number_of_ppl_purchased_yesterday"],
         "number_of_ppl_added_to_carts": social["number_of_ppl_added_to_carts"],
