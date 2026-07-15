@@ -371,6 +371,11 @@ def _login(adapter, credentials, timeout_seconds=180):
     print(f"[LOGIN] Amazon 계정 로그인 시작 ({credentials['source']})")
     adapter.get(HOME_URL)
     time.sleep(3)
+    _handle_continue_shopping(adapter)
+    if _verified_login(adapter) and _nav_login_state(adapter) is True:
+        print("[LOGIN] Reusing existing authenticated Amazon session")
+        return True
+
     if _logged_in(adapter):
         # The nav does not expose an email address, so an existing session
         # cannot be proven to be LOGIN_2. Re-authenticate instead of accepting

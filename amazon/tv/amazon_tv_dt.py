@@ -46,12 +46,9 @@ setup_environment(__file__)
 from common.amazon_base import AmazonBaseCrawler
 from amazon.tv.amazon_login import ensure_amazon_login_dp
 
-# 신뢰 프로필 (리뷰 로그인 게이트 통행권) — detail 스테이지 전용.
-# 일반 사용 Chrome 프로필의 사본으로 브라우저를 띄우면 게이트를 통과한다
-# (2026-07-05 RDP 실측). 사본의 유효기간이 ~2일에 불과해(2026-07-08 관측)
-# detail 런 시작 시마다 원본에서 자동 리프레시한다 — 원본은 크롤링에 쓰이지
-# 않아 정상 사용 토큰 회전으로 신뢰가 유지되는 "통행증 발급처" 역할.
-# 원본/사본 둘 다 없으면 기존 기본 프로필로 동작 (하위 호환).
+# Dedicated trusted profile for Amazon detail collection.
+# Seed it once from regular Chrome, then preserve the authenticated
+# crawler session so a successful RDP verification is not overwritten.
 TRUSTED_PROFILE_DIR = r'C:\chrome_profile_amzn'
 TRUSTED_PROFILE_SOURCE = os.path.join(
     os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
@@ -64,16 +61,26 @@ _TRUSTED_PROFILE_FILES = [
 
 
 def refresh_trusted_profile(source_dir=None, dest_dir=None):
-    """신뢰 프로필 사본을 원본 Chrome 프로필에서 리프레시.
-
-    Cookies가 Chrome 실행 중 잠금이면 esentutl /vss로 우회 복사한다
-    (make_trusted_profile.bat과 동일 로직의 Python 구현).
+    """Use an existing crawler profile; seed it from Chrome only once.
 
     Returns:
-        bool: 핵심 파일(Cookies)까지 갱신 성공 여부. 실패해도 기존 사본은 보존됨.
+        bool: existing or newly copied Cookies are available.
     """
     source_dir = source_dir or TRUSTED_PROFILE_SOURCE
     dest_dir = dest_dir or TRUSTED_PROFILE_DIR
+
+    existing_cookies = os.path.join(
+        dest_dir, 'Default', 'Network', 'Cookies'
+    )
+    try:
+        if (
+            os.path.isfile(existing_cookies)
+            and os.path.getsize(existing_cookies) > 0
+        ):
+            print(f"[INFO] Preserving existing Amazon profile session: {dest_dir}")
+            return True
+    except OSError:
+        pass
 
     if not os.path.exists(os.path.join(source_dir, 'Local State')):
         print(f"[INFO] 신뢰 프로필 원본 없음({source_dir}) → 리프레시 생략")
