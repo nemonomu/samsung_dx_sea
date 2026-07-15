@@ -303,7 +303,9 @@ def fetch_today_batch_ids(test_mode=False):
     # test 모드 batch_id는 't_w_YYYYMMDD' prefix, 운영은 'w_YYYYMMDD'
     pattern = f"t_w_{today_str}%" if test_mode else f"w_{today_str}%"
     try:
-        conn = psycopg2.connect(**DB_CONFIG, database='postgres')
+        db_config = dict(DB_CONFIG)
+        db_config.setdefault('database', 'postgres')
+        conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         cursor.execute(
             f"SELECT DISTINCT batch_id FROM {table} "

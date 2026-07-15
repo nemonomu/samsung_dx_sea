@@ -43,6 +43,15 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.walmart_base import WalmartBaseCrawler
+from walmart.tv.wmart_tv_next_data import (
+    WalmartNextDataClient,
+    build_item_url,
+    build_review_url,
+    format_reviews,
+    normalize_int,
+    parse_detail_product,
+    parse_review_page,
+)
 
 
 # ================================================================================
@@ -247,6 +256,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         # DrissionPage 드라이버 (Selenium driver 대신 사용)
         self.page = None
+        self.next_data_client = WalmartNextDataClient()
+        self.skip_walmart_search = True
 
 
         # SPEC DIFF 누적 (run() 끝에 일괄 출력용)
@@ -326,7 +337,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                             total_saved += 1
                             self._record_saved(detail=detail_loaded)
 
-                    time.sleep(random.uniform(2, 4))
+                    if combined_data and combined_data is not product and combined_data.get('_detail_source') in ('direct', 'zenrows_static', 'zenrows_js'):
+                        time.sleep(random.uniform(0.2, 0.8))
+                    else:
+                        time.sleep(random.uniform(2, 4))
 
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -428,15 +442,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not self.load_xpaths(self.account_name, self.page_type, 'SEA', 'TV'):
             return False
 
-        # 4. 브라우저 설정 (DrissionPage)
-        if not self.setup_browser():
-            print("[ERROR] Initialize failed: DrissionPage setup failed")
-            return False
+        # 4. NextData HTTP client ready. Browser opens only as lazy fallback.
+        self.next_data_client = WalmartNextDataClient()
+        self.skip_walmart_search = True
 
-        # 5. 세션 초기화 (example.com → walmart.com → 검색)
-        self.initialize_session()
-
-        # 6. 로그 정리
+        # 5. Log cleanup
         self.cleanup_old_logs()
 
         print(f"[INFO] batch_id: {self.batch_id}")
@@ -513,6 +523,148 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         print("[WARNING] DB connection closed; reconnecting...")
         return self.connect_db()
 
+    def ensure_browser_ready(self):
+        """Prepare the existing DrissionPage flow only when HTTP collection fails."""
+        if self.page is not None:
+            return True
+        if not self.setup_browser():
+            return False
+        self.skip_walmart_search = True
+        self.initialize_session()
+        return True
+
+    def collect_reviews_next_data(self, item, count_of_reviews, inline_reviews, product):
+        review_total = normalize_int(count_of_reviews) or 0
+        if review_total <= 0:
+            return None, count_of_reviews
+
+        review_texts = []
+        page_limit = 2 if review_total >= 20 else 1
+        for page_number in range(1, page_limit + 1):
+            review_url = build_review_url(item, page_number)
+            result = self.next_data_client.fetch_next_data(
+                review_url,
+                direct_retries=1,
+                use_zenrows=True,
+                js_render_fallback=True,
+            )
+            next_data = result.get('next_data')
+            if not next_data:
+                if page_number == 1 and inline_reviews:
+                    review_texts.extend(inline_reviews)
+                else:
+                    self._record_run_error(f'review_page{page_number}_next_data', product, 'no __NEXT_DATA__')
+                continue
+
+            parsed = parse_review_page(next_data, limit=10)
+            page_reviews = parsed.get('reviews') or []
+            review_texts.extend(page_reviews)
+            if page_number == 1:
+                count_of_reviews = parsed.get('total_review_count') or count_of_reviews
+
+        if not review_texts and inline_reviews:
+            review_texts.extend(inline_reviews)
+        return format_reviews(review_texts, limit=20), count_of_reviews
+
+    def crawl_detail_next_data(self, product):
+        product_url = product.get('product_url')
+        requested_item = self.extract_item(product_url)
+        candidate_urls = []
+        for url in (build_item_url(requested_item), product_url):
+            if url and url not in candidate_urls:
+                candidate_urls.append(url)
+
+        for url in candidate_urls:
+            result = self.next_data_client.fetch_next_data(
+                url,
+                direct_retries=1,
+                use_zenrows=True,
+                js_render_fallback=True,
+            )
+            attempts = result.get('attempts') or []
+            if attempts:
+                summary = ' -> '.join(
+                    f"{item.get('source')}:{item.get('status')}/blocked={item.get('blocked')}"
+                    for item in attempts
+                )
+                print(f"  [NEXT_DATA detail] {requested_item or '-'}: {summary}")
+
+            next_data = result.get('next_data')
+            if not next_data:
+                continue
+
+            parsed = parse_detail_product(next_data)
+            item = parsed.get('item') or requested_item
+            if requested_item and item and str(requested_item) != str(item):
+                listing_name = product.get('retailer_sku_name')
+                detail_name = parsed.get('retailer_sku_name')
+                if not self.redirect_product_names_match(listing_name, detail_name):
+                    print(f"  [NEXT_DATA detail] redirect mismatch rejected: {requested_item} -> {item}")
+                    continue
+
+            if not item:
+                continue
+
+            spec_product = product.copy()
+            if parsed.get('retailer_sku_name'):
+                spec_product['retailer_sku_name'] = parsed.get('retailer_sku_name')
+
+            mst_screen_size, mst_sku = self.get_tv_specs_from_mst(item)
+            sku, sku_source, brand_sku, page_sku, brand_name = self.extract_sku(spec_product, product_url, None, mst_sku)
+            screen_size, spec_source, name_screen_size, page_screen_size = self.extract_screen_size(spec_product, None, mst_screen_size)
+            detailed_review_content, count_of_reviews = self.collect_reviews_next_data(
+                item,
+                parsed.get('count_of_reviews'),
+                parsed.get('inline_reviews') or [],
+                product,
+            )
+
+            source = result.get('source') or 'next_data'
+            combined_data = product.copy()
+            combined_data.update({
+                'item': item,
+                'sku': sku,
+                'count_of_reviews': count_of_reviews or parsed.get('count_of_reviews') or '0',
+                'star_rating': parsed.get('star_rating'),
+                'count_of_star_ratings': count_of_reviews or parsed.get('count_of_star_ratings'),
+                'final_sku_price': parsed.get('final_sku_price'),
+                'original_sku_price': parsed.get('original_sku_price'),
+                'savings': parsed.get('savings'),
+                'discount_type': parsed.get('discount_type'),
+                'sku_popularity': parsed.get('sku_popularity'),
+                'number_of_ppl_purchased_yesterday': parsed.get('number_of_ppl_purchased_yesterday'),
+                'number_of_ppl_added_to_carts': parsed.get('number_of_ppl_added_to_carts'),
+                'model_year': self.extract_model_year(spec_product.get('retailer_sku_name')),
+                'screen_size': screen_size,
+                'retailer_sku_name_similar': parsed.get('retailer_sku_name_similar'),
+                'detailed_review_content': detailed_review_content,
+                '_detail_source': source,
+            })
+
+            extracted_sku = brand_sku or page_sku
+            extracted_screen_size = name_screen_size or page_screen_size
+            has_sku_diff = (mst_sku or extracted_sku) and mst_sku != extracted_sku
+            has_screen_size_diff = (mst_screen_size or extracted_screen_size) and mst_screen_size != extracted_screen_size
+            if has_sku_diff or has_screen_size_diff:
+                self.spec_diffs.append({
+                    'item': item,
+                    'mst_sku': mst_sku,
+                    'extracted_sku': extracted_sku,
+                    'brand_sku': brand_sku,
+                    'page_sku': page_sku,
+                    'brand_name': brand_name,
+                    'mst_screen_size': mst_screen_size,
+                    'extracted_screen_size': extracted_screen_size,
+                    'name_screen_size': name_screen_size,
+                    'page_screen_size': page_screen_size,
+                })
+
+            review_count = (detailed_review_content.count(' ||| ') + 1) if detailed_review_content else 0
+            print(f"  [NEXT_DATA detail OK] source={source}, item={item}, price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}")
+            return combined_data
+
+        return None
+
     def crawl_detail(self, product):
         """상세 페이지 크롤링: 페이지 로드 → 데이터 추출 → 스펙 추출 → 유사제품 추출 → 리뷰 추출 (DrissionPage 사용)"""
         try:
@@ -520,6 +672,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if not product_url:
                 print(f"  [SKIP] product_url 없음 → 크롤링/저장 건너뜀")
                 return None
+
+
+            fast_data = self.crawl_detail_next_data(product)
+            if fast_data:
+                return fast_data
+
+            if self.page is None and not self.ensure_browser_ready():
+                print("[ERROR] Browser fallback setup failed")
+                return product
 
             self.load_detail_page(product_url)
 

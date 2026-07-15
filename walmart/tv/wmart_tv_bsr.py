@@ -41,6 +41,11 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.walmart_base import WalmartBaseCrawler
+from walmart.tv.wmart_tv_next_data import (
+    WalmartNextDataClient,
+    build_listing_url,
+    parse_listing_products,
+)
 
 
 class WalmartTVBSRCrawler(WalmartBaseCrawler):
@@ -59,6 +64,9 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
         self.batch_id = batch_id
         self.calendar_week = None
         self.url_template = None
+        self.next_data_client = WalmartNextDataClient()
+        self._last_listing_source = None
+        self.skip_walmart_search = True
 
         # DrissionPage 객체
         self.page = None
@@ -127,7 +135,8 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
                     if (total_insert + total_update) >= target_products:
                         break
 
-                time.sleep(random.uniform(8, 12))  # 페이지 간 대기 시간 증가
+                wait_range = (8, 12) if self._last_listing_source == 'browser' else (0.5, 1.5)
+                time.sleep(random.uniform(*wait_range))
                 page_num += 1
 
             print(f"[DONE] Page: {page_num}, Update: {total_update}, Insert: {total_insert}, batch_id: {self.batch_id}")
@@ -184,15 +193,11 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
             print(f"[ERROR] Initialize failed: URL template load failed (account={self.account_name}, page_type={self.page_type})")
             return False
 
-        # 5. 브라우저 설정 (DrissionPage)
-        if not self.setup_browser():
-            print("[ERROR] Initialize failed: Browser setup failed")
-            return False
+        # 5. NextData HTTP client ready. Browser opens only as lazy fallback.
+        self.next_data_client = WalmartNextDataClient()
+        self.skip_walmart_search = True
 
-        # 6. 세션 초기화 (example.com → walmart.com → 카테고리)
-        self.initialize_session()
-
-        # 7. calendar_week 생성 및 로그 정리
+        # 6. calendar_week/log cleanup
         self.calendar_week = self.generate_calendar_week()
         self.cleanup_old_logs()
 
@@ -202,9 +207,64 @@ class WalmartTVBSRCrawler(WalmartBaseCrawler):
         print(f"[INFO] Initialize completed: batch_id={self.batch_id}, calendar_week={self.calendar_week}")
         return True
 
+    def ensure_browser_ready(self):
+        """Prepare the existing DrissionPage flow only when HTTP collection fails."""
+        if self.page is not None:
+            return True
+        if not self.setup_browser():
+            return False
+        self.skip_walmart_search = True
+        self.initialize_session()
+        return True
+
+    def crawl_page_direct(self, page_number):
+        url = build_listing_url(self.url_template, page_number, self.page_type)
+        result = self.next_data_client.fetch_next_data(
+            url,
+            direct_retries=1,
+            use_zenrows=True,
+            js_render_fallback=True,
+        )
+        attempts = result.get('attempts') or []
+        if attempts:
+            summary = ' -> '.join(
+                f"{item.get('source')}:{item.get('status')}/blocked={item.get('blocked')}"
+                for item in attempts
+            )
+            print(f"[NEXT_DATA] Page {page_number}: {summary}")
+
+        next_data = result.get('next_data')
+        if not next_data:
+            print(f"[NEXT_DATA] Page {page_number}: no __NEXT_DATA__, browser fallback")
+            return None
+
+        products = parse_listing_products(
+            next_data,
+            account_name=self.account_name,
+            page_type=self.page_type,
+            page_number=page_number,
+            calendar_week=self.calendar_week,
+            batch_id=self.batch_id,
+        )
+        if not products:
+            print(f"[NEXT_DATA] Page {page_number}: 0 products parsed, browser fallback")
+            return None
+
+        self._last_listing_source = result.get('source') or 'next_data'
+        print(f"[NEXT_DATA] Page {page_number}: {len(products)} products parsed via {self._last_listing_source}")
+        return products
+
     def crawl_page(self, page_number):
         """페이지 크롤링: 페이지 로드 → CAPTCHA 처리 → 스크롤 → HTML 파싱(40개 검증) → 제품 데이터 추출"""
         try:
+            direct_products = self.crawl_page_direct(page_number)
+            if direct_products is not None:
+                return direct_products
+
+            self._last_listing_source = 'browser'
+            if self.page is None and not self.ensure_browser_ready():
+                raise RuntimeError("Browser page is not initialized")
+
             base_container_xpath = self.xpaths.get('base_container', {}).get('xpath')
             if not base_container_xpath:
                 print("[ERROR] base_container XPath not found")
