@@ -6,7 +6,7 @@ Amazon TV 통합 크롤러 (운영용)
 ================================================================================
 STEP 1. Main   - 검색 결과 페이지에서 제품 목록 수집 (최대 300개)
 STEP 2. BSR    - Best Seller 페이지에서 제품 목록 수집 (2페이지)
-STEP 3. Detail - 수집된 모든 제품의 상세 페이지 크롤링 + SKU/item 추출
+STEP 3. Detail - config.AMAZON_LOGIN_2 계정 로그인 후 제품 상세 페이지 크롤링 + SKU/item 추출
 STEP 4. Review Coverage - 리뷰 수집률이 임계치(50%) 미만이면 이메일에 WARNING만.
         즉시 백필은 안 한다 — detail 직후엔 리뷰 로그인 게이트로 세션 신원이
         고갈 상태라 백필이 매번 0건 실패하고 신원만 더 소진시킨다(2026-07 실측).
@@ -420,7 +420,11 @@ class AmazonTVIntegratedCrawler:
                 print(f"\n[STEP 3/3] Detail Crawler...")
                 stage_start = time.time()
                 try:
-                    detail_crawler = AmazonTVDetailCrawler(batch_id=self.batch_id, test_mode=False)
+                    detail_crawler = AmazonTVDetailCrawler(
+                        batch_id=self.batch_id,
+                        test_mode=False,
+                        require_amazon_login=True,
+                    )
                     success = detail_crawler.run()
                     detail_report = dict(detail_crawler.detail_report)
                     crawl_results['detail'] = {

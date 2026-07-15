@@ -82,6 +82,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
     def __init__(self, batch_id=None, start_id=None, mode=None, test_mode=False):
         """batch_id: 필수, start_id: 특정 id 이후부터 조회, mode: 1/2/3, test_mode: True면 test_tv_retail_com 사용"""
         super().__init__(batch_id=batch_id, test_mode=test_mode)
+        self.require_amazon_login = True
         self.start_id = start_id
         self.mode = mode or self.MODE_ITEM_NULL
 

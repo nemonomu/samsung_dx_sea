@@ -44,6 +44,7 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
+from amazon.tv.amazon_login import ensure_amazon_login_dp
 
 # 신뢰 프로필 (리뷰 로그인 게이트 통행권) — detail 스테이지 전용.
 # 일반 사용 Chrome 프로필의 사본으로 브라우저를 띄우면 게이트를 통과한다
@@ -173,7 +174,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # ========================================================================
     # Init
     # ========================================================================
-    def __init__(self, batch_id=None, test_mode=False):
+    def __init__(self, batch_id=None, test_mode=False, require_amazon_login=False):
         """초기화. batch_id: 통합 크롤러에서 전달, test_mode: 테스트 모드 여부"""
         super().__init__()
         self.account_name = 'Amazon'
@@ -182,6 +183,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         self.page_type = 'detail'
         self.batch_id = batch_id
         self.test_mode = test_mode
+        self.require_amazon_login = require_amazon_login
         self.item_mst_table = 'tv_item_mst'  # is_product_excluded 조회 테이블
         self.page = None  # DrissionPage 객체
 
@@ -478,6 +480,22 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             print(f"[ERROR] Initialize failed: Amazon browser setup failed - {e}")
             traceback.print_exc()
             return False
+
+        # 같은 Detail 브라우저 세션에서 로그인한 뒤 PDP URL만 연다.
+        # 로그인 뒤 review page 직접 접근이나 review-link 클릭은 하지 않는다.
+        if self.require_amazon_login:
+            try:
+                login_timeout = int(os.environ.get('AMAZON_LOGIN_TIMEOUT', '180'))
+                if not ensure_amazon_login_dp(self.page, timeout_seconds=login_timeout):
+                    print("[ERROR] Amazon 로그인 실패 — Detail 크롤링을 시작하지 않습니다.")
+                    return False
+                # 계정 로그인으로 배송지가 바뀔 수 있으므로 운영 ZIP을 다시 적용한다.
+                if not self.set_amazon_zip_code(self.amazon_zip_code):
+                    print("[ERROR] 로그인 후 Amazon ZIP code 재설정 실패")
+                    return False
+            except Exception as e:
+                print(f"[ERROR] Amazon 로그인 초기화 실패: {e}")
+                return False
 
         # 5. 로그 정리
         self.cleanup_old_logs()

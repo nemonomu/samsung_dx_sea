@@ -54,6 +54,7 @@ from amazon.tv.amazon_tv_dt import (
 )
 from common.amazon_base import AmazonBaseCrawler
 from common.base_crawler import BaseCrawler
+from amazon.tv.amazon_login import ensure_amazon_login_selenium
 
 REVIEW_GATE_MARKERS = AmazonBaseCrawler.REVIEW_GATE_MARKERS
 
@@ -260,7 +261,7 @@ def main():
     batch_id = args.batch_id or select_batch_id()
     if not batch_id:
         print("[ERROR] batch_id가 필요합니다.")
-        return
+        return 1
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'uc_gate_test')
@@ -276,7 +277,7 @@ def main():
     if not targets:
         print("[INFO] 대상 없음 — 종료")
         conn.close()
-        return
+        return 0
 
     user_data_dir = None
     if not args.no_profile:
@@ -287,6 +288,27 @@ def main():
 
     driver = make_uc_driver(user_data_dir=user_data_dir)
     set_amazon_zip(driver)
+
+    # 같은 UC 세션에서 로그인한 뒤 아래 product_url(PDP)만 순서대로 연다.
+    # review 전용 URL 이동이나 review-link 클릭은 하지 않는다.
+    try:
+        login_timeout = int(os.environ.get('AMAZON_LOGIN_TIMEOUT', '180'))
+        if not ensure_amazon_login_selenium(driver, timeout_seconds=login_timeout):
+            print("[ERROR] Amazon 로그인 실패 — UC 리뷰 백필을 시작하지 않습니다.")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            conn.close()
+            return 1
+    except Exception as e:
+        print(f"[ERROR] Amazon 로그인 초기화 실패: {e}")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        conn.close()
+        return 1
 
     results = {'batch_id': batch_id, 'started_at': ts, 'write': write,
                'use_profile': not args.no_profile, 'products': []}
@@ -360,6 +382,8 @@ def main():
             pass
         conn.close()
 
+    return 0
+
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
