@@ -194,6 +194,16 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             print(f"[ERROR] DB update failed: id가 없음")
             return False
 
+        if (
+            self.mode == self.MODE_DETAIL_REVIEW_NULL
+            and not product.get('detailed_review_content')
+        ):
+            print(
+                f"[WARNING] Mode 4 skipped: detailed_review_content "
+                f"was not collected (id={row_id})"
+            )
+            return False
+
         try:
             cursor = self.db_conn.cursor()
 
@@ -205,10 +215,17 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                 field: now if source == 'CURRENT_TIMESTAMP' else source
                 for field, source in self.UPDATE_META_FIELDS.items()
             }
-            update_data = {
-                **{key: product.get(key) for key in self.EXTRACTED_FIELDS},
-                **update_meta,
-            }
+            if self.mode == self.MODE_DETAIL_REVIEW_NULL:
+                # Review backfill must not overwrite unrelated extracted fields.
+                update_data = {
+                    'detailed_review_content': product['detailed_review_content'],
+                    **update_meta,
+                }
+            else:
+                update_data = {
+                    **{key: product.get(key) for key in self.EXTRACTED_FIELDS},
+                    **update_meta,
+                }
 
             updates = [f"{key} = %s" for key in update_data]
             params = list(update_data.values())
@@ -258,7 +275,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                         if combined_data.get('_detail_skip') == 'asin_mismatch':
                             print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
                         else:
-                            self.upsert_item_mst(combined_data)
+                            if self.mode != self.MODE_DETAIL_REVIEW_NULL:
+                                self.upsert_item_mst(combined_data)
                             if self.save_to_retail_com(combined_data):
                                 total_updated += 1
 
@@ -295,7 +313,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                                 if combined_data.get('_detail_skip') == 'asin_mismatch':
                                     print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
                                 else:
-                                    self.upsert_item_mst(combined_data)
+                                    if self.mode != self.MODE_DETAIL_REVIEW_NULL:
+                                        self.upsert_item_mst(combined_data)
                                     if self.save_to_retail_com(combined_data):
                                         total_updated += 1
                             print(f"[SUCCESS] 재시도 성공")
