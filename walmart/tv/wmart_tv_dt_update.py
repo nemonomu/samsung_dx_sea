@@ -242,10 +242,12 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                     print(f"  URL: {url_display}")
 
                     combined_data = self.crawl_detail(product)
-                    if combined_data:
+                    if combined_data and combined_data is not product:
                         self.upsert_item_mst(combined_data)
                         if self.save_to_retail_com(combined_data):
                             total_updated += 1
+                    elif combined_data is product:
+                        print("  [INFO] Detail update skipped: detail fields incomplete")
 
                     time.sleep(random.uniform(2, 4))
 
@@ -265,11 +267,13 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                         if self.restart_browser():
                             try:
                                 combined_data = self.crawl_detail(product)
-                                if combined_data:
+                                if combined_data and combined_data is not product:
                                     self.upsert_item_mst(combined_data)
                                     if self.save_to_retail_com(combined_data):
                                         total_updated += 1
-                                print(f"[SUCCESS] 재시도 성공: {sku_name[:30]}")
+                                    print(f"[SUCCESS] Retry succeeded: {sku_name[:30]}")
+                                elif combined_data is product:
+                                    print("  [INFO] Retry detail update skipped: detail fields incomplete")
                             except Exception as retry_e:
                                 print(f"[ERROR] 재시도 실패: {retry_e}")
                     continue

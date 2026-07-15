@@ -533,38 +533,100 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         self.initialize_session()
         return True
 
+    @staticmethod
+    def _formatted_review_count(detailed_review_content):
+        if not detailed_review_content:
+            return 0
+        return detailed_review_content.count(' ||| ') + 1
+
+    @staticmethod
+    def _has_required_price(value):
+        if value is None:
+            return False
+        text = str(value).strip()
+        return bool(text and text not in ('-', 'None', 'null', 'NULL'))
+
+    @staticmethod
+    def _env_int(name, default, minimum=1):
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
+
+    def _log_next_data_attempts(self, label, item, page_number, result):
+        attempts = (result or {}).get('attempts') or []
+        if not attempts:
+            return
+        summary = ' -> '.join(
+            f"{attempt.get('source')}:{attempt.get('status')}/blocked={attempt.get('blocked')}"
+            for attempt in attempts
+        )
+        page_suffix = f" page{page_number}" if page_number else ''
+        print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
+
     def collect_reviews_next_data(self, item, count_of_reviews, inline_reviews, product):
         review_total = normalize_int(count_of_reviews) or 0
         if review_total <= 0:
-            return None, count_of_reviews
+            return None, count_of_reviews, True
 
         review_texts = []
-        page_limit = 2 if review_total >= 20 else 1
-        for page_number in range(1, page_limit + 1):
-            review_url = build_review_url(item, page_number)
-            result = self.next_data_client.fetch_next_data(
-                review_url,
-                direct_retries=1,
-                use_zenrows=True,
-                js_render_fallback=True,
-            )
-            next_data = result.get('next_data')
-            if not next_data:
-                if page_number == 1 and inline_reviews:
-                    review_texts.extend(inline_reviews)
-                else:
-                    self._record_run_error(f'review_page{page_number}_next_data', product, 'no __NEXT_DATA__')
-                continue
-
-            parsed = parse_review_page(next_data, limit=10)
-            page_reviews = parsed.get('reviews') or []
-            review_texts.extend(page_reviews)
-            if page_number == 1:
-                count_of_reviews = parsed.get('total_review_count') or count_of_reviews
-
-        if not review_texts and inline_reviews:
+        inline_reviews = inline_reviews or []
+        if inline_reviews:
             review_texts.extend(inline_reviews)
-        return format_reviews(review_texts, limit=20), count_of_reviews
+            print(f"  [NEXT_DATA review] page1: reused {len(inline_reviews)} inline reviews from detail payload")
+
+        page_limit = 2 if review_total >= 20 else 1
+        retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_RETRIES', 1)
+        start_page = 2 if len(inline_reviews) >= 10 else 1
+
+        for page_number in range(start_page, page_limit + 1):
+            page_added = False
+            last_reason = 'no __NEXT_DATA__'
+
+            for retry_index in range(1, retry_total + 1):
+                review_url = build_review_url(item, page_number)
+                result = self.next_data_client.fetch_next_data(
+                    review_url,
+                    direct_retries=1,
+                    use_zenrows=True,
+                    js_render_fallback=True,
+                )
+                self._log_next_data_attempts('review', item, page_number, result)
+
+                next_data = result.get('next_data')
+                if not next_data:
+                    if retry_index < retry_total:
+                        print(f"  [NEXT_DATA review] page{page_number}: empty result, retrying ({retry_index + 1}/{retry_total})")
+                    continue
+
+                parsed = parse_review_page(next_data, limit=10)
+                page_reviews = parsed.get('reviews') or []
+                if page_number == 1:
+                    count_of_reviews = parsed.get('total_review_count') or count_of_reviews
+
+                if page_reviews:
+                    review_texts.extend(page_reviews)
+                    page_added = True
+                    break
+
+                last_reason = 'no parsed reviews'
+                if retry_index < retry_total:
+                    print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{retry_total})")
+
+            if not page_added:
+                self._record_run_error(f'review_page{page_number}_next_data', product, last_reason)
+
+        detailed_review_content = format_reviews(review_texts, limit=20)
+        collected_reviews = self._formatted_review_count(detailed_review_content)
+        complete = review_total < 20 or collected_reviews >= 20
+
+        if not complete:
+            message = f'expected 20 reviews from {review_total}, collected {collected_reviews}'
+            print(f"  [NEXT_DATA review WARNING] {message}")
+            self._record_run_error('review_next_data_incomplete', product, message)
+
+        return detailed_review_content, count_of_reviews, complete
 
     def crawl_detail_next_data(self, product):
         product_url = product.get('product_url')
@@ -605,6 +667,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if not item:
                 continue
 
+            if not self._has_required_price(parsed.get('final_sku_price')):
+                print(f"  [NEXT_DATA detail] price missing for item={item}; trying next candidate/browser fallback")
+                continue
+
             spec_product = product.copy()
             if parsed.get('retailer_sku_name'):
                 spec_product['retailer_sku_name'] = parsed.get('retailer_sku_name')
@@ -612,12 +678,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             mst_screen_size, mst_sku = self.get_tv_specs_from_mst(item)
             sku, sku_source, brand_sku, page_sku, brand_name = self.extract_sku(spec_product, product_url, None, mst_sku)
             screen_size, spec_source, name_screen_size, page_screen_size = self.extract_screen_size(spec_product, None, mst_screen_size)
-            detailed_review_content, count_of_reviews = self.collect_reviews_next_data(
+            detailed_review_content, count_of_reviews, review_complete = self.collect_reviews_next_data(
                 item,
                 parsed.get('count_of_reviews'),
                 parsed.get('inline_reviews') or [],
                 product,
             )
+            if not review_complete:
+                print(
+                    f"  [NEXT_DATA detail] review incomplete for item={item}; "
+                    "browser fallback required"
+                )
+                return None
 
             source = result.get('source') or 'next_data'
             combined_data = product.copy()
@@ -659,7 +731,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     'page_screen_size': page_screen_size,
                 })
 
-            review_count = (detailed_review_content.count(' ||| ') + 1) if detailed_review_content else 0
+            review_count = self._formatted_review_count(detailed_review_content)
             print(f"  [NEXT_DATA detail OK] source={source}, item={item}, price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}")
             return combined_data
 
@@ -707,6 +779,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if final_sku_price and '$' in final_sku_price:
                 original_sku_price = self.safe_extract_chain(tree, 'original_sku_price')
                 savings = self.safe_extract_chain(tree, 'savings')
+
+            if not self._has_required_price(final_sku_price):
+                message = 'browser fallback final_sku_price missing'
+                print(f"  [price ERROR] {message}")
+                self._record_run_error('detail_price_missing_browser', product, message)
+                return product
 
             # ========== 1-3단계: 추가 필드 추출 ==========
             number_of_ppl_purchased_yesterday = self.convert_first_number(tree, 'number_of_ppl_purchased_yesterday')
@@ -807,6 +885,13 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 )
 
             # 결합된 데이터
+            if normalize_int(count_of_reviews) >= 20 and self._formatted_review_count(detailed_review_content) < 20:
+                collected_reviews = self._formatted_review_count(detailed_review_content)
+                message = f'browser fallback expected 20 reviews from {count_of_reviews}, collected {collected_reviews}'
+                print(f"  [review ERROR] {message}")
+                self._record_run_error('review_browser_incomplete', product, message)
+                return product
+
             combined_data = product.copy()
             combined_data.update({
                 'item': item,
