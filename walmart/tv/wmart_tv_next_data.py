@@ -461,7 +461,6 @@ def _review_texts_from_reviews_node(reviews_node, limit=10):
             break
     return rows
 
-
 def find_reviews_node(value):
     best = None
     for node in _walk(value):
@@ -485,15 +484,10 @@ def parse_review_page(next_data, limit=10):
 
 def format_reviews(review_texts, limit=20):
     rows = []
-    seen = set()
     for text in review_texts:
         cleaned = collapse_ws(text)
         if not cleaned:
             continue
-        key = cleaned.lower()
-        if key in seen:
-            continue
-        seen.add(key)
         rows.append(cleaned)
         if len(rows) >= limit:
             break

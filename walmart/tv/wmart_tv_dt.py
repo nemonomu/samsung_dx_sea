@@ -899,18 +899,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if review_total <= 0:
             return None, count_of_reviews, True
 
-        review_texts = []
         inline_reviews = inline_reviews or []
-        if inline_reviews:
-            review_texts.extend(inline_reviews)
-            if log:
-                print(f"  [NEXT_DATA review] page1: reused {len(inline_reviews)} inline reviews from detail payload")
+        review_texts = []
 
         page_limit = 2 if review_total >= 20 else 1
         retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_RETRIES', 1)
-        start_page = 2 if len(inline_reviews) >= 10 else 1
+        extra_page_limit = self._env_int('WALMART_TV_REVIEW_NEXTDATA_EXTRA_PAGES', 2, minimum=0)
+        max_page = page_limit + extra_page_limit if review_total >= 20 else page_limit
 
-        for page_number in range(start_page, page_limit + 1):
+        for page_number in range(1, max_page + 1):
             page_added = False
             last_reason = 'no __NEXT_DATA__'
 
@@ -945,8 +942,19 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 if log and retry_index < retry_total:
                     print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{retry_total})")
 
+            if not page_added and page_number == 1 and inline_reviews:
+                review_texts.extend(inline_reviews)
+                page_added = True
+                if log:
+                    print(f"  [NEXT_DATA review] page1: fallback reused {len(inline_reviews)} inline reviews from detail payload")
+
             if not page_added:
                 add_error(f'review_page{page_number}_next_data', last_reason)
+
+            detailed_review_content = format_reviews(review_texts, limit=20)
+            collected_reviews = self._formatted_review_count(detailed_review_content)
+            if page_number >= page_limit and (review_total < 20 or collected_reviews >= 20):
+                break
 
         detailed_review_content = format_reviews(review_texts, limit=20)
         collected_reviews = self._formatted_review_count(detailed_review_content)
