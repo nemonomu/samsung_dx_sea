@@ -1,7 +1,8 @@
-"""Compare logged-out and logged-in Amazon PDP extraction in one browser.
+"""Compare pre-login and post-login Amazon PDP extraction in one browser.
 
-The test reuses AmazonTVDetailCrawler.crawl_detail(), disables every DB write
-method, and never navigates to an Amazon review page.
+The pre-login pass skips detailed_review_content but extracts every other
+production field. The post-login pass extracts all fields, including detailed
+reviews. The test disables every DB write and never opens a review-page URL.
 """
 
 import argparse
@@ -36,23 +37,22 @@ from amazon.tv.amazon_tv_login_pdp_test_urls import DEFAULT_TEST_URLS
 
 
 DEFAULT_OUTPUT_DIR = os.path.join(_current_dir, "data", "login_pdp_test")
-REVIEW_FIELDS = {
-    "summarized_review_content",
-    "detailed_review_content",
-}
+REVIEW_FIELDS = {"detailed_review_content"}
 MONITORED_FIELDS = tuple(dict.fromkeys([
-    "item",
     "sku",
     *AmazonTVDetailCrawler.EXTRACTED_FIELDS,
-    "delivery_availability",
-    "fastest_delivery",
-    "available_quantity_for_purchase",
-    "redirect",
+    *AmazonTVDetailCrawler.PASSTHROUGH_FIELDS,
 ]))
+COMPARISON_FIELDS = tuple(
+    field for field in MONITORED_FIELDS
+    if field != "detailed_review_content"
+)
 
 
 class FieldComparisonCrawler(AmazonTVDetailCrawler):
     """Production extractor with all persistence and MST fallback disabled."""
+
+    skip_detailed_review = False
 
     def get_tv_specs_from_mst(self, item):
         return None, None, None
@@ -65,6 +65,19 @@ class FieldComparisonCrawler(AmazonTVDetailCrawler):
 
     def save_to_retail_com(self, product):
         raise AssertionError("DB write is forbidden in the login PDP test")
+
+    def extract_reviews_with_retry(self, tree, max_reviews=20, page_html=None):
+        if self.skip_detailed_review:
+            print(
+                "  [REVIEW] Pre-login field comparison skips "
+                "detailed_review_content"
+            )
+            return None, 0, False
+        return super().extract_reviews_with_retry(
+            tree,
+            max_reviews=max_reviews,
+            page_html=page_html,
+        )
 
 
 def load_test_urls(path=None, limit=0):
@@ -140,6 +153,11 @@ def observe_field(field, value):
             "length": len(text),
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         })
+        if field == "detailed_review_content":
+            observation["review_count"] = len(re.findall(
+                r"(?:^|\s*\|\|\|\s*)review\d+\s+-",
+                str(value),
+            ))
     else:
         observation["value"] = json_safe(value)
     return observation
@@ -284,26 +302,108 @@ def compare_modes(urls, logged_out_rows, logged_in_rows):
             "gained_after_login": [],
             "changed_after_login": [],
             "missing_in_both": [],
+            "fields": {},
+            "detailed_review_content": {
+                "compared": False,
+                "post_login_present": False,
+                "post_login_review_count": 0,
+                "post_login_length": 0,
+                "login_gate": bool(in_row and in_row.get("gated")),
+            },
         }
 
         if out_row and in_row:
             out_fields = out_row.get("fields", {})
             in_fields = in_row.get("fields", {})
-            for field in MONITORED_FIELDS:
+            for field in COMPARISON_FIELDS:
                 out_observation = out_fields.get(field, {"present": False})
                 in_observation = in_fields.get(field, {"present": False})
                 out_present = out_observation.get("present", False)
                 in_present = in_observation.get("present", False)
                 if out_present and not in_present:
+                    state = "LOST"
                     comparison["lost_after_login"].append(field)
                 elif not out_present and in_present:
+                    state = "GAINED"
                     comparison["gained_after_login"].append(field)
                 elif not out_present and not in_present:
+                    state = "MISSING_BOTH"
                     comparison["missing_in_both"].append(field)
                 elif observation_token(out_observation) != observation_token(in_observation):
+                    state = "CHANGED"
                     comparison["changed_after_login"].append(field)
+                else:
+                    state = "SAME"
+                comparison["fields"][field] = {
+                    "state": state,
+                    "before_login": out_observation.get("value"),
+                    "after_login": in_observation.get("value"),
+                }
+
+            review_observation = in_fields.get(
+                "detailed_review_content",
+                {"present": False},
+            )
+            comparison["detailed_review_content"].update({
+                "post_login_present": bool(review_observation.get("present")),
+                "post_login_review_count": review_observation.get(
+                    "review_count",
+                    0,
+                ),
+                "post_login_length": review_observation.get("length", 0),
+                "post_login_sha256": review_observation.get("sha256"),
+            })
         comparisons.append(comparison)
     return comparisons
+
+
+def _log_value(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def print_final_comparison_log(comparisons):
+    print("\n" + "=" * 96)
+    print("[FINAL FIELD COMPARISON] excludes detailed_review_content")
+    print("=" * 96)
+    for comparison in comparisons:
+        print(
+            f"\n[PRODUCT] asin={comparison['asin']} "
+            f"before_status={comparison['logged_out_status']} "
+            f"after_status={comparison['logged_in_status']}"
+        )
+        print(f"  URL: {comparison['requested_url']}")
+        for field in COMPARISON_FIELDS:
+            values = comparison["fields"].get(field, {
+                "state": "NOT_RUN",
+                "before_login": None,
+                "after_login": None,
+            })
+            print(f"  [FIELD] {field} | {values['state']}")
+            print(
+                "    BEFORE_LOGIN: "
+                f"{_log_value(values['before_login'])}"
+            )
+            print(
+                "    AFTER_LOGIN : "
+                f"{_log_value(values['after_login'])}"
+            )
+
+        review = comparison["detailed_review_content"]
+        print("  [FIELD] detailed_review_content | COMPARE_EXCLUDED")
+        print(
+            "    AFTER_LOGIN : "
+            f"present={review['post_login_present']} "
+            f"review_count={review['post_login_review_count']} "
+            f"length={review['post_login_length']} "
+            f"login_gate={review['login_gate']} "
+            f"sha256={review.get('post_login_sha256')}"
+        )
+    print("\n" + "=" * 96)
 
 
 def enforce_read_only_db(crawler):
@@ -322,8 +422,9 @@ def enforce_read_only_db(crawler):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Compare all Amazon TV detail fields before and after one LOGIN_2 "
-            "login in the same browser session"
+            "Compare Amazon TV detail fields except detailed_review_content "
+            "before and after one LOGIN_2 login; collect detailed reviews "
+            "after login in the same browser session"
         ),
     )
     parser.add_argument(
@@ -366,6 +467,9 @@ def main():
         "started_at": started_at.isoformat(timespec="seconds"),
         "credentials_source": "AMAZON_LOGIN_2",
         "same_browser_session": True,
+        "comparison_fields": list(COMPARISON_FIELDS),
+        "comparison_excluded_fields": ["detailed_review_content"],
+        "pre_login_detailed_review_skipped": True,
         "login_attempts": 0,
         "login_ok": False,
         "logged_out_baseline_ok": False,
@@ -404,11 +508,18 @@ def main():
         else:
             result["db_session_read_only"] = True
             result["logged_out_baseline_ok"] = True
-            print(f"[TEST] Logged-out baseline: {len(urls)} PDP URLs")
+            crawler.skip_detailed_review = True
+            print(
+                f"[TEST PHASE 1/2] Pre-login field extraction: "
+                f"{len(urls)} PDP URLs "
+                "(detailed_review_content skipped)"
+            )
             logged_out_rows = run_mode(crawler, urls, "logged_out", args.sleep)
             result["modes"]["logged_out"]["products"] = logged_out_rows
 
+            crawler.skip_detailed_review = False
             result["login_attempts"] = 1
+            print("[TEST PHASE 2/2] Starting AMAZON_LOGIN_2 login")
             result["login_ok"] = ensure_amazon_login_dp(
                 crawler.page,
                 timeout_seconds=args.login_timeout,
@@ -420,7 +531,10 @@ def main():
                 result["fatal_error"] = "ZIP reset failed after login"
                 exit_code = 3
             else:
-                print(f"[TEST] Logged-in pass: {len(urls)} PDP URLs")
+                print(
+                    f"[TEST PHASE 2/2] Post-login full-field extraction: "
+                    f"{len(urls)} PDP URLs"
+                )
                 logged_in_rows = run_mode(crawler, urls, "logged_in", args.sleep)
                 result["modes"]["logged_in"]["products"] = logged_in_rows
                 result["comparisons"] = compare_modes(
@@ -453,11 +567,21 @@ def main():
     changed_field_count = sum(
         len(row["changed_after_login"]) for row in result["comparisons"]
     )
+    detailed_review_collected = sum(
+        bool(row["detailed_review_content"]["post_login_present"])
+        for row in result["comparisons"]
+    )
+    review_login_gate_count = sum(
+        bool(row["detailed_review_content"]["login_gate"])
+        for row in result["comparisons"]
+    )
     result["summary"] = {
         "logged_out_statuses": dict(out_statuses),
         "logged_in_statuses": dict(in_statuses),
         "lost_after_login_field_count": lost_field_count,
         "changed_after_login_field_count": changed_field_count,
+        "detailed_review_content_collected": detailed_review_collected,
+        "review_login_gate_count": review_login_gate_count,
     }
     result["finished_at"] = datetime.now().isoformat(timespec="seconds")
     result["elapsed_seconds"] = round(
@@ -490,6 +614,9 @@ def main():
         elif lost_field_count:
             exit_code = 2
 
+    if result["comparisons"]:
+        print_final_comparison_log(result["comparisons"])
+
     stamp = started_at.strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(args.output_dir, f"login_pdp_test_{stamp}.json")
     with open(output_path, "w", encoding="utf-8") as handle:
@@ -502,7 +629,10 @@ def main():
         f"logged_out={dict(out_statuses)} "
         f"logged_in={dict(in_statuses)} "
         f"lost_fields={lost_field_count} "
-        f"changed_fields={changed_field_count}"
+        f"changed_fields={changed_field_count} "
+        f"detailed_review_content="
+        f"{detailed_review_collected}/{len(in_rows)} "
+        f"review_login_gate={review_login_gate_count}"
     )
     print(f"[RESULT] {output_path}")
     return exit_code
