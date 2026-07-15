@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
+from lxml import html as lxml_html
 
 WALMART_BASE_URL = "https://www.walmart.com"
 ZENROWS_API_URL = "https://api.zenrows.com/v1/"
@@ -75,11 +76,11 @@ def format_money(value):
         try:
             value = float(text.replace(",", ""))
         except ValueError:
-            return text
+            return None
     try:
         return f"${float(value):,.2f}"
     except (TypeError, ValueError):
-        return collapse_ws(value)
+        return None
 
 
 def item_id_from_url(url):
@@ -390,6 +391,12 @@ def _price_string(price_info):
         formatted = format_money(price_info.get(key))
         if formatted:
             return formatted
+    estimated_total = ((price_info.get("additionalFees") or {}).get("estimatedTotalPrice") or {})
+    if isinstance(estimated_total, dict):
+        for nested_key in ("priceString", "price"):
+            formatted = format_money(estimated_total.get(nested_key))
+            if formatted:
+                return formatted
     return None
 
 
@@ -590,18 +597,84 @@ def parse_discount_type_from_html(html_text):
     return "Price when purchased online" if "Price when purchased online" in text else None
 
 
-def parse_similar_product_names(next_data, current_item=None, limit=30):
+SIMILAR_HTML_XPATHS = (
+    "//section[@data-dca-name='itemTile']//div[@role='group' and starts-with(@data-testid, 'product-tile-') and not(@data-testid='product-tile-1')]//span[@data-automation-id='product-title']/text()",
+)
+SIMILAR_MODULE_TITLES = {
+    "see similar items",
+    "compare with similar items",
+}
+SIMILAR_IMAGE_NAME_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:$|\?)", re.I)
+SIMILAR_UUID_IMAGE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"(?:\.[0-9a-f]+)?\.(?:jpe?g|png|webp|gif|avif)$",
+    re.I,
+)
+
+
+def _similar_product_item_id(node):
+    url = node.get("canonicalUrl") or node.get("productPageUrl") or node.get("productUrl") or ""
+    item = node.get("usItemId") or node.get("itemId") or item_id_from_url(url)
+    node_id = node.get("id")
+    if not item and str(node_id or "").isdigit():
+        item = node_id
+    item = str(item).strip() if item is not None else None
+    return item if item and item.isdigit() else None
+
+
+def _similar_product_name(node):
+    name = collapse_ws(node.get("name") or node.get("title") or node.get("productName"))
+    if not name:
+        return None
+    lower = name.lower()
+    if len(name) < 8:
+        return None
+    if SIMILAR_IMAGE_NAME_RE.search(lower) or SIMILAR_UUID_IMAGE_RE.match(lower):
+        return None
+    return name
+
+
+def _iter_similar_module_products(module):
+    configs = module.get("configs") if isinstance(module, dict) else None
+    if not isinstance(configs, dict):
+        return
+    for key in ("products", "items"):
+        value = configs.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                if isinstance(item.get("product"), dict):
+                    yield item["product"]
+                else:
+                    yield item
+
+
+def _iter_similar_next_data_modules(next_data):
+    data = get_initial_data(next_data)
+    modules = ((data.get("contentLayout") or {}).get("modules") or [])
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        if module.get("type") != "ItemCarousel":
+            continue
+        configs = module.get("configs") if isinstance(module.get("configs"), dict) else {}
+        title = collapse_ws(configs.get("title") or module.get("name")) or ""
+        title_key = title.lower()
+        if title_key in SIMILAR_MODULE_TITLES:
+            yield module
+
+
+def _join_unique_similar_names(pairs, current_item=None, limit=30):
     names = []
     seen = set()
-    for node in _walk(next_data):
-        if not isinstance(node, dict):
+    current_item = str(current_item) if current_item else None
+    for item, name in pairs:
+        item = str(item).strip() if item is not None else None
+        name = collapse_ws(name)
+        if not name or not item or (current_item and item == current_item):
             continue
-        name = collapse_ws(node.get("name"))
-        url = node.get("canonicalUrl") or node.get("productPageUrl")
-        item = node.get("usItemId") or node.get("id") or item_id_from_url(url or "")
-        if not name or not item or (current_item and str(item) == str(current_item)):
-            continue
-        key = (str(item), name.lower())
+        key = (item, name.lower())
         if key in seen:
             continue
         seen.add(key)
@@ -611,13 +684,47 @@ def parse_similar_product_names(next_data, current_item=None, limit=30):
     return " ||| ".join(names) if names else None
 
 
-def parse_detail_product(next_data):
+def parse_similar_product_names_from_html(html_text, limit=30):
+    if not html_text:
+        return None
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return None
+    for xpath in SIMILAR_HTML_XPATHS:
+        pairs = []
+        for index, value in enumerate(tree.xpath(xpath), 1):
+            name = collapse_ws(value)
+            if name:
+                pairs.append((str(index), name))
+        result = _join_unique_similar_names(pairs, limit=limit)
+        if result:
+            return result
+    return None
+
+
+def parse_similar_product_names(next_data, current_item=None, limit=30):
+    pairs = []
+    for module in _iter_similar_next_data_modules(next_data):
+        for node in _iter_similar_module_products(module) or []:
+            item = _similar_product_item_id(node)
+            name = _similar_product_name(node)
+            if item and name:
+                pairs.append((item, name))
+    return _join_unique_similar_names(pairs, current_item=current_item, limit=limit)
+
+
+def parse_detail_product(next_data, html_text=None):
     initial_data = get_initial_data(next_data)
     product = initial_data.get("product") or {}
     reviews_node = initial_data.get("reviews") or find_reviews_node(initial_data) or {}
     price_info = product.get("priceInfo") or {}
     social = parse_social_counts(product)
     item = product.get("usItemId") or product.get("id") or item_id_from_url(product.get("canonicalUrl") or "")
+    retailer_sku_name_similar = (
+        parse_similar_product_names_from_html(html_text)
+        or parse_similar_product_names(next_data, current_item=item)
+    )
     count_of_reviews = parse_text_review_count(reviews_node, product)
     count_of_star_ratings = parse_star_rating_count(product, reviews_node) or count_of_reviews
     star_rating = collapse_ws(product.get("averageRating") or reviews_node.get("averageOverallRating")) or "No ratings yet"
@@ -638,5 +745,5 @@ def parse_detail_product(next_data):
         "number_of_ppl_purchased_yesterday": social["number_of_ppl_purchased_yesterday"],
         "number_of_ppl_added_to_carts": social["number_of_ppl_added_to_carts"],
         "inline_reviews": _review_texts_from_reviews_node(reviews_node, limit=10),
-        "retailer_sku_name_similar": parse_similar_product_names(next_data, current_item=item),
+        "retailer_sku_name_similar": retailer_sku_name_similar,
     }

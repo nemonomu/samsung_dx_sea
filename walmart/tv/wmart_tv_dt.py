@@ -26,6 +26,7 @@ import time
 import random
 import traceback
 import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from lxml import html
@@ -262,6 +263,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         self.skip_walmart_search = True
         self.detail_next_data_workers = self._env_int('WALMART_TV_DETAIL_WORKERS', 4)
         self.detail_next_data_chunk_size = self._env_int('WALMART_TV_DETAIL_CHUNK_SIZE', 40)
+        self.parallel_miss_reasons = {}
 
 
         # SPEC DIFF 누적 (run() 끝에 일괄 출력용)
@@ -350,6 +352,9 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                                 f"price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}"
                             )
                         else:
+                            miss_reason = self.parallel_miss_reasons.get(i)
+                            if miss_reason:
+                                print(f"  [NEXT_DATA parallel MISS] reason={miss_reason}; browser fallback")
                             combined_data = self.crawl_detail(product, skip_fast=True)
 
                         if combined_data:
@@ -559,12 +564,107 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return 0
         return detailed_review_content.count(' ||| ') + 1
 
+    SKU_POPULARITY_ALLOWED_VALUES = {
+        'overall pick',
+        'best seller',
+        'rollback',
+        'clearance',
+        'reduced price',
+        'flash deal',
+        'sale',
+        'popular pick',
+    }
+
     @staticmethod
-    def _has_required_price(value):
-        if value is None:
-            return False
+    def _money_value(value):
+        if value in (None, ''):
+            return None
         text = str(value).strip()
-        return bool(text and text not in ('-', 'None', 'null', 'NULL'))
+        match = re.search(r'\$\s*\d[\d,]*(?:\.\d{1,2})?', text)
+        if not match:
+            return None
+        return match.group(0).replace('$ ', '$')
+
+    @classmethod
+    def _has_required_price(cls, value):
+        return cls._money_value(value) is not None
+
+    @staticmethod
+    def _format_count_value(value):
+        count = normalize_int(value)
+        return f'{count:,}' if count is not None else None
+
+    @classmethod
+    def _normalize_sku_popularity(cls, value):
+        if not value:
+            return None
+        values = []
+        seen = set()
+        for part in re.split(r',|\|\|\|', str(value)):
+            text = ' '.join(part.split())
+            if not text:
+                continue
+            key = text.lower()
+            if key not in cls.SKU_POPULARITY_ALLOWED_VALUES:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(text)
+        return ', '.join(values) if values else None
+
+    @staticmethod
+    def _normalize_discount_type(value):
+        text = ' '.join(str(value or '').split())
+        return 'Price when purchased online' if text == 'Price when purchased online' else None
+
+    @staticmethod
+    def _normalize_similar_value(value):
+        text = str(value or '').strip()
+        if not text:
+            return None
+        polluted_patterns = (
+            r'\.(?:jpe?g|png|webp|gif|avif)(?:\?|$)',
+            r'\b(?:\d-Year Plan|Pro TV Mounting|Protection Plan)\b',
+            r'\b(?:Picture Quality|Ease Of Setup|Value For Money|Sound Quality|Ease Of Use|Controls|Apps)\b',
+            r'\b(?:Refurbished TVs|Certified Refurbished|Walmart Restored|Small Vizio|\d+ Inch TVs)\b',
+        )
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in polluted_patterns):
+            return None
+        return text
+
+    def _normalize_detail_fields(self, product):
+        if not product:
+            return product
+
+        for field in ('count_of_reviews', 'count_of_star_ratings'):
+            formatted = self._format_count_value(product.get(field))
+            if formatted is not None:
+                product[field] = formatted
+
+        if not product.get('star_rating') and normalize_int(product.get('count_of_reviews')) == 0:
+            product['star_rating'] = 'No ratings yet'
+        if not product.get('count_of_star_ratings') and product.get('count_of_reviews') is not None:
+            product['count_of_star_ratings'] = product.get('count_of_reviews')
+
+        if product.get('final_sku_price'):
+            product['final_sku_price'] = self._money_value(product.get('final_sku_price'))
+        if product.get('original_sku_price'):
+            product['original_sku_price'] = self._money_value(product.get('original_sku_price'))
+        if product.get('savings'):
+            product['savings'] = self._money_value(product.get('savings'))
+
+        product['discount_type'] = self._normalize_discount_type(product.get('discount_type'))
+        product['sku_popularity'] = self._normalize_sku_popularity(product.get('sku_popularity'))
+
+        for field in ('number_of_ppl_purchased_yesterday', 'number_of_ppl_added_to_carts'):
+            value = normalize_int(product.get(field))
+            product[field] = str(value) if value is not None else None
+
+        product['retailer_sku_name_similar'] = self._normalize_similar_value(
+            product.get('retailer_sku_name_similar')
+        )
+        return product
 
     @staticmethod
     def _env_int(name, default, minimum=1):
@@ -630,6 +730,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return {}
 
     def _crawl_detail_next_data_worker(self, index, product, mst_specs):
+        diagnostics = []
         try:
             client = WalmartNextDataClient()
             combined_data = self.crawl_detail_next_data(
@@ -639,19 +740,60 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 record_errors=False,
                 collect_spec_diff=False,
                 log=False,
+                diagnostics=diagnostics,
             )
-            return index, combined_data, None
+            reason = None if combined_data else self._parallel_miss_reason(diagnostics)
+            return index, combined_data, None, reason, diagnostics
         except Exception as e:
-            return index, None, e
+            diagnostics.append({
+                'stage': 'worker_exception',
+                'product': product,
+                'message': str(e),
+            })
+            return index, None, e, 'worker_exception', diagnostics
+
+    def _parallel_miss_reason(self, diagnostics):
+        stages = [
+            str(item.get('stage') or '')
+            for item in (diagnostics or [])
+        ]
+        if any(stage in ('detail_next_data_review_incomplete', 'review_next_data_incomplete') for stage in stages):
+            return 'review_incomplete'
+        if any(stage.startswith('review_page') for stage in stages):
+            return 'review_page_missing'
+        if 'detail_next_data_price_missing' in stages:
+            return 'price_missing'
+        if 'detail_next_data_redirect_mismatch' in stages:
+            return 'redirect_mismatch'
+        if 'detail_next_data_item_missing' in stages:
+            return 'item_missing'
+        if 'detail_next_data_no_candidate_url' in stages:
+            return 'no_candidate_url'
+        if 'detail_next_data_no_next_data' in stages:
+            return 'no_next_data'
+        if 'worker_exception' in stages:
+            return 'worker_exception'
+        return 'unknown'
+
+    def _parallel_miss_message(self, diagnostics):
+        for item in reversed(diagnostics or []):
+            message = str(item.get('message') or '').strip()
+            if message:
+                return message
+        return ''
 
     def collect_detail_next_data_parallel(self, indexed_products):
         if not indexed_products:
+            self.parallel_miss_reasons = {}
             return {}
 
         workers = min(self.detail_next_data_workers, len(indexed_products))
         products = [product for _, product in indexed_products]
         mst_specs = self.load_mst_specs_cache(products)
         results = {}
+        miss_counts = Counter()
+        miss_examples = {}
+        self.parallel_miss_reasons = {}
 
         print(
             f"[INFO] NextData detail parallel fetch: "
@@ -665,18 +807,44 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             for future in as_completed(future_map):
                 index, product = future_map[future]
                 try:
-                    result_index, combined_data, error = future.result()
+                    result_index, combined_data, error, reason, diagnostics = future.result()
                 except Exception as e:
-                    result_index, combined_data, error = index, None, e
+                    result_index, combined_data, error, reason, diagnostics = index, None, e, 'worker_exception', [
+                        {'stage': 'worker_exception', 'product': product, 'message': str(e)}
+                    ]
 
                 if error:
                     self._record_run_error('detail_next_data_parallel', product, error)
-                    continue
 
                 if combined_data:
                     results[result_index] = combined_data
+                    continue
+
+                reason = reason or self._parallel_miss_reason(diagnostics)
+                self.parallel_miss_reasons[result_index] = reason
+                miss_counts[reason] += 1
+                if reason not in miss_examples:
+                    item = self.extract_item(product.get('product_url'))
+                    name = product.get('retailer_sku_name') or ''
+                    message = self._parallel_miss_message(diagnostics)
+                    miss_examples[reason] = (
+                        f"#{result_index} item={item or '-'} "
+                        f"name={name[:60]} "
+                        f"message={message[:120]}"
+                    )
 
         print(f"[INFO] NextData detail parallel result: {len(results)}/{len(indexed_products)} loaded")
+        if miss_counts:
+            summary = ', '.join(
+                f"{reason}={count}"
+                for reason, count in miss_counts.most_common()
+            )
+            print(f"[INFO] NextData parallel miss reason summary: {summary}")
+            examples = ' | '.join(
+                f"{reason}: {example}"
+                for reason, example in miss_examples.items()
+            )
+            print(f"[INFO] NextData parallel miss examples: {examples}")
         return results
 
     def _apply_fast_artifacts(self, combined_data):
@@ -700,6 +868,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return False
 
         self._apply_fast_artifacts(combined_data)
+        self._normalize_detail_fields(combined_data)
         self.upsert_item_mst(combined_data)
         return self.save_to_retail_com(combined_data)
 
@@ -799,11 +968,21 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         record_errors=True,
         collect_spec_diff=True,
         log=True,
+        diagnostics=None,
     ):
         client = next_data_client or self.next_data_client
         fast_errors = []
+        diagnostics_list = diagnostics if diagnostics is not None else []
+
+        def add_diagnostic(stage, message):
+            diagnostics_list.append({
+                'stage': stage,
+                'product': product,
+                'message': str(message),
+            })
 
         def add_error(stage, message):
+            add_diagnostic(stage, message)
             if record_errors:
                 self._record_run_error(stage, product, message)
             else:
@@ -820,6 +999,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if url and url not in candidate_urls:
                 candidate_urls.append(url)
 
+        if not candidate_urls:
+            add_diagnostic('detail_next_data_no_candidate_url', 'no candidate URL')
+            return None
+
         for url in candidate_urls:
             result = client.fetch_next_data(
                 url,
@@ -832,9 +1015,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             next_data = result.get('next_data')
             if not next_data:
+                attempts = result.get('attempts') or []
+                attempt_summary = ' -> '.join(
+                    f"{attempt.get('source')}:{attempt.get('status')}/blocked={attempt.get('blocked')}"
+                    for attempt in attempts
+                )
+                add_diagnostic('detail_next_data_no_next_data', attempt_summary or 'no __NEXT_DATA__')
                 continue
 
-            parsed = parse_detail_product(next_data)
+            parsed = parse_detail_product(next_data, html_text=result.get('html'))
             if not parsed.get('discount_type'):
                 parsed['discount_type'] = parse_discount_type_from_html(result.get('html'))
 
@@ -843,14 +1032,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 listing_name = product.get('retailer_sku_name')
                 detail_name = parsed.get('retailer_sku_name')
                 if not self.redirect_product_names_match(listing_name, detail_name):
+                    message = f"{requested_item} -> {item}"
+                    add_diagnostic('detail_next_data_redirect_mismatch', message)
                     if log:
                         print(f"  [NEXT_DATA detail] redirect mismatch rejected: {requested_item} -> {item}")
                     continue
 
             if not item:
+                add_diagnostic('detail_next_data_item_missing', 'item missing in parsed detail')
                 continue
 
             if not self._has_required_price(parsed.get('final_sku_price')):
+                add_diagnostic('detail_next_data_price_missing', f'item={item}')
                 if log:
                     print(f"  [NEXT_DATA detail] price missing for item={item}; trying next candidate/browser fallback")
                 continue
@@ -888,6 +1081,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 log=log,
             )
             if not review_complete:
+                add_diagnostic(
+                    'detail_next_data_review_incomplete',
+                    f"item={item}, expected={parsed.get('count_of_reviews')}, collected={self._formatted_review_count(detailed_review_content)}",
+                )
                 if log:
                     print(
                         f"  [NEXT_DATA detail] review incomplete for item={item}; "
