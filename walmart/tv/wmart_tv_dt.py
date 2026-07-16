@@ -1,4 +1,4 @@
-"""
+﻿"""
 Walmart TV Detail 페이지 크롤러
 
 ================================================================================
@@ -206,6 +206,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         'count_of_reviews',
         'star_rating',
         'count_of_star_ratings',
+        'offer',
         'final_sku_price',
         'original_sku_price',
         'savings',
@@ -224,7 +225,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         'page_type',
         'retailer_sku_name',
         'product_url',
-        'offer',
         'pick_up_availability',
         'fastest_delivery',
         'delivery_availability',
@@ -596,6 +596,32 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         count = normalize_int(value)
         return f'{count:,}' if count is not None else None
 
+    @staticmethod
+    def _offer_count_from_text(value):
+        text = ' '.join(str(value or '').split())
+        if not text:
+            return None
+        match = re.search(r'(\d+)\s+free\s+offers?', text, re.IGNORECASE)
+        if not match:
+            return None
+        count = normalize_int(match.group(1))
+        return str(count) if count is not None else None
+
+    @staticmethod
+    def _format_star_rating_value(value):
+        text = ' '.join(str(value or '').split())
+        if not text:
+            return None
+        if text.lower() == 'no ratings yet':
+            return 'No ratings yet'
+        match = re.search(r'\d+(?:\.\d+)?', text)
+        if not match:
+            return text
+        try:
+            return f'{float(match.group(0)):.1f}'
+        except (TypeError, ValueError):
+            return text
+
     @classmethod
     def _normalize_sku_popularity(cls, value):
         if not value:
@@ -621,6 +647,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         return 'Price when purchased online' if text == 'Price when purchased online' else None
 
     @staticmethod
+    def _normalize_social_count(value, marker=None):
+        count = normalize_int(value)
+        return str(count) if count is not None else None
+
+    @staticmethod
     def _normalize_similar_value(value):
         text = str(value or '').strip()
         if not text:
@@ -629,11 +660,38 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             r'\.(?:jpe?g|png|webp|gif|avif)(?:\?|$)',
             r'\b(?:\d-Year Plan|Pro TV Mounting|Protection Plan)\b',
             r'\b(?:Picture Quality|Ease Of Setup|Value For Money|Sound Quality|Ease Of Use|Controls|Apps)\b',
-            r'\b(?:Refurbished TVs|Certified Refurbished|Walmart Restored|Small Vizio|\d+ Inch TVs)\b',
         )
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in polluted_patterns):
-            return None
-        return text
+        polluted_exact = {
+            'refurbished tvs',
+            'tvs - certified refurbished',
+            'walmart restored vizio tvs',
+            'vizio tvs',
+            'vizio',
+            'small vizio tv',
+            'small vizio tvs',
+            'vizio small tv',
+            'vizio small tvs',
+            'vizio 37',
+            'vizio 39 led',
+            'vizio tv 37',
+            '43 inch tvs',
+        }
+        names = []
+        seen = set()
+        for part in str(value).split(' ||| '):
+            name = ' '.join(part.split())
+            if not name:
+                continue
+            if name.lower() in polluted_exact:
+                continue
+            if any(re.search(pattern, name, re.IGNORECASE) for pattern in polluted_patterns):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return ' ||| '.join(names) if names else None
 
     def _normalize_detail_fields(self, product):
         if not product:
@@ -644,10 +702,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if formatted is not None:
                 product[field] = formatted
 
-        if not product.get('star_rating') and normalize_int(product.get('count_of_reviews')) == 0:
+        formatted_star_rating = self._format_star_rating_value(product.get('star_rating'))
+        if formatted_star_rating:
+            product['star_rating'] = formatted_star_rating
+        elif normalize_int(product.get('count_of_reviews')) == 0:
             product['star_rating'] = 'No ratings yet'
-        if not product.get('count_of_star_ratings') and product.get('count_of_reviews') is not None:
-            product['count_of_star_ratings'] = product.get('count_of_reviews')
+
+        if not product.get('count_of_star_ratings') and normalize_int(product.get('count_of_reviews')) == 0:
+            product['count_of_star_ratings'] = '0'
 
         if product.get('final_sku_price'):
             product['final_sku_price'] = self._money_value(product.get('final_sku_price'))
@@ -655,14 +717,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             product['original_sku_price'] = self._money_value(product.get('original_sku_price'))
         if product.get('savings'):
             product['savings'] = self._money_value(product.get('savings'))
-
         product['discount_type'] = self._normalize_discount_type(product.get('discount_type'))
         product['sku_popularity'] = self._normalize_sku_popularity(product.get('sku_popularity'))
-
-        for field in ('number_of_ppl_purchased_yesterday', 'number_of_ppl_added_to_carts'):
-            value = normalize_int(product.get(field))
-            product[field] = str(value) if value is not None else None
-
+        product['number_of_ppl_purchased_yesterday'] = self._normalize_social_count(
+            product.get('number_of_ppl_purchased_yesterday'), 'bought'
+        )
+        product['number_of_ppl_added_to_carts'] = self._normalize_social_count(
+            product.get('number_of_ppl_added_to_carts'), 'cart'
+        )
         product['retailer_sku_name_similar'] = self._normalize_similar_value(
             product.get('retailer_sku_name_similar')
         )
@@ -695,7 +757,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
 
     def _fill_similar_from_json_response(self, parsed, product_url, item, client, log=True):
-        if parsed.get('retailer_sku_name_similar') or not self.similar_json_fallback_enabled:
+        existing_similar = self._normalize_similar_value(parsed.get('retailer_sku_name_similar'))
+        if existing_similar:
+            parsed['retailer_sku_name_similar'] = existing_similar
+            return
+        if not self.similar_json_fallback_enabled:
+            parsed['retailer_sku_name_similar'] = None
             return
 
         result = client.fetch_similar_product_names(
@@ -704,22 +771,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             wait_ms=self.similar_json_wait_ms,
         )
         meta = result.get('meta') or {}
-        similar = result.get('names')
+        similar = self._normalize_similar_value(result.get('names'))
         if similar:
             parsed['retailer_sku_name_similar'] = similar
-            if log:
-                print(
-                    f"  [NEXT_DATA similar HIT] source={meta.get('source')}, "
-                    f"products={meta.get('similar_count')}, "
-                    f"xhr={meta.get('xhr_count')}, elapsed={meta.get('elapsed_sec')}s"
-                )
-            return
-
         if log:
             print(
-                f"  [NEXT_DATA similar MISS] source={meta.get('source')}, "
-                f"status={meta.get('status')}, xhr={meta.get('xhr_count')}, "
-                f"error={meta.get('error') or '-'}"
+                f"  [NEXT_DATA similar] source={result.get('source') or '-'}, "
+                f"status={meta.get('status') or '-'}, xhr={meta.get('xhr_count') or 0}, "
+                f"count={(similar.count(' ||| ') + 1) if similar else 0}"
             )
 
     def load_mst_specs_cache(self, products):
@@ -939,16 +998,19 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         inline_reviews = inline_reviews or []
         review_texts = []
 
-        page_limit = 2 if review_total >= 20 else 1
+        expected_review_count = min(review_total, 20)
+        page_limit = max(1, (expected_review_count + 9) // 10)
         retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_RETRIES', 1)
+        page2_retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_PAGE2_RETRIES', 2)
         extra_page_limit = self._env_int('WALMART_TV_REVIEW_NEXTDATA_EXTRA_PAGES', 2, minimum=0)
         max_page = page_limit + extra_page_limit if review_total >= 20 else page_limit
 
         for page_number in range(1, max_page + 1):
             page_added = False
             last_reason = 'no __NEXT_DATA__'
+            page_retry_total = page2_retry_total if page_number >= 2 else retry_total
 
-            for retry_index in range(1, retry_total + 1):
+            for retry_index in range(1, page_retry_total + 1):
                 review_url = build_review_url(item, page_number)
                 result = client.fetch_next_data(
                     review_url,
@@ -961,8 +1023,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
                 next_data = result.get('next_data')
                 if not next_data:
-                    if log and retry_index < retry_total:
-                        print(f"  [NEXT_DATA review] page{page_number}: empty result, retrying ({retry_index + 1}/{retry_total})")
+                    if log and retry_index < page_retry_total:
+                        print(f"  [NEXT_DATA review] page{page_number}: empty result, retrying ({retry_index + 1}/{page_retry_total})")
                     continue
 
                 parsed = parse_review_page(next_data, limit=10)
@@ -976,8 +1038,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     break
 
                 last_reason = 'no parsed reviews'
-                if log and retry_index < retry_total:
-                    print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{retry_total})")
+                if log and retry_index < page_retry_total:
+                    print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{page_retry_total})")
 
             if not page_added and page_number == 1 and inline_reviews:
                 review_texts.extend(inline_reviews)
@@ -990,15 +1052,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             detailed_review_content = format_reviews(review_texts, limit=20)
             collected_reviews = self._formatted_review_count(detailed_review_content)
-            if page_number >= page_limit and (review_total < 20 or collected_reviews >= 20):
+            if page_number >= page_limit and collected_reviews >= expected_review_count:
                 break
 
         detailed_review_content = format_reviews(review_texts, limit=20)
         collected_reviews = self._formatted_review_count(detailed_review_content)
-        complete = review_total < 20 or collected_reviews >= 20
+        complete = collected_reviews >= expected_review_count
 
         if not complete:
-            message = f'expected 20 reviews from {review_total}, collected {collected_reviews}'
+            message = f'expected {expected_review_count} reviews from {review_total}, collected {collected_reviews}'
             if log:
                 print(f"  [NEXT_DATA review WARNING] {message}")
             add_error('review_next_data_incomplete', message)
@@ -1146,7 +1208,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'sku': sku,
                 'count_of_reviews': count_of_reviews or parsed.get('count_of_reviews') or '0',
                 'star_rating': parsed.get('star_rating'),
-                'count_of_star_ratings': parsed.get('count_of_star_ratings') or count_of_reviews,
+                'count_of_star_ratings': parsed.get('count_of_star_ratings'),
+                'offer': parsed.get('offer') or product.get('offer'),
                 'final_sku_price': parsed.get('final_sku_price'),
                 'original_sku_price': parsed.get('original_sku_price'),
                 'savings': parsed.get('savings'),
@@ -1248,6 +1311,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             number_of_ppl_added_to_carts = self.convert_first_number(tree, 'number_of_ppl_added_to_carts')
             sku_popularity = self.safe_extract_chain_join(tree, 'sku_popularity', separator=", ")
             discount_type = self.safe_extract_chain(tree, 'discount_type')
+            offer = self._offer_count_from_text(tree.text_content()) or product.get('offer')
             model_year = self.extract_model_year(product.get('retailer_sku_name'))  # 모델 연도 추출 (제품명 정규식)
 
             # ========== 2단계: TV 스펙 (모달) ==========
@@ -1342,9 +1406,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 )
 
             # 결합된 데이터
-            if normalize_int(count_of_reviews) >= 20 and self._formatted_review_count(detailed_review_content) < 20:
+            expected_review_count = min(normalize_int(count_of_reviews) or 0, 20)
+            if expected_review_count > 0 and self._formatted_review_count(detailed_review_content) < expected_review_count:
                 collected_reviews = self._formatted_review_count(detailed_review_content)
-                message = f'browser fallback expected 20 reviews from {count_of_reviews}, collected {collected_reviews}'
+                message = f'browser fallback expected {expected_review_count} reviews from {count_of_reviews}, collected {collected_reviews}'
                 print(f"  [review ERROR] {message}")
                 self._record_run_error('review_browser_incomplete', product, message)
                 return product
@@ -1356,6 +1421,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'count_of_reviews': count_of_reviews,
                 'star_rating': star_rating,
                 'count_of_star_ratings': count_of_star_ratings,
+                'offer': offer,
                 'final_sku_price': final_sku_price,
                 'original_sku_price': original_sku_price,
                 'savings': savings,

@@ -83,6 +83,39 @@ def format_money(value):
         return None
 
 
+def format_star_rating(value):
+    text = collapse_ws(value)
+    if not text:
+        return None
+    if text.lower() == "no ratings yet":
+        return "No ratings yet"
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return text
+    try:
+        return f"{float(match.group(0)):.1f}"
+    except (TypeError, ValueError):
+        return text
+
+
+def parse_visible_rating_summary_from_html(html_text):
+    text = html_unescape(html_text or "")
+    match = re.search(
+        r'aria-label=["\']\s*(\d+(?:\.\d+)?)\s+out\s+of\s+5\s+stars?\s+rating,\s*([\d,]+)\s+ratings?',
+        text,
+        re.I,
+    )
+    if not match:
+        match = re.search(
+            r'(\d+(?:\.\d+)?)\s+out\s+of\s+5\s+stars?\s+rating,\s*([\d,]+)\s+ratings?',
+            text,
+            re.I,
+        )
+    if not match:
+        return None, None
+    return format_star_rating(match.group(1)), format_count_text(match.group(2))
+
+
 def item_id_from_url(url):
     if not url:
         return None
@@ -342,6 +375,31 @@ def _find_text_containing(texts, *needles):
     return None
 
 
+def _delivery_value_from_text(value, phrase):
+    text = collapse_ws(value)
+    if not text or phrase.lower() not in text.lower():
+        return None
+    patterns = (
+        r"arrives\s+(.+)$",
+        r"as\s+soon\s+as\s+(.+)$",
+        r"pickup\s+(?:as\s+soon\s+as\s+)?(.+)$",
+    )
+    invalid_values = {
+        "as soon as",
+        "arrives",
+        "available",
+        "at a",
+        "nearby store",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            result = collapse_ws(match.group(1).strip(" ,.-"))
+            if result and result.lower() not in invalid_values:
+                return result
+    return None
+
+
 def _find_following_badge_value(item, phrase):
     groups = (((item.get("badges") or {}).get("groupsV2")) or [])
     phrase_lower = phrase.lower()
@@ -354,16 +412,42 @@ def _find_following_badge_value(item, phrase):
                     values.append(value)
             for index, value in enumerate(values):
                 if phrase_lower in value.lower():
+                    inline_value = _delivery_value_from_text(value, phrase)
+                    if inline_value:
+                        return inline_value
                     for next_value in values[index + 1:]:
                         if next_value and next_value.lower() != value.lower():
                             return next_value
                     return value
+
+    values = _badge_texts(item)
+    for index, value in enumerate(values):
+        if phrase_lower in value.lower():
+            inline_value = _delivery_value_from_text(value, phrase)
+            if inline_value:
+                return inline_value
+            for next_value in values[index + 1:index + 4]:
+                lower_next = next_value.lower()
+                if next_value and lower_next != value.lower() and phrase_lower not in lower_next:
+                    return next_value
+            return value
     return None
 
 
-def _extract_free_offer_count(item):
-    text = _find_text_containing(_badge_texts(item), "free", "offer")
-    return normalize_count_text(text)
+def _extract_offer_count(item):
+    if not isinstance(item, dict):
+        return None
+
+    for key in ("additionalOfferCount", "offerCount", "offersCount"):
+        count = normalize_int(item.get(key))
+        if count is not None and count > 0:
+            return str(count)
+
+    for text in _badge_texts(item):
+        match = re.search(r"(\d+)\s+free\s+offers?", text, re.I)
+        if match:
+            return normalize_count_text(match.group(1))
+    return None
 
 
 def _extract_available_quantity(item):
@@ -421,7 +505,7 @@ def parse_listing_products(next_data, *, account_name, page_type, page_number, c
             "account_name": account_name,
             "page_type": page_type,
             "retailer_sku_name": collapse_ws(item.get("name")),
-            "offer": _extract_free_offer_count(item),
+            "offer": _extract_offer_count(item),
             "pick_up_availability": _find_following_badge_value(item, "Free pickup"),
             "fastest_delivery": _find_following_badge_value(item, "Free shipping"),
             "delivery_availability": _find_following_badge_value(item, "Delivery"),
@@ -591,17 +675,16 @@ def parse_text_review_count(*nodes):
 
 
 def parse_star_rating_count(*nodes):
+    rating_keys = (
+        "totalReviewCount",
+        "ratingCount",
+        "ratingsCount",
+        "totalRatings",
+    )
     for node in nodes:
         if not isinstance(node, dict):
             continue
-        for key in (
-            "numberOfReviews",
-            "totalReviewCount",
-            "ratingCount",
-            "ratingsCount",
-            "totalRatings",
-            "reviewsCount",
-        ):
+        for key in rating_keys:
             value = format_count_text(node.get(key))
             if value is not None:
                 return value
@@ -827,15 +910,21 @@ def parse_detail_product(next_data, html_text=None):
         parse_similar_product_names_from_html(html_text)
         or parse_similar_product_names(next_data, current_item=item)
     )
+    visible_star_rating, visible_rating_count = parse_visible_rating_summary_from_html(html_text)
     count_of_reviews = parse_text_review_count(reviews_node, product)
-    count_of_star_ratings = parse_star_rating_count(product, reviews_node) or count_of_reviews
-    star_rating = collapse_ws(product.get("averageRating") or reviews_node.get("averageOverallRating")) or "No ratings yet"
+    count_of_star_ratings = visible_rating_count or parse_star_rating_count(reviews_node)
+    star_rating = (
+        visible_star_rating
+        or format_star_rating(product.get("averageRating") or reviews_node.get("roundedAverageOverallRating") or reviews_node.get("averageOverallRating"))
+        or "No ratings yet"
+    )
     if count_of_reviews is None and count_of_star_ratings is None:
         count_of_reviews = "0"
         count_of_star_ratings = "0"
     return {
         "item": str(item) if item else None,
         "retailer_sku_name": collapse_ws(product.get("name")),
+        "offer": _extract_offer_count(product),
         "count_of_reviews": count_of_reviews,
         "star_rating": star_rating,
         "count_of_star_ratings": count_of_star_ratings,
