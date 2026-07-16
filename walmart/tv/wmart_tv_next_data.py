@@ -450,6 +450,20 @@ def _extract_offer_count(item):
     return None
 
 
+def parse_offer_count_from_html(html_text):
+    text = html_unescape(html_text or "")
+    text = " ".join(text.split())
+    if not text:
+        return None
+    match = re.search(r"(?<!\d)(\d{1,2})\s+free\s+offers?(?:\b|,)", text, re.I)
+    if not match:
+        return None
+    count = normalize_int(match.group(1))
+    if count is None or count <= 0 or count > 99:
+        return None
+    return str(count)
+
+
 def _extract_available_quantity(item):
     text = _find_text_containing(_badge_texts(item), "only", "left")
     return normalize_count_text(text)
@@ -924,7 +938,7 @@ def parse_detail_product(next_data, html_text=None):
     return {
         "item": str(item) if item else None,
         "retailer_sku_name": collapse_ws(product.get("name")),
-        "offer": _extract_offer_count(product),
+        "offer": _extract_offer_count(product) or parse_offer_count_from_html(html_text),
         "count_of_reviews": count_of_reviews,
         "star_rating": star_rating,
         "count_of_star_ratings": count_of_star_ratings,
