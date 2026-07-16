@@ -206,6 +206,72 @@ class WalmartNextDataClient:
             meta.update({"elapsed_sec": round(time.time() - started, 2), "error": f"{type(exc).__name__}: {exc}"})
             return meta, ""
 
+    def fetch_zenrows_json_response(self, url, wait_ms=6000):
+        if not self.zenrows_api_key:
+            self.zenrows_api_key = read_zenrows_api_key(self.config_path)
+        started = time.time()
+        meta = {
+            "source": "zenrows_json",
+            "url": url,
+            "status": None,
+            "final_url": None,
+            "elapsed_sec": None,
+            "html_len": 0,
+            "blocked": False,
+            "error": None,
+            "xhr_count": 0,
+        }
+        if not self.zenrows_api_key:
+            meta["error"] = "ZENROWS_API_KEY not found"
+            return meta, None
+        try:
+            wait_ms = max(0, int(wait_ms or 0))
+        except (TypeError, ValueError):
+            wait_ms = 6000
+        params = {
+            "apikey": self.zenrows_api_key,
+            "url": url,
+            "premium_proxy": "true",
+            "proxy_country": "us",
+            "js_render": "true",
+            "json_response": "true",
+            "wait": str(wait_ms),
+        }
+        try:
+            response = requests.get(ZENROWS_API_URL, params=params, timeout=max(self.zenrows_timeout, 180))
+            response_text = response.text or ""
+            meta.update({
+                "status": response.status_code,
+                "final_url": url,
+                "elapsed_sec": round(time.time() - started, 2),
+                "html_len": len(response_text),
+                "blocked": is_blocked_html(response_text, response.url),
+            })
+            try:
+                payload = response.json()
+            except Exception as exc:
+                meta["error"] = f"json parse {type(exc).__name__}: {exc}"
+                return meta, None
+            if isinstance(payload, dict):
+                meta["xhr_count"] = len(payload.get("xhr") or [])
+            return meta, payload
+        except Exception as exc:
+            meta.update({"elapsed_sec": round(time.time() - started, 2), "error": f"{type(exc).__name__}: {exc}"})
+            return meta, None
+
+    def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30):
+        meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
+        names = parse_similar_product_names_from_json_response(
+            payload,
+            current_item=current_item,
+            limit=limit,
+        )
+        if names:
+            meta["similar_count"] = names.count(" ||| ") + 1
+        else:
+            meta["similar_count"] = 0
+        return {"names": names, "source": meta.get("source"), "meta": meta}
+
     def fetch_next_data(self, url, direct_retries=1, use_zenrows=True, js_render_fallback=True):
         attempts = []
         meta, html_text = self.fetch_direct_html(url, retries=direct_retries)
@@ -592,10 +658,15 @@ def parse_discount_type_from_html(html_text):
 
 
 SIMILAR_HTML_XPATHS = (
-    "//section[@data-dca-name='itemTile']//div[@role='group' and starts-with(@data-testid, 'product-tile-') and not(@data-testid='product-tile-1')]//span[@data-automation-id='product-title']/text()",
+    "//*[@id='ip-carousel-Similar items you might like']//h3[@data-automation-id='product-title']/text()",
+    "//*[@id='ip-carousel-Similar items you might like']//span[@data-automation-id='product-title']/text()",
+    "//div[starts-with(@id, 'ip-carousel-') and contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'similar items')]//h3[@data-automation-id='product-title']/text()",
+    "//div[starts-with(@id, 'ip-carousel-') and contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'similar items')]//span[@data-automation-id='product-title']/text()",
+    "//section[@data-dca-name='itemTile']//div[@role='group' and starts-with(@data-testid, 'product-tile-') and not(@data-testid='product-tile-1')]//*[self::h3 or self::span][@data-automation-id='product-title']/text()",
 )
 SIMILAR_MODULE_TITLES = {
     "see similar items",
+    "similar items you might like",
     "compare with similar items",
 }
 SIMILAR_IMAGE_NAME_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:$|\?)", re.I)
@@ -644,8 +715,15 @@ def _iter_similar_module_products(module):
                     yield item
 
 
+def _similar_data_root(payload):
+    data = get_initial_data(payload)
+    if not isinstance(data, dict) or not (data.get("contentLayout") or {}).get("modules"):
+        data = ((payload or {}).get("data") or {}) if isinstance(payload, dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
 def _iter_similar_next_data_modules(next_data):
-    data = get_initial_data(next_data)
+    data = _similar_data_root(next_data)
     modules = ((data.get("contentLayout") or {}).get("modules") or [])
     for module in modules:
         if not isinstance(module, dict):
@@ -706,6 +784,36 @@ def parse_similar_product_names(next_data, current_item=None, limit=30):
             if item and name:
                 pairs.append((item, name))
     return _join_unique_similar_names(pairs, current_item=current_item, limit=limit)
+
+
+def parse_similar_product_names_from_json_response(response_json, current_item=None, limit=30):
+    if not isinstance(response_json, dict):
+        return None
+
+    for request in response_json.get("xhr") or []:
+        if not isinstance(request, dict):
+            continue
+        request_url = request.get("url") or ""
+        body = request.get("body") or ""
+        if (
+            "ItemByIdBtf" not in request_url
+            and "orchestra/pdp/graphql" not in request_url
+            and "Similar items" not in body
+        ):
+            continue
+        try:
+            payload = json.loads(body)
+        except Exception:
+            continue
+        result = parse_similar_product_names(
+            payload,
+            current_item=current_item,
+            limit=limit,
+        )
+        if result:
+            return result
+
+    return parse_similar_product_names_from_html(response_json.get("html") or "", limit=limit)
 
 
 def parse_detail_product(next_data, html_text=None):

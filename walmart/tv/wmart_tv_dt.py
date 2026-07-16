@@ -263,6 +263,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         self.skip_walmart_search = True
         self.detail_next_data_workers = self._env_int('WALMART_TV_DETAIL_WORKERS', 4)
         self.detail_next_data_chunk_size = self._env_int('WALMART_TV_DETAIL_CHUNK_SIZE', 40)
+        self.similar_json_fallback_enabled = self._env_bool('WALMART_TV_SIMILAR_JSON_FALLBACK', True)
+        self.similar_json_wait_ms = self._env_int('WALMART_TV_SIMILAR_JSON_WAIT_MS', 6000, minimum=0)
         self.parallel_miss_reasons = {}
 
 
@@ -674,6 +676,13 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return default
         return max(minimum, value)
 
+    @staticmethod
+    def _env_bool(name, default=False):
+        value = os.getenv(name)
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
     def _log_next_data_attempts(self, label, item, page_number, result):
         attempts = (result or {}).get('attempts') or []
         if not attempts:
@@ -684,6 +693,34 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         )
         page_suffix = f" page{page_number}" if page_number else ''
         print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
+
+    def _fill_similar_from_json_response(self, parsed, product_url, item, client, log=True):
+        if parsed.get('retailer_sku_name_similar') or not self.similar_json_fallback_enabled:
+            return
+
+        result = client.fetch_similar_product_names(
+            product_url,
+            current_item=item,
+            wait_ms=self.similar_json_wait_ms,
+        )
+        meta = result.get('meta') or {}
+        similar = result.get('names')
+        if similar:
+            parsed['retailer_sku_name_similar'] = similar
+            if log:
+                print(
+                    f"  [NEXT_DATA similar HIT] source={meta.get('source')}, "
+                    f"products={meta.get('similar_count')}, "
+                    f"xhr={meta.get('xhr_count')}, elapsed={meta.get('elapsed_sec')}s"
+                )
+            return
+
+        if log:
+            print(
+                f"  [NEXT_DATA similar MISS] source={meta.get('source')}, "
+                f"status={meta.get('status')}, xhr={meta.get('xhr_count')}, "
+                f"error={meta.get('error') or '-'}"
+            )
 
     def load_mst_specs_cache(self, products):
         items = []
@@ -1099,6 +1136,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                         "browser fallback required"
                     )
                 return None
+
+            self._fill_similar_from_json_response(parsed, url, item, client, log=log)
 
             source = result.get('source') or 'next_data'
             combined_data = product.copy()
