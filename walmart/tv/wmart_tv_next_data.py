@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from html import unescape as html_unescape
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from lxml import html as lxml_html
@@ -99,21 +99,34 @@ def format_star_rating(value):
 
 
 def parse_visible_rating_summary_from_html(html_text):
-    text = html_unescape(html_text or "")
-    match = re.search(
-        r'aria-label=["\']\s*(\d+(?:\.\d+)?)\s+out\s+of\s+5\s+stars?\s+rating,\s*([\d,]+)\s+ratings?',
-        text,
-        re.I,
-    )
-    if not match:
+    if not html_text:
+        return None, None
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return None, None
+
+    values = tree.xpath("//div[@data-testid='reviews-and-ratings']//div[@role='group']/@aria-label")
+    for value in values:
+        text = collapse_ws(value)
         match = re.search(
-            r'(\d+(?:\.\d+)?)\s+out\s+of\s+5\s+stars?\s+rating,\s*([\d,]+)\s+ratings?',
+            r"(\d+(?:\.\d+)?)\s+out\s+of\s+5\s+stars?\s+rating[,\s]*([\d,]+)\s+ratings?",
             text,
             re.I,
         )
-    if not match:
-        return None, None
-    return format_star_rating(match.group(1)), format_count_text(match.group(2))
+        if match:
+            return format_star_rating(match.group(1)), format_count_text(match.group(2))
+        match = re.search(
+            r"(\d+(?:\.\d+)?)\s+stars?\s+out\s+of\s+([\d,]+)\s+reviews?",
+            text,
+            re.I,
+        )
+        if match:
+            return format_star_rating(match.group(1)), format_count_text(match.group(2))
+
+    if tree.xpath("//div[@data-testid='reviews-and-ratings']//span[contains(., 'No ratings yet')]"):
+        return "No ratings yet", "0"
+    return None, None
 
 
 def item_id_from_url(url):
@@ -180,7 +193,13 @@ def extract_next_data(html_text):
 
 
 def get_initial_data(next_data):
-    return ((next_data or {}).get("props", {}).get("pageProps", {}).get("initialData", {}).get("data", {}))
+    initial_data = (
+        (next_data or {}).get("props", {}).get("pageProps", {}).get("initialData", {})
+    )
+    if not isinstance(initial_data, dict):
+        return {}
+    nested_data = initial_data.get("data")
+    return nested_data if isinstance(nested_data, dict) and nested_data else initial_data
 
 
 def read_zenrows_api_key(config_path=None):
@@ -383,11 +402,11 @@ def _delivery_value_from_text(value, phrase):
         r"arrives\s+(.+)$",
         r"as\s+soon\s+as\s+(.+)$",
         r"pickup\s+(?:as\s+soon\s+as\s+)?(.+)$",
+        rf"{re.escape(phrase)}\s+(.+)$",
     )
     invalid_values = {
         "as soon as",
         "arrives",
-        "available",
         "at a",
         "nearby store",
     }
@@ -434,14 +453,43 @@ def _find_following_badge_value(item, phrase):
     return None
 
 
+def _included_service_offer_count(item):
+    for module in item.get("addOnServices") or []:
+        if not isinstance(module, dict):
+            continue
+        if module.get("serviceType") != "SERVICES":
+            continue
+        group_count = 0
+        for group in module.get("groups") or []:
+            if not isinstance(group, dict) or group.get("groupType") != "INCLUDED_SERVICES":
+                continue
+            services = group.get("services") or []
+            if any(isinstance(service, dict) and service.get("offerId") for service in services):
+                group_count += 1
+        if group_count <= 0:
+            continue
+
+        service_title = collapse_ws(module.get("serviceTitle")) or ""
+        declared_match = re.search(
+            r"(?<!\d)(\d{1,2})\s+free\s+offers?\b",
+            service_title,
+            re.I,
+        )
+        if declared_match:
+            declared_count = normalize_int(declared_match.group(1))
+            if declared_count != group_count:
+                continue
+        return str(group_count)
+    return None
+
+
 def _extract_offer_count(item):
     if not isinstance(item, dict):
         return None
 
-    for key in ("additionalOfferCount", "offerCount", "offersCount"):
-        count = normalize_int(item.get(key))
-        if count is not None and count > 0:
-            return str(count)
+    included_service_count = _included_service_offer_count(item)
+    if included_service_count:
+        return included_service_count
 
     for text in _badge_texts(item):
         match = re.search(r"(\d+)\s+free\s+offers?", text, re.I)
@@ -450,9 +498,8 @@ def _extract_offer_count(item):
     return None
 
 
-def parse_offer_count_from_html(html_text):
-    text = html_unescape(html_text or "")
-    text = " ".join(text.split())
+def _offer_count_from_text(value):
+    text = " ".join(str(value or "").split())
     if not text:
         return None
     match = re.search(r"(?<!\d)(\d{1,2})\s+free\s+offers?(?:\b|,)", text, re.I)
@@ -462,6 +509,43 @@ def parse_offer_count_from_html(html_text):
     if count is None or count <= 0 or count > 99:
         return None
     return str(count)
+
+
+def _is_buy_box_offer_context(node):
+    current = node
+    for _ in range(8):
+        if current is None:
+            break
+        tag = str(getattr(current, "tag", "") or "").lower()
+        if tag in {"script", "style", "noscript"}:
+            return False
+        attr_text = " ".join(
+            str(current.get(name) or "")
+            for name in ("id", "class", "data-testid", "aria-label")
+        ).lower()
+        if "buy-box-inner-container" in attr_text or "buy box" in attr_text or "buybox" in attr_text:
+            return True
+        current = current.getparent()
+    return False
+
+
+def parse_offer_count_from_html(html_text):
+    if not html_text:
+        return None
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return None
+    for text_node in tree.xpath(
+        "//text()[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'free offers')]"
+    ):
+        parent = text_node.getparent()
+        if parent is None or not _is_buy_box_offer_context(parent):
+            continue
+        count = _offer_count_from_text(text_node)
+        if count:
+            return count
+    return None
 
 
 def _extract_available_quantity(item):
@@ -483,32 +567,124 @@ def _extract_sku_status(item):
     return ", ".join(_unique_texts(parts)) if parts else None
 
 
+def _listing_object_item_id(item):
+    if not isinstance(item, dict):
+        return None
+    for key in ("usItemId", "itemId", "id"):
+        value = item.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text.isdigit():
+            return text
+    return None
+
+
 def _is_listing_product(item):
     if not isinstance(item, dict):
         return False
     url = item.get("canonicalUrl") or item.get("productPageUrl")
-    return bool(item.get("name") and item_id_from_url(url or ""))
+    url_item = item_id_from_url(url or "")
+    object_item = _listing_object_item_id(item)
+    if object_item and url_item and object_item != url_item:
+        return False
+    return bool(item.get("name") and url_item)
+
+
+def _canonical_listing_card_url(card):
+    candidates = []
+    for href in card.xpath(".//a[@href]/@href"):
+        absolute_url = absolute_walmart_url(href)
+        if not absolute_url:
+            continue
+        parsed = urlparse(absolute_url)
+        if "/sp/track" in parsed.path:
+            redirect_url = (parse_qs(parsed.query).get("rd") or [None])[0]
+            canonical_url = absolute_walmart_url(redirect_url)
+            is_tracking = True
+        else:
+            canonical_url = absolute_url
+            is_tracking = False
+        if item_id_from_url(canonical_url):
+            candidates.append((is_tracking, canonical_url))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: row[0])
+    return candidates[0][1]
+
+
+def parse_listing_card_element(card):
+    product_url = _canonical_listing_card_url(card)
+    title_nodes = card.xpath(".//h3[@data-automation-id='product-title']")
+    retailer_sku_name = collapse_ws(title_nodes[0].text_content()) if title_nodes else None
+    offer = None
+    for text_node in card.xpath(
+        ".//text()[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'free offer')]"
+    ):
+        parent = text_node.getparent()
+        if parent is None or str(parent.tag).lower() in {"script", "style", "noscript"}:
+            continue
+        offer = _offer_count_from_text(text_node)
+        if offer:
+            break
+    badge_texts = _unique_texts(
+        collapse_ws(node.text_content())
+        for node in card.xpath(
+            ".//span[@data-testid='badgeTagComponent'] | .//div[contains(@class, 'ff-text-wrapper')]"
+        )
+    )
+
+    def delivery_value(phrase):
+        for text in badge_texts:
+            if phrase.lower() not in text.lower():
+                continue
+            return _delivery_value_from_text(text, phrase) or text
+        return None
+
+    sku_status_parts = []
+    if card.xpath(".//*[normalize-space(.)='Sponsored']"):
+        sku_status_parts.append("Sponsored")
+    if card.xpath(".//*[normalize-space(.)='Rollback']"):
+        sku_status_parts.append("Rollback")
+
+    available_match = None
+    for text in badge_texts:
+        available_match = re.search(r"\bonly\s+([\d,]+)\s+left\b", text, re.I)
+        if available_match:
+            break
+    available_quantity = normalize_count_text(available_match.group(1)) if available_match else None
+    inventory_status = next(
+        (text for text in badge_texts if text.lower() == "low stock"),
+        None,
+    )
+    return {
+        "retailer_sku_name": retailer_sku_name,
+        "offer": offer,
+        "pick_up_availability": delivery_value("Free pickup"),
+        "fastest_delivery": delivery_value("Free shipping"),
+        "delivery_availability": delivery_value("Delivery"),
+        "sku_status": ", ".join(_unique_texts(sku_status_parts)) if sku_status_parts else None,
+        "available_quantity_for_purchase": available_quantity,
+        "inventory_status": inventory_status,
+        "product_url": product_url,
+    }
 
 
 def _listing_items_from_next_data(next_data):
+    """Return products only from Walmart's primary search-results stack."""
     initial_data = get_initial_data(next_data)
     stacks = (initial_data.get("searchResult") or {}).get("itemStacks") or []
     for stack in stacks:
-        items = stack.get("items") if isinstance(stack, dict) else None
-        if not isinstance(items, list):
+        if not isinstance(stack, dict):
             continue
-        product_items = [item for item in items if _is_listing_product(item)]
-        if product_items:
-            return product_items
-    best = []
-    for node in _walk(next_data):
-        items = node.get("items") if isinstance(node, dict) else None
-        if not isinstance(items, list):
+        title = collapse_ws(stack.get("title")) or ""
+        if not title.lower().startswith("results for "):
             continue
-        product_items = [item for item in items if _is_listing_product(item)]
-        if len(product_items) > len(best):
-            best = product_items
-    return best
+        items = stack.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if _is_listing_product(item)]
+    return []
 
 
 def parse_listing_products(next_data, *, account_name, page_type, page_number, calendar_week, batch_id):
@@ -750,8 +926,20 @@ def parse_discount_type(product, price_info=None):
 
 
 def parse_discount_type_from_html(html_text):
-    text = html_unescape(html_text or "")
-    return "Price when purchased online" if "Price when purchased online" in text else None
+    if not html_text:
+        return None
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        return None
+    values = tree.xpath(
+        "//div[@data-testid='ip-legal-policy-component' "
+        "and not(ancestor::div[contains(@class, 'sticky-buy-box-column')])]//span/text()"
+    )
+    for value in values:
+        if collapse_ws(value) == "Price when purchased online":
+            return "Price when purchased online"
+    return None
 
 
 SIMILAR_HTML_XPATHS = (
@@ -759,7 +947,6 @@ SIMILAR_HTML_XPATHS = (
     "//*[@id='ip-carousel-Similar items you might like']//span[@data-automation-id='product-title']/text()",
     "//div[starts-with(@id, 'ip-carousel-') and contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'similar items')]//h3[@data-automation-id='product-title']/text()",
     "//div[starts-with(@id, 'ip-carousel-') and contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'similar items')]//span[@data-automation-id='product-title']/text()",
-    "//section[@data-dca-name='itemTile']//div[@role='group' and starts-with(@data-testid, 'product-tile-') and not(@data-testid='product-tile-1')]//*[self::h3 or self::span][@data-automation-id='product-title']/text()",
 )
 SIMILAR_MODULE_TITLES = {
     "see similar items",
@@ -913,6 +1100,32 @@ def parse_similar_product_names_from_json_response(response_json, current_item=N
     return parse_similar_product_names_from_html(response_json.get("html") or "", limit=limit)
 
 
+def _idml_spec_value(initial_data, display_name):
+    idml = initial_data.get("idml") if isinstance(initial_data, dict) else None
+    if not isinstance(idml, dict):
+        return None
+    target = str(display_name or "").strip().lower()
+    for row in idml.get("specifications") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name") or "").strip().lower() == target:
+            value = collapse_ws(row.get("value"))
+            if value:
+                return value
+    for group in idml.get("specificationsV2") or []:
+        if not isinstance(group, dict):
+            continue
+        for row in group.get("specificationGroup") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("displayName") or "").strip().lower() != target:
+                continue
+            values = row.get("attributeValue") or []
+            if isinstance(values, list) and values:
+                return collapse_ws(values[0])
+    return None
+
+
 def parse_detail_product(next_data, html_text=None):
     initial_data = get_initial_data(next_data)
     product = initial_data.get("product") or {}
@@ -938,7 +1151,7 @@ def parse_detail_product(next_data, html_text=None):
     return {
         "item": str(item) if item else None,
         "retailer_sku_name": collapse_ws(product.get("name")),
-        "offer": _extract_offer_count(product) or parse_offer_count_from_html(html_text),
+        "offer": parse_offer_count_from_html(html_text),
         "count_of_reviews": count_of_reviews,
         "star_rating": star_rating,
         "count_of_star_ratings": count_of_star_ratings,
@@ -950,5 +1163,7 @@ def parse_detail_product(next_data, html_text=None):
         "number_of_ppl_purchased_yesterday": social["number_of_ppl_purchased_yesterday"],
         "number_of_ppl_added_to_carts": social["number_of_ppl_added_to_carts"],
         "inline_reviews": _review_texts_from_reviews_node(reviews_node, limit=10),
+        "sku": _idml_spec_value(initial_data, "Model"),
+        "screen_size": _idml_spec_value(initial_data, "Screen size"),
         "retailer_sku_name_similar": retailer_sku_name_similar,
     }

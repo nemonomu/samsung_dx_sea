@@ -47,6 +47,7 @@ from common.walmart_base import WalmartBaseCrawler
 from walmart.tv.wmart_tv_next_data import (
     WalmartNextDataClient,
     build_listing_url,
+    parse_listing_card_element,
     parse_listing_products,
 )
 
@@ -309,20 +310,13 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             products = []
             for idx, item in enumerate(base_containers, 1):
                 try:
+                    card_data = parse_listing_card_element(item)
                     product_data = {
                         'account_name': self.account_name,
                         'page_type': self.page_type,
-                        'retailer_sku_name': self.safe_extract_chain(item, 'retailer_sku_name'),
-                        'offer': self.convert_first_number(item, 'offer'),
-                        'pick_up_availability': self.safe_extract_chain(item, 'pick_up_availability'),
-                        'fastest_delivery': self.safe_extract_chain(item, 'fastest_delivery'),
-                        'delivery_availability': self.safe_extract_chain(item, 'delivery_availability'),
-                        'sku_status': self.extract_sku_status(item),
-                        'available_quantity_for_purchase': self.convert_first_number(item, 'available_quantity_for_purchase'),
-                        'inventory_status': self.safe_extract_chain(item, 'inventory_status'),
+                        **card_data,
                         'main_rank': 0,  # save_products()에서 재할당
                         'page_number': page_number,
-                        'product_url': self.extract_product_url(item, 'https://www.walmart.com'),
                         'calendar_week': self.calendar_week,
                         'crawl_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'batch_id': self.batch_id

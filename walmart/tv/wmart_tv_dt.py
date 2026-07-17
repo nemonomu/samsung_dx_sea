@@ -29,6 +29,7 @@ import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from lxml import html
 from DrissionPage import ChromiumPage
 
@@ -53,7 +54,9 @@ from walmart.tv.wmart_tv_next_data import (
     normalize_int,
     parse_detail_product,
     parse_discount_type_from_html,
+    parse_offer_count_from_html,
     parse_review_page,
+    parse_similar_product_names_from_html,
 )
 
 
@@ -193,6 +196,11 @@ WALMART_TV_BRAND_SKU_PATTERNS = [
 
 
 class WalmartTVDetailCrawler(WalmartBaseCrawler):
+    REVIEW_BODY_XPATH = (
+        "//div[@data-testid='enhanced-review-content']"
+        "//span[contains(concat(' ', normalize-space(@class), ' '), ' tl-m ') "
+        "and contains(concat(' ', normalize-space(@class), ' '), ' db-m ')]"
+    )
     # ========================================================================
     # tv_retail_com 컬럼 매핑 (INSERT/UPDATE 공통 단일 소스)
     # ========================================================================
@@ -278,6 +286,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             'product': 'TV',
             'main_records': 0,
             'bsr_records': 0,
+            'target_records': 0,
             'detail_records': 0,
             'saved_records': 0,
             'redirects': [],
@@ -301,7 +310,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             'stage': 'detail',
             'url': product.get('product_url') if product else None,
             'message': str(message),
-            'decision': 'listing_only',
+            'decision': 'detail_not_saved',
         })
 
     def run(self):
@@ -315,6 +324,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if not product_list:
                 print("[ERROR] No products found")
                 return False
+
+            self.detail_report['target_records'] = len(product_list)
 
             self.detail_report['main_records'] = sum(
                 1 for product in product_list
@@ -364,6 +375,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                             if self.save_detail_result(combined_data):
                                 total_saved += 1
                                 self._record_saved(detail=detail_loaded)
+                            else:
+                                self._record_run_error('detail_save_rejected', product, 'validated detail row was not saved')
 
                         if combined_data and combined_data is not product and combined_data.get('_detail_source') in ('direct', 'zenrows_static', 'zenrows_js'):
                             time.sleep(random.uniform(0.05, 0.15))
@@ -378,17 +391,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                         if "dom timeout" in error_msg:
                             print(f"[INFO] DOM 타임아웃 - 브라우저 재시작 후 다음 제품으로")
                             self.restart_browser()
-                            if self.save_detail_result(product):
-                                total_saved += 1
-                                self._record_saved()
-                            self._record_run_error('detail', product, e)
+                            self._record_run_error('detail_dom_timeout', product, e)
                             continue
 
                         if "redirect detected" in error_msg:
-                            print("[INFO] 리다이렉트 감지 - product_list 기본 정보만 저장")
-                            if self.save_detail_result(product):
-                                total_saved += 1
-                                self._record_saved()
+                            print("[INFO] 리다이렉트 감지 - 검증된 detail row 없음, 저장하지 않음")
                             self._record_redirect(product, e)
                             continue
 
@@ -403,16 +410,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                                         if self.save_detail_result(combined_data):
                                             total_saved += 1
                                             self._record_saved(detail=detail_loaded)
-                                    print(f"[SUCCESS] 재시도 성공: {retailer_sku_name[:30]}")
-                                    continue
+                                            print(f"[SUCCESS] 재시도 성공: {retailer_sku_name[:30]}")
+                                            continue
+                                    raise RuntimeError('retry did not produce a validated detail row')
                                 except Exception as retry_e:
                                     print(f"[ERROR] 재시도 실패: {retry_e}")
                                     self._record_run_error('detail_retry', product, retry_e)
+                                    continue
 
-                        # 모든 에러 발생 시 product_list 기본 정보는 저장
-                        if self.save_detail_result(product):
-                            total_saved += 1
-                            self._record_saved()
+                        # 검증된 detail row가 없으면 불완전한 listing-only row를 저장하지 않는다.
                         self._record_run_error('detail', product, e)
                         continue
 
@@ -566,6 +572,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return 0
         return detailed_review_content.count(' ||| ') + 1
 
+    def safe_extract_chain_list(self, element, base_field_name):
+        if base_field_name == 'detailed_review_content':
+            try:
+                results = element.xpath(self.REVIEW_BODY_XPATH)
+            except Exception:
+                return [], None
+            if results:
+                return results, 'detailed_review_content_exact'
+            return [], None
+
+        return super().safe_extract_chain_list(element, base_field_name)
+
     SKU_POPULARITY_ALLOWED_VALUES = {
         'overall pick',
         'best seller',
@@ -590,6 +608,16 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
     @classmethod
     def _has_required_price(cls, value):
         return cls._money_value(value) is not None
+
+    @classmethod
+    def _money_amount(cls, value):
+        normalized = cls._money_value(value)
+        if normalized is None:
+            return None
+        try:
+            return Decimal(normalized.replace('$', '').replace(',', ''))
+        except (InvalidOperation, ValueError):
+            return None
 
     @staticmethod
     def _format_count_value(value):
@@ -965,7 +993,82 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         self._apply_fast_artifacts(combined_data)
         self._normalize_detail_fields(combined_data)
-        self.upsert_item_mst(combined_data)
+
+        item_text = str(combined_data.get('item') or '').strip()
+        if not item_text.isdigit():
+            print(
+                f"  [SAVE SKIP] invalid item: "
+                f"{combined_data.get('item') or combined_data.get('product_url') or '-'}"
+            )
+            return False
+        combined_data['item'] = item_text
+        item = item_text
+
+        if not self._has_required_price(combined_data.get('final_sku_price')):
+            print(f"  [SAVE SKIP] final_sku_price missing: item={item}")
+            return False
+
+        final_price_amount = self._money_amount(combined_data.get('final_sku_price'))
+        original_price_amount = self._money_amount(combined_data.get('original_sku_price'))
+        if original_price_amount is not None and final_price_amount > original_price_amount:
+            print(
+                f"  [SAVE SKIP] final price exceeds original price: item={item}, "
+                f"final={combined_data.get('final_sku_price')}, "
+                f"original={combined_data.get('original_sku_price')}"
+            )
+            return False
+
+        review_total = normalize_int(combined_data.get('count_of_reviews'))
+        rating_total = normalize_int(combined_data.get('count_of_star_ratings'))
+        star_rating = str(combined_data.get('star_rating') or '').strip()
+        if review_total is None or rating_total is None or not star_rating:
+            print(
+                f"  [SAVE SKIP] rating summary incomplete: item={item}, "
+                f"reviews={combined_data.get('count_of_reviews')}, "
+                f"rating={combined_data.get('star_rating')}, ratings={combined_data.get('count_of_star_ratings')}"
+            )
+            return False
+
+        if review_total > rating_total:
+            print(
+                f"  [SAVE SKIP] review count exceeds rating count: item={item}, "
+                f"reviews={review_total}, ratings={rating_total}"
+            )
+            return False
+
+        if star_rating.lower() == 'no ratings yet':
+            if review_total != 0 or rating_total != 0:
+                print(
+                    f"  [SAVE SKIP] no-ratings label conflicts with counts: item={item}, "
+                    f"reviews={review_total}, ratings={rating_total}"
+                )
+                return False
+        else:
+            if not re.fullmatch(r'\d+(?:\.\d+)?', star_rating):
+                print(f"  [SAVE SKIP] invalid star_rating: item={item}, rating={star_rating}")
+                return False
+            star_value = float(star_rating)
+            if not (0.0 <= star_value <= 5.0) or rating_total <= 0:
+                print(
+                    f"  [SAVE SKIP] star rating conflicts with rating count: item={item}, "
+                    f"rating={star_rating}, ratings={rating_total}"
+                )
+                return False
+
+        expected_review_count = min(review_total, 20)
+        collected_review_count = self._formatted_review_count(
+            combined_data.get('detailed_review_content')
+        )
+        if expected_review_count > collected_review_count:
+            print(
+                f"  [SAVE SKIP] detailed reviews incomplete: item={item}, "
+                f"expected={expected_review_count}, collected={collected_review_count}"
+            )
+            return False
+
+        if not self.upsert_item_mst(combined_data):
+            print(f"  [SAVE SKIP] tv_item_mst write failed: item={item}")
+            return False
         return self.save_to_retail_com(combined_data)
 
     def collect_reviews_next_data(
@@ -1029,8 +1132,9 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
                 parsed = parse_review_page(next_data, limit=10)
                 page_reviews = parsed.get('reviews') or []
-                if page_number == 1:
-                    count_of_reviews = parsed.get('total_review_count') or count_of_reviews
+                parsed_review_total = normalize_int(parsed.get('total_review_count'))
+                if page_number == 1 and page_reviews and parsed_review_total and parsed_review_total > 0:
+                    count_of_reviews = parsed.get('total_review_count')
 
                 if page_reviews:
                     review_texts.extend(page_reviews)
@@ -1102,7 +1206,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         product_url = product.get('product_url')
         requested_item = self.extract_item(product_url)
         candidate_urls = []
-        for url in (build_item_url(requested_item), product_url):
+        for url in (product_url, build_item_url(requested_item)):
             if url and url not in candidate_urls:
                 candidate_urls.append(url)
 
@@ -1170,12 +1274,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 None,
                 mst_sku,
                 log=log,
+                page_sku_value=parsed.get('sku'),
             )
             screen_size, spec_source, name_screen_size, page_screen_size = self.extract_screen_size(
                 spec_product,
                 None,
                 mst_screen_size,
                 log=log,
+                page_screen_size_raw=parsed.get('screen_size'),
             )
             detailed_review_content, count_of_reviews, review_complete = self.collect_reviews_next_data(
                 item,
@@ -1209,7 +1315,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'count_of_reviews': count_of_reviews or parsed.get('count_of_reviews') or '0',
                 'star_rating': parsed.get('star_rating'),
                 'count_of_star_ratings': parsed.get('count_of_star_ratings'),
-                'offer': parsed.get('offer') or product.get('offer'),
+                'offer': parsed.get('offer'),
                 'final_sku_price': parsed.get('final_sku_price'),
                 'original_sku_price': parsed.get('original_sku_price'),
                 'savings': parsed.get('savings'),
@@ -1311,7 +1417,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             number_of_ppl_added_to_carts = self.convert_first_number(tree, 'number_of_ppl_added_to_carts')
             sku_popularity = self.safe_extract_chain_join(tree, 'sku_popularity', separator=", ")
             discount_type = self.safe_extract_chain(tree, 'discount_type')
-            offer = self._offer_count_from_text(tree.text_content()) or product.get('offer')
+            offer = parse_offer_count_from_html(page_html)
             model_year = self.extract_model_year(product.get('retailer_sku_name'))  # 모델 연도 추출 (제품명 정규식)
 
             # ========== 2단계: TV 스펙 (모달) ==========
@@ -1349,9 +1455,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             # HTML 재파싱 후 절대경로로 카드 이름 일괄 추출
             page_html = self.page.run_js('return document.documentElement.outerHTML')
             tree = html.fromstring(page_html)
-            retailer_sku_name_similar = self.safe_extract_chain_join(
-                tree, 'similar_product_name', separator=' ||| '
-            )
+            retailer_sku_name_similar = parse_similar_product_names_from_html(page_html)
+            if not retailer_sku_name_similar and self.similar_json_fallback_enabled:
+                similar_result = self.next_data_client.fetch_similar_product_names(
+                    product_url,
+                    current_item=item,
+                    wait_ms=self.similar_json_wait_ms,
+                )
+                retailer_sku_name_similar = self._normalize_similar_value(similar_result.get('names'))
 
             # ========== 4단계: 리뷰 관련 필드 ==========
             count_of_reviews = None
@@ -1578,11 +1689,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         """
         item = product.get('item')
         if not item:
-            return
+            return False
 
         try:
             if not self.ensure_db_connection():
-                return
+                return False
 
             cursor = self.db_conn.cursor()
             new_sku = product.get('sku') or 'no sku'
@@ -1642,6 +1753,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     pass  # ITEM_MST 업데이트할 필드 없음
 
             cursor.close()
+            return True
 
         except Exception as e:
             print(f"[ERROR] upsert_item_mst failed: {item}: {e}")
@@ -1650,6 +1762,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     self.db_conn.rollback()
             except Exception:
                 pass
+            return False
 
     def extract_sku_by_brand(self, retailer_sku_name, product_url):
         """브랜드별 정규식으로 SKU 추출 (1차 retailer_sku_name → 2차 product_url)
@@ -1697,8 +1810,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         return None, None
 
-    def extract_sku(self, product, product_url, modal_tree, mst_sku, log=True):
-        """SKU 최종값 결정: 마스터 → 브랜드 정규식 → 모달."""
+    def extract_sku(self, product, product_url, modal_tree, mst_sku, log=True, page_sku_value=None):
+        """SKU 최종값 결정: 마스터 → 브랜드 정규식 → PDP spec/모달."""
         brand_sku, brand_name = self.extract_sku_by_brand(
             product.get('retailer_sku_name'),
             product_url,
@@ -1712,7 +1825,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             else:
                 print(f"  [sku 브랜드 추출] 브랜드 매칭 없음 → page_sku로 fallback")
 
-        page_sku = self.safe_extract_chain(modal_tree, 'sku') if modal_tree is not None else None
+        page_sku = str(page_sku_value or '').strip() or None
+        page_sku_source = "PDP spec" if page_sku else None
+        if modal_tree is not None:
+            page_sku = self.safe_extract_chain(modal_tree, 'sku')
+            page_sku_source = "모달" if page_sku else None
 
         sku = None
         sku_source = None
@@ -1724,7 +1841,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             sku_source = "브랜드"
         elif page_sku:
             sku = page_sku
-            sku_source = "모달"
+            sku_source = page_sku_source
 
         return sku, sku_source, brand_sku, page_sku, brand_name
 
@@ -1777,8 +1894,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             print(f"  [WARNING] {label} failed: {e}")
             return None
 
-    def extract_screen_size(self, product, modal_tree, mst_screen_size, log=True):
-        """screen_size 최종값 결정: 상품명 정규식 → 모달 → 마스터."""
+    def extract_screen_size(
+        self,
+        product,
+        modal_tree,
+        mst_screen_size,
+        log=True,
+        page_screen_size_raw=None,
+    ):
+        """screen_size 최종값 결정: 상품명 정규식 → PDP spec/모달 → 마스터."""
         name_screen_size = self.extract_screen_size_by_regex(
             product.get('retailer_sku_name'),
             r'(\d+\.?\d*)(?:[\s-]*inch(?:es)?|["“”″])',
@@ -1787,9 +1911,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if name_screen_size and log:
             print(f"  [screen_size 상품명 추출] {name_screen_size}")
 
-        page_screen_size = None
+        page_screen_size_source = "PDP spec" if page_screen_size_raw else None
         if modal_tree is not None:
             page_screen_size_raw = self.safe_extract_chain(modal_tree, 'screen_size')
+            page_screen_size_source = "모달" if page_screen_size_raw else None
+        page_screen_size = None
+        if page_screen_size_raw:
             page_screen_size = self.extract_screen_size_by_regex(
                 page_screen_size_raw,
                 r'([\d.]+)\s*(?:in(?:ch(?:es)?)?|")?',
@@ -1803,7 +1930,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             spec_source = "상품명"
         elif page_screen_size:
             screen_size = page_screen_size
-            spec_source = "모달"
+            spec_source = page_screen_size_source
         elif mst_screen_size:
             screen_size = mst_screen_size
             spec_source = "마스터"

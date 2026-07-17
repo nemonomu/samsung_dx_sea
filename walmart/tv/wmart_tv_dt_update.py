@@ -243,9 +243,10 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
 
                     combined_data = self.crawl_detail(product)
                     if combined_data and combined_data is not product:
-                        self.upsert_item_mst(combined_data)
-                        if self.save_to_retail_com(combined_data):
+                        if self.save_detail_result(combined_data):
                             total_updated += 1
+                        else:
+                            print("  [INFO] Detail update skipped: validated detail row was not saved")
                     elif combined_data is product:
                         print("  [INFO] Detail update skipped: detail fields incomplete")
 
@@ -268,10 +269,11 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                             try:
                                 combined_data = self.crawl_detail(product)
                                 if combined_data and combined_data is not product:
-                                    self.upsert_item_mst(combined_data)
-                                    if self.save_to_retail_com(combined_data):
+                                    if self.save_detail_result(combined_data):
                                         total_updated += 1
-                                    print(f"[SUCCESS] Retry succeeded: {sku_name[:30]}")
+                                        print(f"[SUCCESS] Retry succeeded: {sku_name[:30]}")
+                                    else:
+                                        print("  [INFO] Retry update skipped: validated detail row was not saved")
                                 elif combined_data is product:
                                     print("  [INFO] Retry detail update skipped: detail fields incomplete")
                             except Exception as retry_e:

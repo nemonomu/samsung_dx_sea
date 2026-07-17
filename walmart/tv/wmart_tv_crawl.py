@@ -113,13 +113,15 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
 
     detail_records = detail_report.get('detail_records', 0)
     saved_records = detail_report.get('saved_records', 0)
+    target_records = detail_report.get('target_records')
+    target_records = saved_records if target_records is None else target_records
     has_sos = bool(error_message or failed_stages)
     # detail 미수집(리스팅 정보만 저장) 비율이 높으면 경고로 승격 — CAPTCHA 등으로 상세가
     # 통째로 막힌 런이 조용히 'No issues'로 넘어가는 사각지대 방지 (detail 0이거나 절반 이상 누락).
     undetailed_records = max(saved_records - detail_records, 0)
-    detail_blocked = saved_records > 0 and (
-        detail_records == 0 or undetailed_records * 2 >= saved_records
-    )
+    unsaved_records = max(target_records - saved_records, 0)
+    missing_detail_records = max(target_records - detail_records, 0)
+    detail_blocked = missing_detail_records > 0
     has_warning = bool(redirects or run_errors or detail_blocked)
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
@@ -127,6 +129,7 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
         'product: TV',
         f"main records: {main_records or 0}",
         f"bsr records: {bsr_records or 0}",
+        f"detail targets: {target_records}",
         f"detail records: {detail_records}",
         f"db insert rows: {saved_records}",
         f"elapsed: {concise_elapsed_time(elapsed)}",
@@ -144,8 +147,9 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
         lines.append(f"- failed stages: {', '.join(failed_stages)}")
     if detail_blocked:
         lines.append(
-            f"- detail missing: {undetailed_records}/{saved_records} rows saved "
-            f"without detail (likely CAPTCHA/block)"
+            f"- detail missing: {missing_detail_records}/{target_records} target URLs "
+            f"did not produce validated detail rows "
+            f"(unsaved={unsaved_records}, listing_only={undetailed_records})"
         )
     if run_errors:
         lines.append(f"- run errors: {len(run_errors)}")
