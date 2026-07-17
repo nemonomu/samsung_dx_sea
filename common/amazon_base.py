@@ -844,12 +844,27 @@ class AmazonBaseCrawler(BaseCrawler):
     # ====================================================================
     # Main
     # ====================================================================
-    def find_product_containers(self, base_container_xpath, page_number, expected_products=40, scroll_ratio=1.0, label=None):
+    def find_product_containers(
+        self,
+        base_container_xpath,
+        page_number,
+        expected_products=40,
+        scroll_ratio=1.0,
+        label=None,
+        max_retries=None,
+    ):
         """상품 컨테이너 검증 파싱 후 부족하면 스크롤 재파싱을 최대 3회 수행한다."""
         base_containers = []
         log_label = f"Page {page_number}" if label is None else label
+        if max_retries is None:
+            max_attempts = 3
+            retry_label_total = 3
+        else:
+            max_retries = max(0, int(max_retries))
+            max_attempts = max_retries + 1
+            retry_label_total = max_retries
 
-        for attempt in range(1, 4):
+        for attempt in range(1, max_attempts + 1):
             page_html = self.page.html
             tree = html.fromstring(page_html)
             base_containers = tree.xpath(base_container_xpath)
@@ -857,8 +872,8 @@ class AmazonBaseCrawler(BaseCrawler):
             if len(base_containers) >= expected_products:
                 break
 
-            if attempt < 3:
-                print(f"[WARNING] {log_label}: {len(base_containers)}/{expected_products} products, retrying ({attempt}/3)...")
+            if attempt < max_attempts:
+                print(f"[WARNING] {log_label}: {len(base_containers)}/{expected_products} products, retrying ({attempt}/{retry_label_total})...")
                 self.scroll_to_bottom(scroll_ratio)
                 time.sleep(random.uniform(3, 5))
 

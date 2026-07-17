@@ -185,7 +185,15 @@ class AmazonTVMainCrawler(AmazonBaseCrawler):
 
             # 16개 검증 (최대 3회 재시도: 파싱 → 부족하면 스크롤 → 재파싱)
             expected_products = 16
-            base_containers = self.find_product_containers(base_container_xpath, page_number, expected_products)
+            # The final page normally has fewer than 16 products. One retry is
+            # enough there; earlier pages keep the existing retry behavior.
+            max_retries = 1 if page_number == self.max_pages else None
+            base_containers = self.find_product_containers(
+                base_container_xpath,
+                page_number,
+                expected_products,
+                max_retries=max_retries,
+            )
             print(f"[INFO] Page {page_number}: {len(base_containers)} products found")
 
             # 1페이지 캡처
