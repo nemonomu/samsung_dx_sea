@@ -57,6 +57,8 @@ from walmart.tv.wmart_tv_next_data import (
     parse_offer_count_from_html,
     parse_review_page,
     parse_similar_product_names_from_html,
+    product_scope_query_params,
+    review_response_scope_error,
 )
 
 
@@ -745,6 +747,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             product['original_sku_price'] = self._money_value(product.get('original_sku_price'))
         if product.get('savings'):
             product['savings'] = self._money_value(product.get('savings'))
+        final_price_amount = self._money_amount(product.get('final_sku_price'))
+        original_price_amount = self._money_amount(product.get('original_sku_price'))
+        if (
+            final_price_amount is not None
+            and original_price_amount is not None
+            and final_price_amount == original_price_amount
+        ):
+            product['original_sku_price'] = None
+            product['savings'] = None
         product['discount_type'] = self._normalize_discount_type(product.get('discount_type'))
         product['sku_popularity'] = self._normalize_sku_popularity(product.get('sku_popularity'))
         product['number_of_ppl_purchased_yesterday'] = self._normalize_social_count(
@@ -881,6 +892,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             str(item.get('stage') or '')
             for item in (diagnostics or [])
         ]
+        if any(stage.startswith('review_scope') for stage in stages):
+            return 'review_scope_mismatch'
         if any(stage in ('detail_next_data_review_incomplete', 'review_next_data_incomplete') for stage in stages):
             return 'review_incomplete'
         if any(stage.startswith('review_page') for stage in stages):
@@ -992,6 +1005,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return False
 
         self._apply_fast_artifacts(combined_data)
+        raw_star_rating = ' '.join(str(combined_data.get('star_rating') or '').split())
+        raw_star_match = re.search(r'\d+(?:\.(\d+))?', raw_star_rating)
+        if raw_star_match and len(raw_star_match.group(1) or '') > 1:
+            print(
+                f"  [SAVE SKIP] star_rating has unsupported raw precision: "
+                f"item={combined_data.get('item') or '-'}, rating={raw_star_rating}"
+            )
+            return False
         self._normalize_detail_fields(combined_data)
 
         item_text = str(combined_data.get('item') or '').strip()
@@ -1077,6 +1098,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         count_of_reviews,
         inline_reviews,
         product,
+        star_rating=None,
+        count_of_star_ratings=None,
         next_data_client=None,
         record_errors=True,
         error_collector=None,
@@ -1094,27 +1117,44 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     'message': str(message),
                 })
 
-        review_total = normalize_int(count_of_reviews) or 0
-        if review_total <= 0:
-            return None, count_of_reviews, True
+        review_summary = {
+            'count_of_reviews': count_of_reviews,
+            'star_rating': star_rating,
+            'count_of_star_ratings': count_of_star_ratings,
+        }
+        review_total = normalize_int(count_of_reviews)
+        rating_total = normalize_int(count_of_star_ratings)
+        star_text = str(star_rating or '').strip().lower()
+        if review_total == 0 and rating_total in (None, 0) and star_text in ('', 'no ratings yet'):
+            return None, review_summary, True
 
         inline_reviews = inline_reviews or []
         review_texts = []
+        product_url = product.get('product_url') if product else None
+        scope_params = product_scope_query_params(product_url)
 
-        expected_review_count = min(review_total, 20)
-        page_limit = max(1, (expected_review_count + 9) // 10)
         retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_RETRIES', 1)
         page2_retry_total = self._env_int('WALMART_TV_REVIEW_NEXTDATA_PAGE2_RETRIES', 2)
         extra_page_limit = self._env_int('WALMART_TV_REVIEW_NEXTDATA_EXTRA_PAGES', 2, minimum=0)
-        max_page = page_limit + extra_page_limit if review_total >= 20 else page_limit
 
-        for page_number in range(1, max_page + 1):
+        def review_limits(total):
+            expected = min(total, 20)
+            required_pages = max(1, (expected + 9) // 10)
+            last_page = required_pages + extra_page_limit if total >= 20 else required_pages
+            return expected, required_pages, last_page
+
+        review_total_hint = review_total if review_total is not None and review_total > 0 else 1
+        expected_review_count, page_limit, max_page = review_limits(review_total_hint)
+
+        page_number = 1
+        while page_number <= max_page:
             page_added = False
             last_reason = 'no __NEXT_DATA__'
+            fatal_scope_error = None
             page_retry_total = page2_retry_total if page_number >= 2 else retry_total
 
             for retry_index in range(1, page_retry_total + 1):
-                review_url = build_review_url(item, page_number)
+                review_url = build_review_url(item, page_number, product_url)
                 result = client.fetch_next_data(
                     review_url,
                     direct_retries=1,
@@ -1130,11 +1170,90 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                         print(f"  [NEXT_DATA review] page{page_number}: empty result, retrying ({retry_index + 1}/{page_retry_total})")
                     continue
 
+                scope_error = review_response_scope_error(next_data, item, product_url)
+                if scope_error:
+                    last_reason = scope_error
+                    fatal_scope_error = scope_error
+                    if log and retry_index < page_retry_total:
+                        print(
+                            f"  [NEXT_DATA review] page{page_number}: "
+                            f"{scope_error}, retrying ({retry_index + 1}/{page_retry_total})"
+                        )
+                    continue
+
+                fatal_scope_error = None
                 parsed = parse_review_page(next_data, limit=10)
                 page_reviews = parsed.get('reviews') or []
                 parsed_review_total = normalize_int(parsed.get('total_review_count'))
-                if page_number == 1 and page_reviews and parsed_review_total and parsed_review_total > 0:
-                    count_of_reviews = parsed.get('total_review_count')
+                parsed_rating_total = normalize_int(parsed.get('count_of_star_ratings'))
+                parsed_star_rating = str(parsed.get('star_rating') or '').strip()
+                parsed_summary_complete = (
+                    parsed_review_total is not None
+                    and parsed_rating_total is not None
+                    and bool(parsed_star_rating)
+                )
+                if not parsed_summary_complete:
+                    last_reason = (
+                        "review response summary incomplete: "
+                        f"reviews={parsed.get('total_review_count')}, "
+                        f"rating={parsed.get('star_rating')}, "
+                        f"ratings={parsed.get('count_of_star_ratings')}"
+                    )
+                    fatal_scope_error = last_reason
+                    continue
+
+                parsed_summary_key = (
+                    parsed_review_total,
+                    parsed_star_rating.lower(),
+                    parsed_rating_total,
+                )
+                if page_number == 1:
+                    current_rating_total = normalize_int(review_summary.get('count_of_star_ratings'))
+                    current_star_rating = str(review_summary.get('star_rating') or '').strip()
+                    current_summary_complete = (
+                        normalize_int(review_summary.get('count_of_reviews')) is not None
+                        and current_rating_total is not None
+                        and bool(current_star_rating)
+                    )
+                    current_summary_key = (
+                        normalize_int(review_summary.get('count_of_reviews')),
+                        current_star_rating.lower(),
+                        current_rating_total,
+                    )
+                    if current_summary_complete and current_summary_key != parsed_summary_key:
+                        last_reason = (
+                            "PDP/review summary mismatch: "
+                            f"pdp={current_summary_key}, review={parsed_summary_key}, "
+                            f"scope={scope_params or '{}'}"
+                        )
+                        fatal_scope_error = last_reason
+                        continue
+
+                    review_summary = {
+                        'count_of_reviews': parsed.get('total_review_count'),
+                        'star_rating': parsed.get('star_rating'),
+                        'count_of_star_ratings': parsed.get('count_of_star_ratings'),
+                    }
+                    review_total = parsed_review_total
+                    expected_review_count, page_limit, max_page = review_limits(review_total)
+                else:
+                    accepted_summary_key = (
+                        normalize_int(review_summary.get('count_of_reviews')),
+                        str(review_summary.get('star_rating') or '').strip().lower(),
+                        normalize_int(review_summary.get('count_of_star_ratings')),
+                    )
+                    if accepted_summary_key != parsed_summary_key:
+                        last_reason = (
+                            "review page summary mismatch: "
+                            f"page1={accepted_summary_key}, page{page_number}={parsed_summary_key}, "
+                            f"scope={scope_params or '{}'}"
+                        )
+                        fatal_scope_error = last_reason
+                        continue
+
+                if review_total == 0:
+                    page_added = True
+                    break
 
                 if page_reviews:
                     review_texts.extend(page_reviews)
@@ -1144,6 +1263,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 last_reason = 'no parsed reviews'
                 if log and retry_index < page_retry_total:
                     print(f"  [NEXT_DATA review] page{page_number}: no parsed reviews, retrying ({retry_index + 1}/{page_retry_total})")
+
+            if fatal_scope_error and not page_added:
+                add_error('review_scope_mismatch', fatal_scope_error)
+                if log:
+                    print(f"  [NEXT_DATA review ERROR] {fatal_scope_error}")
+                return None, review_summary, False
 
             if not page_added and page_number == 1 and inline_reviews:
                 review_texts.extend(inline_reviews)
@@ -1158,6 +1283,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             collected_reviews = self._formatted_review_count(detailed_review_content)
             if page_number >= page_limit and collected_reviews >= expected_review_count:
                 break
+            page_number += 1
 
         detailed_review_content = format_reviews(review_texts, limit=20)
         collected_reviews = self._formatted_review_count(detailed_review_content)
@@ -1169,7 +1295,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 print(f"  [NEXT_DATA review WARNING] {message}")
             add_error('review_next_data_incomplete', message)
 
-        return detailed_review_content, count_of_reviews, complete
+        return detailed_review_content, review_summary, complete
 
     def crawl_detail_next_data(
         self,
@@ -1206,7 +1332,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         product_url = product.get('product_url')
         requested_item = self.extract_item(product_url)
         candidate_urls = []
-        for url in (product_url, build_item_url(requested_item)):
+        for url in (product_url, build_item_url(requested_item, product_url)):
             if url and url not in candidate_urls:
                 candidate_urls.append(url)
 
@@ -1283,11 +1409,13 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 log=log,
                 page_screen_size_raw=parsed.get('screen_size'),
             )
-            detailed_review_content, count_of_reviews, review_complete = self.collect_reviews_next_data(
+            detailed_review_content, review_summary, review_complete = self.collect_reviews_next_data(
                 item,
                 parsed.get('count_of_reviews'),
                 parsed.get('inline_reviews') or [],
                 product,
+                star_rating=parsed.get('star_rating'),
+                count_of_star_ratings=parsed.get('count_of_star_ratings'),
                 next_data_client=client,
                 record_errors=record_errors,
                 error_collector=fast_errors,
@@ -1305,6 +1433,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     )
                 return None
 
+            parsed.update(review_summary)
             self._fill_similar_from_json_response(parsed, url, item, client, log=log)
 
             source = result.get('source') or 'next_data'
@@ -1312,7 +1441,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             combined_data.update({
                 'item': item,
                 'sku': sku,
-                'count_of_reviews': count_of_reviews or parsed.get('count_of_reviews') or '0',
+                'count_of_reviews': parsed.get('count_of_reviews') or '0',
                 'star_rating': parsed.get('star_rating'),
                 'count_of_star_ratings': parsed.get('count_of_star_ratings'),
                 'offer': parsed.get('offer'),

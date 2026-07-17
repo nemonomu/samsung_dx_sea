@@ -6,13 +6,14 @@ import time
 from datetime import datetime
 from html import unescape as html_unescape
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse
 
 import requests
 from lxml import html as lxml_html
 
 WALMART_BASE_URL = "https://www.walmart.com"
 ZENROWS_API_URL = "https://api.zenrows.com/v1/"
+PRODUCT_SCOPE_QUERY_KEYS = ("conditionGroupCode", "classType")
 HTTP_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "accept-language": "en-US,en;q=0.9",
@@ -148,17 +149,58 @@ def absolute_walmart_url(url):
     return urljoin(WALMART_BASE_URL, text)
 
 
-def build_item_url(item):
-    return f"{WALMART_BASE_URL}/ip/{item}" if item else None
+def product_scope_query_params(source_url):
+    if not source_url:
+        return {}
+    canonical_keys = {key.lower(): key for key in PRODUCT_SCOPE_QUERY_KEYS}
+    params = {}
+    for key, value in parse_qsl(urlparse(str(source_url)).query, keep_blank_values=False):
+        canonical_key = canonical_keys.get(key.lower())
+        if canonical_key and value and canonical_key not in params:
+            params[canonical_key] = value
+    return params
 
 
-def build_review_url(item, page_number=1):
+def _build_scoped_url(base_url, source_url=None, extra_params=None):
+    params = list(product_scope_query_params(source_url).items())
+    params.extend(extra_params or [])
+    return f"{base_url}?{urlencode(params)}" if params else base_url
+
+
+def build_item_url(item, source_url=None):
     if not item:
         return None
-    url = f"{WALMART_BASE_URL}/reviews/product/{item}"
-    if int(page_number or 1) > 1:
-        url += f"?page={int(page_number)}"
-    return url
+    return _build_scoped_url(f"{WALMART_BASE_URL}/ip/{item}", source_url)
+
+
+def build_review_url(item, page_number=1, source_url=None):
+    if not item:
+        return None
+    page_number = max(1, int(page_number or 1))
+    extra_params = [("page", str(page_number))] if page_number > 1 else []
+    return _build_scoped_url(
+        f"{WALMART_BASE_URL}/reviews/product/{item}",
+        source_url,
+        extra_params,
+    )
+
+
+def review_response_scope_error(next_data, item, source_url=None):
+    query = (next_data or {}).get("query")
+    if not isinstance(query, dict):
+        return "review response query missing"
+
+    response_item = collapse_ws(query.get("id"))
+    if not response_item:
+        return "review response item missing"
+    if item and response_item != str(item):
+        return f"review response item mismatch: expected={item}, actual={response_item}"
+
+    for key, expected in product_scope_query_params(source_url).items():
+        actual = collapse_ws(query.get(key))
+        if actual != expected:
+            return f"review response scope mismatch: {key} expected={expected}, actual={actual or '-'}"
+    return None
 
 
 def build_listing_url(url_template, page_number, page_type=None):
@@ -814,11 +856,20 @@ def find_reviews_node(value):
 def parse_review_page(next_data, limit=10):
     reviews_node = find_reviews_node(next_data)
     if not reviews_node:
-        return {"reviews": [], "total_review_count": None, "star_rating": None}
+        return {
+            "reviews": [],
+            "total_review_count": None,
+            "star_rating": None,
+            "count_of_star_ratings": None,
+        }
     return {
         "reviews": _review_texts_from_reviews_node(reviews_node, limit=limit),
         "total_review_count": parse_text_review_count(reviews_node),
-        "star_rating": collapse_ws(reviews_node.get("averageOverallRating") or reviews_node.get("roundedAverageOverallRating")),
+        "star_rating": format_star_rating(
+            reviews_node.get("roundedAverageOverallRating")
+            or reviews_node.get("averageOverallRating")
+        ),
+        "count_of_star_ratings": parse_star_rating_count(reviews_node),
     }
 
 
