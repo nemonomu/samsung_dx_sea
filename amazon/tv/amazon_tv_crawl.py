@@ -114,6 +114,15 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
     recovery_deferred = recovery_triggered and review_recovery.get('deferred')
     review_gated_count = detail_report.get('review_gated_count', 0) or 0
     review_gate_restarts = detail_report.get('review_gate_restarts', 0) or 0
+    listing_only_records = detail_report.get('listing_only_records', 0) or 0
+    listing_fallback_reason = detail_report.get('listing_fallback_reason')
+    listing_fallback_reason_text = (
+        listing_fallback_reason or 'detail_unavailable'
+    )
+    detail_batch_id = detail_report.get('batch_id')
+    login_cookie_snapshot_saved = detail_report.get(
+        'login_cookie_snapshot_saved'
+    )
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -135,7 +144,8 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
     )
     has_warning = bool(
         redirects or run_errors or detail_blocked or recovery_triggered
-        or review_gated_count
+        or review_gated_count or listing_only_records
+        or login_cookie_snapshot_saved is False
     )
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
@@ -158,10 +168,26 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
         lines.append(f'- fatal error: {error_message}')
     if failed_stages:
         lines.append(f"- failed stages: {', '.join(failed_stages)}")
+    if login_cookie_snapshot_saved is False:
+        lines.append(
+            '- Amazon login cookie snapshot save failed: this Detail run '
+            'continued, but OTP/CAPTCHA may recur on the next startup'
+        )
+    if listing_only_records:
+        lines.append(
+            f'- listing-only fallback: {listing_only_records}건 '
+            f'(reason={listing_fallback_reason_text})'
+        )
+        if detail_batch_id:
+            lines.append(
+                '  - 인증 복구 후 Detail 추출 필드 보강: '
+                f'python -B amazon_tv_dt_update.py '
+                f'--batch-id {detail_batch_id} --mode 2'
+            )
     if detail_blocked:
         lines.append(
             f"- detail 미수집: {saved_records}건 중 {undetailed_records}건 상세 없이 저장 "
-            f"(CAPTCHA/차단 의심)"
+            f"(Detail 초기화/수집 실패)"
         )
     if review_gated_count:
         lines.append(

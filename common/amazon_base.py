@@ -25,6 +25,7 @@ Amazon 공통 베이스 크롤러 (DrissionPage 기반)
 
 import os
 import re
+import socket
 import time
 import random
 import traceback
@@ -32,6 +33,12 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from lxml import html
 
 from common.base_crawler import BaseCrawler
+
+
+def _local_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        return probe.connect_ex(('127.0.0.1', port)) == 0
 
 
 class AmazonBaseCrawler(BaseCrawler):
@@ -73,10 +80,34 @@ class AmazonBaseCrawler(BaseCrawler):
             # browser_user_data_dir에 그런 프로필의 "사본" 경로를 주면 그 세션 상태로
             # 크롤링한다. 원본 Chrome과의 충돌을 피하려고 반드시 사본 + 별도 포트 사용.
             trusted_profile = getattr(self, 'browser_user_data_dir', None)
+            trusted_profile_port = None
             if trusted_profile:
-                co.set_user_data_path(trusted_profile)
-                co.auto_port()
-                print(f"[INFO] 신뢰 프로필로 브라우저 실행: {trusted_profile}")
+                configured_port = getattr(self, 'browser_debug_port', None)
+                if configured_port is None:
+                    co.set_user_data_path(trusted_profile)
+                    co.auto_port()
+                    print(f"[INFO] 신뢰 프로필로 브라우저 실행: {trusted_profile}")
+                else:
+                    trusted_profile_port = int(configured_port)
+                    if not 1024 <= trusted_profile_port <= 65535:
+                        raise ValueError(
+                            'browser_debug_port must be between 1024 and 65535'
+                        )
+                    # DrissionPage 4.1.1.2 auto_port() replaces an explicitly
+                    # configured user-data-dir with a temporary profile. Use a
+                    # dedicated port so the authenticated profile is actually
+                    # mounted and survives browser restarts.
+                    co.set_local_port(trusted_profile_port)
+                    co.set_user_data_path(trusted_profile)
+                    profile_directory = getattr(
+                        self, 'browser_profile_directory', None
+                    )
+                    if profile_directory:
+                        co.set_user(profile_directory)
+                    print(
+                        f"[INFO] 신뢰 프로필로 브라우저 실행: "
+                        f"{trusted_profile} (port={trusted_profile_port})"
+                    )
             # 이미지 허용, 미디어/플러그인 로드는 비활성화
             co.set_pref('profile.managed_default_content_settings.images', 1)
             co.set_pref('profile.managed_default_content_settings.media_stream', 2)
@@ -90,7 +121,36 @@ class AmazonBaseCrawler(BaseCrawler):
             co.set_argument('--disable-backgrounding-occluded-windows')
             co.set_argument('--disable-renderer-backgrounding')
             co.set_argument('--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling')
+            if (
+                trusted_profile_port is not None
+                and _local_port_in_use(trusted_profile_port)
+            ):
+                raise RuntimeError(
+                    f'Trusted Amazon debug port is already in use: '
+                    f'{trusted_profile_port}'
+                )
             self.page = ChromiumPage(co)
+            if trusted_profile and trusted_profile_port is not None:
+                actual_profile = self.page.browser.user_data_path
+                expected_path = os.path.normcase(
+                    os.path.abspath(trusted_profile)
+                )
+                actual_path = os.path.normcase(
+                    os.path.abspath(actual_profile or '')
+                )
+                if actual_path != expected_path:
+                    try:
+                        self.page.quit()
+                    finally:
+                        self.page = None
+                    raise RuntimeError(
+                        'Trusted Amazon profile was not mounted: '
+                        f'expected={trusted_profile}, actual={actual_profile}'
+                    )
+                print(
+                    f"[OK] 신뢰 프로필 경로 검증 완료: {actual_profile} "
+                    f"(port={trusted_profile_port})"
+                )
             self.page.set.window.max()
             # 포커스 없는 창에서도 focus 상태로 에뮬레이션 — lazy-load 트리거 유지 (SIEL 패턴)
             try:
@@ -105,10 +165,16 @@ class AmazonBaseCrawler(BaseCrawler):
 
             print("[OK] DrissionPage 설정 완료")
 
-            zip_code = getattr(self, 'amazon_zip_code', '10001')
-            if not self.set_amazon_zip_code(zip_code):
-                print("[ERROR] Amazon ZIP code 설정 실패")
-                return False
+            if getattr(self, 'skip_initial_zip', False):
+                print(
+                    "[INFO] Initial ZIP setup skipped until "
+                    "Amazon authentication is ready"
+                )
+            else:
+                zip_code = getattr(self, 'amazon_zip_code', '10001')
+                if not self.set_amazon_zip_code(zip_code):
+                    print("[ERROR] Amazon ZIP code 설정 실패")
+                    return False
             return True
 
         except Exception as e:

@@ -208,19 +208,31 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         self.spec_diffs = []
         self.detail_report = {
             'product': 'TV',
+            'batch_id': batch_id,
             'main_records': 0,
             'bsr_records': 0,
             'detail_records': 0,
             'saved_records': 0,
+            'listing_only_records': 0,
+            'listing_fallback_reason': None,
+            'login_cookie_snapshot_saved': None,
             'redirects': [],
             'run_errors': [],
             'review_gated_count': 0,     # 리뷰 로그인 게이트 감지 상품 수
             'review_gate_restarts': 0,   # 게이트로 인한 브라우저 재시작 횟수
         }
+        self._initialization_failure_reason = None
+        self._product_counts_loaded = False
         self._first_detail_html_saved = False
         # 신뢰 프로필 사용 여부 — detail 전용 (dt_update는 __init__에서 False로 해제).
         # 실제 리프레시/적용은 initialize()에서 브라우저 실행 직전에 수행.
         self.use_trusted_profile = True
+        # DrissionPage auto_port()는 user-data-dir을 임시 프로필로 덮어쓴다.
+        # 고정 전용 포트로 실제 C:\chrome_profile_amzn 세션을 유지한다.
+        self.browser_debug_port = os.environ.get(
+            'AMAZON_TV_CHROME_DEBUG_PORT', '9223'
+        )
+        self.browser_profile_directory = 'Default'
 
     def _normalize_redirect_name(self, value):
         """Compare redirect names by ignoring only whitespace runs and case."""
@@ -314,10 +326,83 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # ========================================================================
     # Run
     # ========================================================================
+    def _set_loaded_product_counts(self, product_list):
+        '''Populate report counts for the product_list rows handled by this run.'''
+        self.detail_report['main_records'] = sum(
+            1 for product in product_list if product.get('page_type') == 'main'
+        )
+        self.detail_report['bsr_records'] = sum(
+            1 for product in product_list
+            if product.get('bsr_rank') not in (None, '', 0, '0')
+        )
+        self._product_counts_loaded = True
+
+    def save_listing_only_fallback(self, reason):
+        '''Insert still-unsaved listing rows when Detail cannot be collected.
+
+        This deliberately does not crawl a PDP or upsert tv_item_mst. Existing
+        rows for the same account/batch/product_url are excluded by
+        load_product_list(), so a partial Detail run only fills its missing
+        retail rows.
+        '''
+        reason = str(reason or 'detail_unavailable')
+        self.detail_report['batch_id'] = self.batch_id
+        self.detail_report['listing_fallback_reason'] = reason
+        self.detail_report['run_errors'].append({
+            'stage': 'detail_listing_fallback',
+            'message': reason,
+            'url': None,
+        })
+        print(
+            f'[WARNING] Detail unavailable ({reason}) - '
+            'saving unsaved listing rows only'
+        )
+
+        try:
+            # Clear any failed initialization transaction before the DB-only
+            # product-list query (for example, an XPath SQL load failure).
+            self.safe_rollback()
+            product_list = self.load_product_list()
+            if not self._product_counts_loaded:
+                self._set_loaded_product_counts(product_list)
+            if not product_list:
+                print('[WARNING] Listing-only fallback: no rows available to save')
+                return 0
+
+            saved = 0
+            for index, product in enumerate(product_list, 1):
+                # No PDP was opened, so redirect state is unknown rather than False.
+                product['redirect'] = None
+                if self.save_to_retail_com(product):
+                    saved += 1
+                else:
+                    failed_url = product.get('product_url') or '-'
+                    print(
+                        f'[ERROR] Listing-only fallback save failed '
+                        f'({index}/{len(product_list)}): '
+                        f'{failed_url}'
+                    )
+
+            self.detail_report['saved_records'] += saved
+            self.detail_report['listing_only_records'] += saved
+            table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
+            print(
+                f'[FALLBACK DONE] Listing rows: {len(product_list)}, '
+                f'Saved: {saved}, Table: {table_name}, batch_id: {self.batch_id}'
+            )
+            return saved
+        except Exception as exc:
+            print(f'[ERROR] Listing-only fallback failed: {exc}')
+            traceback.print_exc()
+            return 0
+
     def run(self):
         """실행: initialize() → load_product_list() → 제품별 crawl_detail() → save_to_retail_com() → 리소스 정리"""
         try:
             if not self.initialize():
+                self.save_listing_only_fallback(
+                    self._initialization_failure_reason or 'initialization_failed'
+                )
                 print("[ERROR] Initialization failed")
                 return False
 
@@ -325,16 +410,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             if not product_list:
                 print("[ERROR] No products found")
                 return False
-            self.detail_report['main_records'] = sum(
-                1 for product in product_list if product.get('page_type') == 'main'
-            )
-            # bsr_records: bsr_rank이 부여된 제품 수 (page_type 무관).
-            # BSR 100위는 main에도 있으면 page_type='main'으로 UPDATE되므로
-            # page_type=='bsr'(BSR 전용)만 세면 안 되고 bsr_rank 보유 여부로 센다.
-            self.detail_report['bsr_records'] = sum(
-                1 for product in product_list
-                if product.get('bsr_rank') not in (None, '', 0, '0')
-            )
+            self._set_loaded_product_counts(product_list)
 
             total_saved = 0
 
@@ -349,16 +425,23 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                         detail_loaded = combined_data is not product
                         if detail_loaded:
                             self.detail_report['detail_records'] += 1
+                        elif not combined_data.get('_detail_skip'):
+                            # crawl_detail returned only the original listing row;
+                            # no landing page state was verified.
+                            combined_data['redirect'] = None
                         if combined_data.get('_detail_skip') == 'asin_mismatch':
                             print("[INFO] 리다이렉트 감지 - product_list 기본 정보만 저장")
                             if self.save_to_retail_com(combined_data):
                                 total_saved += 1
                                 self.detail_report['saved_records'] += 1
                         else:
-                            self.upsert_item_mst(combined_data)
+                            if detail_loaded:
+                                self.upsert_item_mst(combined_data)
                             if self.save_to_retail_com(combined_data):
                                 total_saved += 1
                                 self.detail_report['saved_records'] += 1
+                                if not detail_loaded:
+                                    self.detail_report['listing_only_records'] += 1
 
                     time.sleep(random.uniform(2, 4))
 
@@ -375,9 +458,11 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                         next_product = product_list[i] if i < len(product_list) else None
                         next_url = next_product.get('product_url') if next_product else None
                         print(f"[INFO] DOM 타임아웃 - 다음 상품 URL로 브라우저 재시작 후 현재 상품 스킵")
+                        product['redirect'] = None
                         if self.save_to_retail_com(product):
                             total_saved += 1
                             self.detail_report['saved_records'] += 1
+                            self.detail_report['listing_only_records'] += 1
                         self.restart_browser(next_url)
                         continue
 
@@ -388,13 +473,16 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                         if self.save_to_retail_com(product):
                             total_saved += 1
                             self.detail_report['saved_records'] += 1
+                            self.detail_report['listing_only_records'] += 1
                         continue
 
                     if "amazon recovery unresolved" in error_msg:
                         print("[INFO] Amazon 페이지 복구 실패 - product_list 기본 정보만 저장")
+                        product['redirect'] = None
                         if self.save_to_retail_com(product):
                             total_saved += 1
                             self.detail_report['saved_records'] += 1
+                            self.detail_report['listing_only_records'] += 1
                         continue
 
                     retry_success = False
@@ -409,16 +497,21 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                                 detail_loaded = combined_data is not product
                                 if detail_loaded:
                                     self.detail_report['detail_records'] += 1
+                                elif not combined_data.get('_detail_skip'):
+                                    combined_data['redirect'] = None
                                 if combined_data.get('_detail_skip') == 'asin_mismatch':
                                     print("[INFO] 리다이렉트 감지 - product_list 기본 정보만 저장")
                                     if self.save_to_retail_com(combined_data):
                                         total_saved += 1
                                         self.detail_report['saved_records'] += 1
                                 else:
-                                    self.upsert_item_mst(combined_data)
+                                    if detail_loaded:
+                                        self.upsert_item_mst(combined_data)
                                     if self.save_to_retail_com(combined_data):
                                         total_saved += 1
                                         self.detail_report['saved_records'] += 1
+                                        if not detail_loaded:
+                                            self.detail_report['listing_only_records'] += 1
                             print(f"[SUCCESS] 재시도 성공")
                             retry_success = True
                             break
@@ -429,9 +522,11 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                         continue
 
                     # 모든 에러 발생 시 product_list 기본 정보는 저장
+                    product['redirect'] = None
                     if self.save_to_retail_com(product):
                         total_saved += 1
                         self.detail_report['saved_records'] += 1
+                        self.detail_report['listing_only_records'] += 1
                     continue
 
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
@@ -442,15 +537,24 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             return True
 
         except Exception as e:
+            self.save_listing_only_fallback(
+                f'crawler_failed:{type(e).__name__}: {e}'
+            )
             print(f"[ERROR] Crawler failed: {e}")
             traceback.print_exc()
             return False
 
         finally:
             if self.page:
-                self.page.quit()
+                try:
+                    self.page.quit()
+                except Exception as cleanup_error:
+                    print(f'[WARNING] Detail browser cleanup failed: {cleanup_error}')
             if self.db_conn:
-                self.db_conn.close()
+                try:
+                    self.db_conn.close()
+                except Exception as cleanup_error:
+                    print(f'[WARNING] Detail DB cleanup failed: {cleanup_error}')
 
     # ========================================================================
     # Run Preparation
@@ -461,12 +565,17 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         if not self.batch_id:
             self.batch_id = 't_a_20260518_084638'
 
+        self._initialization_failure_reason = None
+        self.detail_report['batch_id'] = self.batch_id
+
         # 2. DB 연결
         if not self.connect_db():
+            self._initialization_failure_reason = 'db_connection_failed'
             return False
 
         # 3. XPath 로드
         if not self.load_xpaths(self.account_name, self.page_type, 'SEA', 'TV'):
+            self._initialization_failure_reason = 'xpath_load_failed'
             return False
 
         # 3.5. 신뢰 프로필 리프레시 + 적용 (detail 전용) — 사본 유효기간이 ~2일이라
@@ -480,24 +589,43 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 print(f"[INFO] 신뢰 프로필 사본 없음({TRUSTED_PROFILE_DIR}) → 기본 프로필 사용")
 
         # 4. 브라우저 설정 (DrissionPage)
+        self._initialization_failure_reason = 'browser_setup_failed'
+        # 로그인 필수 실행은 쿠키 복원/로그인을 첫 Amazon navigation으로
+        # 수행하고, 인증 성공 뒤 ZIP을 한 번만 설정한다.
+        self.skip_initial_zip = bool(self.require_amazon_login)
         try:
             if not self.setup_browser():
+                self._initialization_failure_reason = 'browser_setup_failed'
                 return False
         except Exception as e:
             print(f"[ERROR] Initialize failed: Amazon browser setup failed - {e}")
             traceback.print_exc()
             return False
+        finally:
+            self.skip_initial_zip = False
 
         # 같은 Detail 브라우저 세션에서 로그인한 뒤 PDP URL만 연다.
         # 로그인 뒤 review page 직접 접근이나 review-link 클릭은 하지 않는다.
         if self.require_amazon_login:
+            self._initialization_failure_reason = 'amazon_login_initialization_failed'
             try:
                 login_timeout = int(os.environ.get('AMAZON_LOGIN_TIMEOUT', '180'))
                 if not ensure_amazon_login_dp(self.page, timeout_seconds=login_timeout):
+                    self._initialization_failure_reason = 'amazon_login_failed'
                     print("[ERROR] Amazon 로그인 실패 — Detail 크롤링을 시작하지 않습니다.")
                     return False
                 # 계정 로그인으로 배송지가 바뀔 수 있으므로 운영 ZIP을 다시 적용한다.
+                snapshot_saved = bool(
+                    getattr(self.page, 'amazon_cookie_snapshot_saved', False)
+                )
+                self.detail_report['login_cookie_snapshot_saved'] = snapshot_saved
+                if not snapshot_saved:
+                    print(
+                        '[WARNING] Amazon login succeeded, but the cookie '
+                        'snapshot was not saved. OTP may recur next run.'
+                    )
                 if not self.set_amazon_zip_code(self.amazon_zip_code):
+                    self._initialization_failure_reason = 'post_login_zip_failed'
                     print("[ERROR] 로그인 후 Amazon ZIP code 재설정 실패")
                     return False
             except Exception as e:
@@ -506,6 +634,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
         # 5. 로그 정리
         self.cleanup_old_logs()
+        self._initialization_failure_reason = None
 
         print(f"[INFO] batch_id: {self.batch_id}")
         return True
@@ -530,7 +659,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     pl.retailer_sku_name,
                     pl.fastest_delivery,
                     pl.delivery_availability, pl.number_of_units_purchased_past_month,
-                    pl.available_quantity_for_purchase,
+                    pl.available_quantity_for_purchase, pl.discount_type,
                     pl.main_rank, pl.bsr_rank, pl.product_url, pl.calendar_week,
                     pl.crawl_datetime, pl.page_type
                 FROM amazon_tv_product_list pl
@@ -557,12 +686,13 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     'delivery_availability': row[2],
                     'number_of_units_purchased_past_month': row[3],
                     'available_quantity_for_purchase': row[4],
-                    'main_rank': row[5],
-                    'bsr_rank': row[6],
-                    'product_url': row[7],
-                    'calendar_week': row[8],
-                    'crawl_datetime': row[9],
-                    'page_type': row[10],
+                    'discount_type': row[5],
+                    'main_rank': row[6],
+                    'bsr_rank': row[7],
+                    'product_url': row[8],
+                    'calendar_week': row[9],
+                    'crawl_datetime': row[10],
+                    'page_type': row[11],
                 }
                 product_list.append(product)
 
@@ -1108,7 +1238,11 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
 def main():
     """개별 실행 진입점 (테스트 모드, 기본 배치 ID 사용)"""
-    crawler = AmazonTVDetailCrawler(batch_id=None, test_mode=True)
+    crawler = AmazonTVDetailCrawler(
+        batch_id=None,
+        test_mode=True,
+        require_amazon_login=True,
+    )
     crawler.run()
     input("Press Enter to exit...")
 

@@ -4,6 +4,9 @@ The browser finishes login and then stays in the same session. No function
 in this module builds or opens an Amazon review-page URL.
 """
 
+import json
+import hashlib
+import os
 import time
 
 HOME_URL = "https://www.amazon.com"
@@ -12,6 +15,22 @@ SIGNOUT_URL = (
     "?path=%2F&signIn=1&useRedirectOnSuccess=1&action=sign-out"
 )
 AUTH_COOKIES = {"at-main", "sess-at-main"}
+DEFAULT_COOKIE_FILE = (
+    r"C:\chrome_profile_amzn\session\amazon_login_2_storage_state.json"
+)
+COOKIE_SNAPSHOT_VERSION = 1
+COOKIE_SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
+COOKIE_WRITE_FIELDS = {
+    "name", "value", "domain", "path", "secure", "httpOnly",
+    "sameSite", "expires", "priority", "sameParty", "sourceScheme",
+    "sourcePort", "partitionKey",
+}
+
+
+def _account_fingerprint(email):
+    return hashlib.sha256(
+        str(email or "").strip().casefold().encode("utf-8")
+    ).hexdigest()
 
 
 def load_amazon_login_credentials(config_module=None):
@@ -35,7 +54,21 @@ def load_amazon_login_credentials(config_module=None):
         raise RuntimeError(
             f"amazon/config.py의 {source} email/password가 비어 있습니다."
         )
-    return {"email": email, "password": password, "source": source}
+    cookie_file = (
+        os.environ.get("AMAZON_LOGIN_COOKIE_FILE")
+        or value.get("cookie_file")
+        or DEFAULT_COOKIE_FILE
+    )
+    cookie_file = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(str(cookie_file)))
+    )
+    return {
+        "email": email,
+        "password": password,
+        "source": source,
+        "cookie_file": cookie_file,
+        "account_fingerprint": _account_fingerprint(email),
+    }
 
 
 class DrissionLoginAdapter:
@@ -196,6 +229,174 @@ def _verified_login(adapter):
     if "/ap/signin" in url or _challenge(adapter):
         return False
     return _nav_login_state(adapter) is not False
+
+
+def _is_amazon_cookie_domain(domain):
+    domain = str(domain or "").strip().lstrip(".").casefold()
+    return domain == "amazon.com" or domain.endswith(".amazon.com")
+
+
+def _sanitize_amazon_cookies(cookies, now=None):
+    """Return CDP-writable, unexpired Amazon cookies without response fields."""
+    now = time.time() if now is None else float(now)
+    sanitized = []
+    for cookie in cookies or []:
+        try:
+            raw = dict(cookie)
+        except (TypeError, ValueError):
+            continue
+
+        name = str(raw.get("name") or "").strip()
+        value = raw.get("value")
+        domain = str(raw.get("domain") or "").strip()
+        if not name or value is None or not _is_amazon_cookie_domain(domain):
+            continue
+
+        clean = {
+            key: raw[key]
+            for key in COOKIE_WRITE_FIELDS
+            if key in raw and raw[key] is not None
+        }
+        clean["name"] = name
+        clean["value"] = str(value)
+        clean["domain"] = domain
+        clean["path"] = str(clean.get("path") or "/")
+
+        expires = clean.get("expires")
+        if raw.get("session") is True:
+            clean.pop("expires", None)
+        elif expires is not None:
+            try:
+                expires = float(expires)
+            except (TypeError, ValueError):
+                clean.pop("expires", None)
+            else:
+                if expires <= 0:
+                    clean.pop("expires", None)
+                elif expires <= now:
+                    continue
+                else:
+                    clean["expires"] = expires
+
+        sanitized.append(clean)
+    return sanitized
+
+
+def load_amazon_cookie_snapshot_dp(
+    page, cookie_file, expected_account_fingerprint=None
+):
+    """Load a local Amazon cookie snapshot into a DrissionPage browser."""
+    if not cookie_file or not os.path.isfile(cookie_file):
+        return False
+    try:
+        if os.path.getsize(cookie_file) > COOKIE_SNAPSHOT_MAX_BYTES:
+            print("[LOGIN COOKIE] Snapshot ignored: file is too large")
+            return False
+        with open(cookie_file, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != COOKIE_SNAPSHOT_VERSION
+            or not isinstance(payload.get("cookies"), list)
+        ):
+            print("[LOGIN COOKIE] Snapshot ignored: invalid format")
+            return False
+        if (
+            expected_account_fingerprint
+            and payload.get("account_fingerprint")
+            != expected_account_fingerprint
+        ):
+            print("[LOGIN COOKIE] Snapshot ignored: account mismatch")
+            return False
+
+        cookies = _sanitize_amazon_cookies(payload["cookies"])
+        cookie_names = {cookie["name"] for cookie in cookies}
+        if not AUTH_COOKIES.issubset(cookie_names):
+            print("[LOGIN COOKIE] Snapshot ignored: auth cookies are missing")
+            return False
+
+        page.browser.set.cookies(cookies)
+        print(
+            f"[LOGIN COOKIE] Restored {len(cookies)} Amazon cookies "
+            f"from {cookie_file}"
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"[LOGIN COOKIE] Snapshot restore failed: "
+            f"{type(exc).__name__}"
+        )
+        return False
+
+
+def save_amazon_cookie_snapshot_dp(
+    page, cookie_file, account_fingerprint=None
+):
+    """Atomically save only a strictly verified DrissionPage Amazon session."""
+    if not cookie_file:
+        return False
+    adapter = DrissionLoginAdapter(page)
+    if not _verified_login(adapter):
+        print("[LOGIN COOKIE] Snapshot not saved: session is not verified")
+        return False
+
+    temp_file = None
+    try:
+        cookies = _sanitize_amazon_cookies(
+            page.browser.cookies(all_info=True)
+        )
+        cookie_names = {cookie["name"] for cookie in cookies}
+        if not AUTH_COOKIES.issubset(cookie_names):
+            print("[LOGIN COOKIE] Snapshot not saved: auth cookies are missing")
+            return False
+
+        directory = os.path.dirname(cookie_file)
+        if not directory:
+            print("[LOGIN COOKIE] Snapshot not saved: invalid path")
+            return False
+        os.makedirs(directory, exist_ok=True)
+        temp_file = f"{cookie_file}.{os.getpid()}.tmp"
+        payload = {
+            "version": COOKIE_SNAPSHOT_VERSION,
+            "saved_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+            "source": "AMAZON_LOGIN_2",
+            "account_fingerprint": account_fingerprint,
+            "cookies": cookies,
+        }
+        with open(temp_file, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(
+                payload,
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_file, cookie_file)
+        temp_file = None
+        try:
+            os.chmod(cookie_file, 0o600)
+        except OSError:
+            pass
+        print(
+            f"[LOGIN COOKIE] Saved {len(cookies)} Amazon cookies "
+            f"to {cookie_file}"
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"[LOGIN COOKIE] Snapshot save failed: "
+            f"{type(exc).__name__}"
+        )
+        return False
+    finally:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
 
 
 def _challenge(adapter):
@@ -367,7 +568,13 @@ def _finish_login(adapter):
     return True
 
 
-def _login(adapter, credentials, timeout_seconds=180):
+def _login(
+    adapter,
+    credentials,
+    timeout_seconds=180,
+    cookie_file=None,
+    account_fingerprint=None,
+):
     print(f"[LOGIN] Amazon 계정 로그인 시작 ({credentials['source']})")
     adapter.get(HOME_URL)
     time.sleep(3)
@@ -375,6 +582,18 @@ def _login(adapter, credentials, timeout_seconds=180):
     if _verified_login(adapter) and _nav_login_state(adapter) is True:
         print("[LOGIN] Reusing existing authenticated Amazon session")
         return True
+
+    # Do not overwrite a potentially newer profile session before checking it.
+    # Restore the snapshot only when the current profile is not verified.
+    if cookie_file and load_amazon_cookie_snapshot_dp(
+        adapter.browser, cookie_file, account_fingerprint
+    ):
+        adapter.get(HOME_URL)
+        time.sleep(2)
+        _handle_continue_shopping(adapter)
+        if _verified_login(adapter) and _nav_login_state(adapter) is True:
+            print("[LOGIN COOKIE] Restored snapshot session is authenticated")
+            return True
 
     if _logged_in(adapter):
         # The nav does not expose an email address, so an existing session
@@ -466,7 +685,32 @@ def _login(adapter, credentials, timeout_seconds=180):
 
 def ensure_amazon_login_dp(page, timeout_seconds=180, config_module=None):
     credentials = load_amazon_login_credentials(config_module)
-    return _login(DrissionLoginAdapter(page), credentials, timeout_seconds)
+    cookie_file = credentials["cookie_file"]
+    try:
+        page.amazon_cookie_snapshot_saved = False
+    except Exception:
+        pass
+    login_ok = _login(
+        DrissionLoginAdapter(page),
+        credentials,
+        timeout_seconds,
+        cookie_file,
+        credentials["account_fingerprint"],
+    )
+    if login_ok:
+        snapshot_saved = save_amazon_cookie_snapshot_dp(
+            page, cookie_file, credentials["account_fingerprint"]
+        )
+        try:
+            page.amazon_cookie_snapshot_saved = snapshot_saved
+        except Exception:
+            pass
+        if not snapshot_saved:
+            print(
+                "[LOGIN COOKIE] Authenticated, but the session snapshot "
+                "was not persisted"
+            )
+    return login_ok
 
 
 def ensure_amazon_logout_dp(page):

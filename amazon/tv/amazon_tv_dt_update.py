@@ -135,7 +135,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     delivery_availability, sku_status,
                     main_rank, bsr_rank, product_url, calendar_week,
                     crawl_datetime, page_type,
-                    number_of_units_purchased_past_month
+                    number_of_units_purchased_past_month, discount_type
                 FROM {self.target_table}
                 WHERE account_name = %s AND batch_id = %s AND product_url IS NOT NULL {condition}
                 ORDER BY id
@@ -169,6 +169,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     # 기존 units 값을 실어, 재크롤 시 PDP에서 못 찾아도 NULL로
                     # 덮어쓰지 않고 보존한다 (crawl_detail은 fill-if-empty).
                     'number_of_units_purchased_past_month': row[13],
+                    # listing-only fallback의 할인 유형도 PDP 재추출 실패 시 보존한다.
+                    'discount_type': row[14],
                 }
                 product_list.append(product)
 
@@ -275,6 +277,10 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                         if combined_data.get('_detail_skip') == 'asin_mismatch':
                             print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
                         else:
+                            if combined_data is product:
+                                raise RuntimeError(
+                                    'Detail extraction incomplete - UPDATE skipped'
+                                )
                             if self.mode != self.MODE_DETAIL_REVIEW_NULL:
                                 self.upsert_item_mst(combined_data)
                             if self.save_to_retail_com(combined_data):
@@ -313,6 +319,10 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                                 if combined_data.get('_detail_skip') == 'asin_mismatch':
                                     print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
                                 else:
+                                    if combined_data is product:
+                                        raise RuntimeError(
+                                            'Detail extraction incomplete - UPDATE skipped'
+                                        )
                                     if self.mode != self.MODE_DETAIL_REVIEW_NULL:
                                         self.upsert_item_mst(combined_data)
                                     if self.save_to_retail_com(combined_data):

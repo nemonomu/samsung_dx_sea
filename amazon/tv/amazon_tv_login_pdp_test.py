@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime
@@ -513,7 +515,26 @@ def main():
         test_mode=True,
         require_amazon_login=False,
     )
-    crawler.use_trusted_profile = not args.no_profile
+    isolated_profile_dir = None
+    if args.login_only and not args.no_profile:
+        crawler.use_trusted_profile = True
+    else:
+        # Never sign the production crawler profile out for field comparison.
+        # --no-profile login smoke also uses this empty profile to prove that
+        # the JSON snapshot alone can restore an authenticated session.
+        isolated_profile_dir = tempfile.mkdtemp(
+            prefix="amazon_login_compare_"
+        )
+        crawler.use_trusted_profile = False
+        crawler.browser_user_data_dir = isolated_profile_dir
+        crawler.browser_debug_port = os.environ.get(
+            "AMAZON_TV_COMPARE_CHROME_DEBUG_PORT", "9224"
+        )
+        crawler.browser_profile_directory = "Default"
+        print(
+            "[TEST] Isolated browser profile: "
+            f"{isolated_profile_dir}"
+        )
     crawler.capture_enabled = False
     crawler._first_detail_html_saved = True
 
@@ -522,12 +543,17 @@ def main():
         "test_scope": "login_only" if args.login_only else "field_comparison",
         "credentials_source": "AMAZON_LOGIN_2",
         "same_browser_session": True,
+        "browser_profile_scope": (
+            "trusted" if args.login_only and not args.no_profile
+            else "isolated"
+        ),
         "comparison_fields": list(COMPARISON_FIELDS),
         "comparison_excluded_fields": ["detailed_review_content"],
         "pre_login_detailed_review_skipped": True,
         "login_attempts": 0,
         "login_ok": False,
         "login_smoke_passed": False,
+        "cookie_snapshot_saved": False,
         "logged_out_baseline_ok": False,
         "review_page_navigation": False,
         "db_write": False,
@@ -569,8 +595,14 @@ def main():
                 crawler.page,
                 timeout_seconds=args.login_timeout,
             )
+            result["cookie_snapshot_saved"] = bool(
+                getattr(crawler.page, "amazon_cookie_snapshot_saved", False)
+            )
             if not result["login_ok"]:
                 result["fatal_error"] = "Amazon LOGIN_2 authentication failed"
+                exit_code = 3
+            elif not result["cookie_snapshot_saved"]:
+                result["fatal_error"] = "Amazon cookie snapshot was not saved"
                 exit_code = 3
             elif not crawler.set_amazon_zip_code(crawler.amazon_zip_code):
                 result["fatal_error"] = "ZIP reset failed after login"
@@ -612,8 +644,14 @@ def main():
                 crawler.page,
                 timeout_seconds=args.login_timeout,
             )
+            result["cookie_snapshot_saved"] = bool(
+                getattr(crawler.page, "amazon_cookie_snapshot_saved", False)
+            )
             if not result["login_ok"]:
                 result["fatal_error"] = "Amazon LOGIN_2 authentication failed"
+                exit_code = 3
+            elif not result["cookie_snapshot_saved"]:
+                result["fatal_error"] = "Amazon cookie snapshot was not saved"
                 exit_code = 3
             elif not crawler.set_amazon_zip_code(crawler.amazon_zip_code):
                 result["fatal_error"] = "ZIP reset failed after login"
@@ -644,6 +682,8 @@ def main():
                 crawler.db_conn.close()
             except Exception:
                 pass
+        if isolated_profile_dir:
+            shutil.rmtree(isolated_profile_dir, ignore_errors=True)
 
     out_rows = result["modes"]["logged_out"]["products"]
     in_rows = result["modes"]["logged_in"]["products"]
@@ -715,6 +755,7 @@ def main():
             "[LOGIN SMOKE RESULT] "
             f"{'PASS' if result['login_smoke_passed'] else 'FAIL'} "
             f"login_ok={result['login_ok']} "
+            f"snapshot_saved={result['cookie_snapshot_saved']} "
             "pdp_opened=False"
         )
     else:
