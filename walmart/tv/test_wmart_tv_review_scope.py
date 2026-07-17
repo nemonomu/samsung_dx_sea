@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from walmart.tv.wmart_tv_dt import WalmartTVDetailCrawler
 from walmart.tv.wmart_tv_next_data import (
+    WalmartNextDataClient,
     build_item_url,
     build_review_url,
     parse_review_page,
@@ -131,6 +133,369 @@ class ReviewScopeUrlTests(unittest.TestCase):
         self.assertEqual(parsed['total_review_count'], '1')
         self.assertEqual(parsed['star_rating'], '1.0')
         self.assertEqual(parsed['count_of_star_ratings'], '1')
+
+
+class ZenRowsRecoveryTests(unittest.TestCase):
+    def test_zenrows_only_client_never_calls_direct(self):
+        client = WalmartNextDataClient(direct_enabled=False)
+        zenrows_calls = []
+
+        def fail_direct(*args, **kwargs):
+            raise AssertionError('direct HTTP must not run in recovery mode')
+
+        def fake_zenrows(url, js_render=False):
+            zenrows_calls.append(js_render)
+            return (
+                {
+                    'source': 'zenrows_static',
+                    'status': 200,
+                    'blocked': False,
+                },
+                '<script id="__NEXT_DATA__">{"query":{"id":"100"}}</script>',
+            )
+
+        client.fetch_direct_html = fail_direct
+        client.fetch_zenrows_html = fake_zenrows
+        result = client.fetch_next_data('https://www.walmart.com/ip/100')
+
+        self.assertEqual(result['source'], 'zenrows_static')
+        self.assertEqual(result['next_data']['query']['id'], '100')
+        self.assertEqual(zenrows_calls, [False])
+        self.assertEqual(
+            [attempt['source'] for attempt in result['attempts']],
+            ['zenrows_static'],
+        )
+
+    def test_zenrows_only_client_falls_back_from_static_to_js(self):
+        client = WalmartNextDataClient(direct_enabled=False)
+        zenrows_calls = []
+
+        def fail_direct(*args, **kwargs):
+            raise AssertionError('direct HTTP must not run in recovery mode')
+
+        def fake_zenrows(url, js_render=False):
+            zenrows_calls.append(js_render)
+            source = 'zenrows_js' if js_render else 'zenrows_static'
+            html_text = ''
+            if js_render:
+                html_text = (
+                    '<script id="__NEXT_DATA__">'
+                    '{"query":{"id":"100"}}'
+                    '</script>'
+                )
+            return (
+                {
+                    'source': source,
+                    'status': 200,
+                    'blocked': False,
+                },
+                html_text,
+            )
+
+        client.fetch_direct_html = fail_direct
+        client.fetch_zenrows_html = fake_zenrows
+        result = client.fetch_next_data('https://www.walmart.com/ip/100')
+
+        self.assertEqual(result['source'], 'zenrows_js')
+        self.assertEqual(zenrows_calls, [False, True])
+        self.assertEqual(
+            [attempt['source'] for attempt in result['attempts']],
+            ['zenrows_static', 'zenrows_js'],
+        )
+
+    @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
+    def test_recovery_worker_uses_zenrows_only_until_success(self, _sleep):
+        crawler = bare_crawler()
+        crawler.zenrows_recovery_attempts = 2
+        calls = []
+
+        def fake_worker(index, product, mst_specs, zenrows_only=False):
+            calls.append(zenrows_only)
+            if len(calls) == 1:
+                return (
+                    index,
+                    None,
+                    None,
+                    'review_incomplete',
+                    [{
+                        'stage': 'review_next_data_incomplete',
+                        'message': 'collected 19',
+                    }],
+                )
+            return (
+                index,
+                {
+                    'item': '100',
+                    '_detail_source': 'zenrows_static',
+                },
+                None,
+                None,
+                [],
+            )
+
+        crawler._crawl_detail_next_data_worker = fake_worker
+        result = crawler._crawl_detail_zenrows_recovery_worker(
+            1,
+            {'product_url': 'https://www.walmart.com/ip/100'},
+            {},
+            'review_incomplete',
+        )
+
+        self.assertEqual(calls, [True, True])
+        self.assertEqual(result[1]['item'], '100')
+        self.assertEqual(result[5], 2)
+
+    @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
+    def test_recovery_worker_stops_after_ten_failed_attempts(self, _sleep):
+        crawler = bare_crawler()
+        crawler.zenrows_recovery_attempts = 10
+        calls = []
+
+        def fake_worker(index, product, mst_specs, zenrows_only=False):
+            calls.append(zenrows_only)
+            return (
+                index,
+                None,
+                None,
+                'review_incomplete',
+                [{
+                    'stage': 'review_next_data_incomplete',
+                    'message': 'collected 19',
+                }],
+            )
+
+        crawler._crawl_detail_next_data_worker = fake_worker
+        result = crawler._crawl_detail_zenrows_recovery_worker(
+            1,
+            {'product_url': 'https://www.walmart.com/ip/100'},
+            {},
+            'review_incomplete',
+        )
+
+        self.assertEqual(len(calls), 10)
+        self.assertTrue(all(calls))
+        self.assertIsNone(result[1])
+        self.assertEqual(result[5], 10)
+
+    def test_parallel_miss_is_recovered_without_run_error(self):
+        crawler = bare_crawler()
+        crawler.detail_next_data_workers = 1
+        crawler.zenrows_recovery_workers = 1
+        crawler.zenrows_recovery_attempts = 1
+        crawler.parallel_miss_reasons = {}
+        crawler.load_mst_specs_cache = lambda products: {}
+        run_errors = []
+        crawler._record_run_error = lambda *args: run_errors.append(args)
+
+        def fake_worker(index, product, mst_specs, zenrows_only=False):
+            if zenrows_only:
+                return (
+                    index,
+                    {
+                        'item': '100',
+                        '_detail_source': 'zenrows_js',
+                    },
+                    None,
+                    None,
+                    [],
+                )
+            return (
+                index,
+                None,
+                None,
+                'review_incomplete',
+                [{
+                    'stage': 'review_next_data_incomplete',
+                    'message': 'collected 19',
+                }],
+            )
+
+        crawler._crawl_detail_next_data_worker = fake_worker
+        result = crawler.collect_detail_next_data_parallel([
+            (1, {
+                'product_url': 'https://www.walmart.com/ip/100',
+                'retailer_sku_name': 'Example TV',
+            }),
+        ])
+
+        self.assertEqual(result[1]['_detail_source'], 'zenrows_js')
+        self.assertEqual(crawler.parallel_miss_reasons, {})
+        self.assertEqual(run_errors, [])
+
+    def test_unresolved_recovery_records_one_final_error(self):
+        crawler = bare_crawler()
+        crawler.detail_next_data_workers = 1
+        crawler.zenrows_recovery_workers = 1
+        crawler.zenrows_recovery_attempts = 1
+        crawler.parallel_miss_reasons = {}
+        crawler.load_mst_specs_cache = lambda products: {}
+        run_errors = []
+        crawler._record_run_error = lambda *args: run_errors.append(args)
+        crawler._crawl_detail_next_data_worker = (
+            lambda index, product, mst_specs, zenrows_only=False: (
+                index,
+                None,
+                None,
+                'price_missing',
+                [{
+                    'stage': 'detail_next_data_price_missing',
+                    'message': 'item=100',
+                }],
+            )
+        )
+
+        result = crawler.collect_detail_next_data_parallel([
+            (1, {
+                'product_url': 'https://www.walmart.com/ip/100',
+                'retailer_sku_name': 'Example TV',
+            }),
+        ])
+
+        self.assertEqual(result, {})
+        self.assertEqual(crawler.parallel_miss_reasons, {1: 'price_missing'})
+        self.assertEqual(len(run_errors), 1)
+        self.assertEqual(run_errors[0][0], 'detail_zenrows_recovery_exhausted')
+
+
+class DetailRunFlowTests(unittest.TestCase):
+    def test_initialize_does_not_require_xpath_or_browser(self):
+        crawler = bare_crawler()
+        crawler.batch_id = 'w_test'
+        crawler.account_name = 'Walmart'
+        crawler.page_type = 'detail'
+        crawler.connect_db = lambda: True
+        crawler.cleanup_old_logs = lambda: None
+
+        def fail_xpath(*args):
+            raise AssertionError('detail initialization must not load XPath')
+
+        def fail_browser(*args):
+            raise AssertionError('detail initialization must not open Chrome')
+
+        crawler.load_xpaths = fail_xpath
+        crawler.setup_browser = fail_browser
+
+        self.assertTrue(crawler.initialize())
+        self.assertIsInstance(crawler.next_data_client, WalmartNextDataClient)
+
+    @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
+    def test_run_saves_unresolved_as_listing_only_without_browser(self, _sleep):
+        crawler = bare_crawler()
+        crawler.batch_id = 'w_test'
+        crawler.test_mode = False
+        crawler.db_conn = None
+        crawler.spec_diffs = []
+        crawler.detail_next_data_chunk_size = 40
+        crawler.parallel_miss_reasons = {}
+        crawler.detail_report = {
+            'product': 'TV',
+            'main_records': 0,
+            'bsr_records': 0,
+            'target_records': 0,
+            'detail_records': 0,
+            'saved_records': 0,
+            'redirects': [],
+            'run_errors': [],
+        }
+        products = [
+            {
+                'product_url': 'https://www.walmart.com/ip/100',
+                'retailer_sku_name': 'Recovered TV',
+                'page_type': 'main',
+                'bsr_rank': None,
+            },
+            {
+                'product_url': 'https://www.walmart.com/ip/200',
+                'retailer_sku_name': 'Unresolved TV',
+                'page_type': 'bsr',
+                'bsr_rank': 1,
+                'final_sku_price': '$200.00',
+                'fastest_delivery': 'Free shipping, arrives',
+            },
+        ]
+        recovered = products[0].copy()
+        recovered.update({
+            'item': '100',
+            '_detail_source': 'zenrows_static',
+            'detailed_review_content': 'review',
+        })
+        crawler.initialize = lambda: True
+        crawler.load_product_list = lambda: products
+
+        def fake_collect(indexed_products):
+            crawler.parallel_miss_reasons = {2: 'review_incomplete'}
+            return {1: recovered}
+
+        def fail_browser_fallback(*args, **kwargs):
+            raise AssertionError('run must not call browser fallback')
+
+        crawler.collect_detail_next_data_parallel = fake_collect
+        crawler.crawl_detail = fail_browser_fallback
+        detail_saved = []
+        listing_saved = []
+        crawler.save_detail_result = lambda row: detail_saved.append(row) or True
+        crawler.save_to_retail_com = lambda row: listing_saved.append(row) or True
+
+        self.assertTrue(crawler.run())
+        self.assertEqual(detail_saved, [recovered])
+        self.assertEqual(len(listing_saved), 1)
+        self.assertEqual(listing_saved[0]['item'], '200')
+        self.assertEqual(listing_saved[0]['final_sku_price'], '$200.00')
+        self.assertIsNone(listing_saved[0]['fastest_delivery'])
+        self.assertIsNone(listing_saved[0]['count_of_reviews'])
+        self.assertEqual(listing_saved[0]['_detail_source'], 'listing_fallback')
+        self.assertEqual(crawler.detail_report['target_records'], 2)
+        self.assertEqual(crawler.detail_report['detail_records'], 1)
+        self.assertEqual(crawler.detail_report['saved_records'], 2)
+
+    def test_product_list_loader_preserves_prices_and_sanitizes_availability(self):
+        row = (
+            'Example TV',
+            '$200.00',
+            '$250.00',
+            '3',
+            'Free pickup as soon as tomorrow',
+            'Free shipping, arrives',
+            '12 mins',
+            'Rollback',
+            '2',
+            'Low stock',
+            1,
+            7,
+            'https://www.walmart.com/ip/Example-TV/200',
+            'w29',
+            '2026-07-17 12:00:00',
+            'main',
+        )
+
+        class FakeCursor:
+            def execute(self, query, params):
+                self.query = query
+                self.params = params
+
+            def fetchall(self):
+                return [row]
+
+            def close(self):
+                pass
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+        crawler = bare_crawler()
+        crawler.db_conn = FakeConnection()
+        crawler.account_name = 'Walmart'
+        crawler.batch_id = 'w_test'
+
+        products = crawler.load_product_list()
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]['final_sku_price'], '$200.00')
+        self.assertEqual(products[0]['original_sku_price'], '$250.00')
+        self.assertEqual(products[0]['pick_up_availability'], 'tomorrow')
+        self.assertIsNone(products[0]['fastest_delivery'])
+        self.assertEqual(products[0]['delivery_availability'], '12 mins')
+        self.assertEqual(products[0]['product_url'], row[12])
 
 
 class ReviewCollectionTests(unittest.TestCase):
@@ -425,6 +790,30 @@ class DetailSaveGuardTests(unittest.TestCase):
         self.assertTrue(crawler.save_detail_result(row))
         self.assertIsNone(saved_rows[0]['original_sku_price'])
         self.assertIsNone(saved_rows[0]['savings'])
+
+    def test_listing_fallback_never_writes_item_mst(self):
+        crawler = bare_crawler()
+        saved_rows = []
+        crawler.upsert_item_mst = lambda product: self.fail(
+            'listing fallback must not write tv_item_mst'
+        )
+        crawler.save_to_retail_com = (
+            lambda product: saved_rows.append(product.copy()) or True
+        )
+        product = {
+            'product_url': 'https://www.walmart.com/ip/Example-TV/200',
+            'retailer_sku_name': 'Example TV',
+            'final_sku_price': '$200.00',
+            'fastest_delivery': 'Free shipping, arrives tomorrow',
+        }
+
+        self.assertTrue(crawler.save_listing_fallback(
+            product,
+            'review_incomplete',
+        ))
+        self.assertEqual(saved_rows[0]['item'], '200')
+        self.assertEqual(saved_rows[0]['fastest_delivery'], 'tomorrow')
+        self.assertIsNone(saved_rows[0]['count_of_reviews'])
 
     def test_invalid_rows_are_rejected_before_db_writes(self):
         cases = {

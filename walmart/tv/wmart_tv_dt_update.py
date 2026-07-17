@@ -94,10 +94,10 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
         return super().initialize()
 
     def crawl_detail(self, product):
-        """UPDATE mode: skip fallback product from failed detail extraction."""
+        """Run the same validated HTTP/ZenRows detail flow for UPDATE mode."""
         result = super().crawl_detail(product)
         if result is product:
-            print("[INFO] Detail extraction fallback - skip row without UPDATE")
+            print("[INFO] Unvalidated listing row rejected without UPDATE")
             return None
         return result
 
@@ -247,37 +247,14 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                             total_updated += 1
                         else:
                             print("  [INFO] Detail update skipped: validated detail row was not saved")
-                    elif combined_data is product:
-                        print("  [INFO] Detail update skipped: detail fields incomplete")
+                    else:
+                        print("  [INFO] Detail update skipped: ZenRows recovery exhausted")
 
-                    time.sleep(random.uniform(2, 4))
+                    time.sleep(random.uniform(0.05, 0.15))
 
                 except Exception as e:
-                    error_msg = str(e).lower()
                     print(f"[ERROR] Product {i} failed: {e}")
-
-                    # DOM 타임아웃 → 브라우저 재시작만 하고 해당 제품은 스킵 (재시도 안 함)
-                    if "dom timeout" in error_msg:
-                        print(f"[INFO] DOM 타임아웃 - 브라우저 재시작 후 다음 제품으로")
-                        self.restart_browser()
-                        continue
-
-                    # 일반 타임아웃 또는 페이지 로드 실패 → 브라우저 재시작 후 재시도
-                    if "timeout" in error_msg or "time out" in error_msg or "url unchanged" in error_msg:
-                        print(f"[INFO] 브라우저 재시작 후 재시도")
-                        if self.restart_browser():
-                            try:
-                                combined_data = self.crawl_detail(product)
-                                if combined_data and combined_data is not product:
-                                    if self.save_detail_result(combined_data):
-                                        total_updated += 1
-                                        print(f"[SUCCESS] Retry succeeded: {sku_name[:30]}")
-                                    else:
-                                        print("  [INFO] Retry update skipped: validated detail row was not saved")
-                                elif combined_data is product:
-                                    print("  [INFO] Retry detail update skipped: detail fields incomplete")
-                            except Exception as retry_e:
-                                print(f"[ERROR] 재시도 실패: {retry_e}")
+                    self._record_run_error('detail_update', product, e)
                     continue
 
             print(f"[DONE] Processed: {len(product_list)}, Updated: {total_updated}, Table: {self.target_table}, batch_id: {self.batch_id}")
@@ -289,8 +266,6 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
             return False
 
         finally:
-            if self.page:
-                self.page.quit()
             if self.db_conn:
                 self.db_conn.close()
             self.stop_logging()

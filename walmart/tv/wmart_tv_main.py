@@ -433,13 +433,14 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
         insert_query = """
             INSERT INTO wmart_tv_product_list (
                 account_name, page_type, retailer_sku_name,
-                offer,
+                offer, final_sku_price, original_sku_price,
                 pick_up_availability, fastest_delivery, delivery_availability,
                 sku_status, available_quantity_for_purchase, inventory_status,
                 main_rank, main_page_number, product_url,
                 calendar_week, crawl_datetime, batch_id
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
         """
 
@@ -449,6 +450,8 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                 product['page_type'],
                 product['retailer_sku_name'],
                 product['offer'],
+                product.get('final_sku_price'),
+                product.get('original_sku_price'),
                 product['pick_up_availability'],
                 product['fastest_delivery'],
                 product['delivery_availability'],

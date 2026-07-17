@@ -253,10 +253,17 @@ def read_zenrows_api_key(config_path=None):
 
 
 class WalmartNextDataClient:
-    def __init__(self, timeout=30, zenrows_timeout=120, config_path=None):
+    def __init__(
+        self,
+        timeout=30,
+        zenrows_timeout=120,
+        config_path=None,
+        direct_enabled=True,
+    ):
         self.timeout = timeout
         self.zenrows_timeout = zenrows_timeout
         self.config_path = config_path
+        self.direct_enabled = bool(direct_enabled)
         self.session = requests.Session()
         self.zenrows_api_key = None
 
@@ -366,14 +373,21 @@ class WalmartNextDataClient:
             meta["similar_count"] = 0
         return {"names": names, "source": meta.get("source"), "meta": meta}
 
-    def fetch_next_data(self, url, direct_retries=1, use_zenrows=True, js_render_fallback=True):
+    def fetch_next_data(
+        self,
+        url,
+        direct_retries=1,
+        use_zenrows=True,
+        js_render_fallback=True,
+    ):
         attempts = []
-        meta, html_text = self.fetch_direct_html(url, retries=direct_retries)
-        if meta:
-            attempts.append(meta)
-        next_data = extract_next_data(html_text)
-        if next_data and meta and not meta.get("blocked"):
-            return {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+        if self.direct_enabled:
+            meta, html_text = self.fetch_direct_html(url, retries=direct_retries)
+            if meta:
+                attempts.append(meta)
+            next_data = extract_next_data(html_text)
+            if next_data and meta and not meta.get("blocked"):
+                return {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
         if use_zenrows:
             for js_render in ([False, True] if js_render_fallback else [False]):
                 meta, html_text = self.fetch_zenrows_html(url, js_render=js_render)
@@ -436,62 +450,155 @@ def _find_text_containing(texts, *needles):
     return None
 
 
-def _delivery_value_from_text(value, phrase):
-    text = collapse_ws(value)
-    if not text or phrase.lower() not in text.lower():
+AVAILABILITY_BADGE_SPECS = {
+    "pick_up_availability": {
+        "mem_id": "L1051",
+        "labels": ("Free pickup as soon as", "Free pickup"),
+    },
+    "fastest_delivery": {
+        "mem_id": "L1053",
+        "labels": ("Free shipping, arrives", "Free shipping"),
+    },
+    "delivery_availability": {
+        "mem_id": "L1052",
+        "labels": ("Delivery as soon as",),
+    },
+}
+
+AVAILABILITY_PHRASE_FIELDS = {
+    "free pickup": "pick_up_availability",
+    "free shipping": "fastest_delivery",
+    "delivery": "delivery_availability",
+}
+
+
+def _availability_field(field_or_phrase):
+    key = collapse_ws(field_or_phrase)
+    if not key:
         return None
-    patterns = (
-        r"arrives\s+(.+)$",
-        r"as\s+soon\s+as\s+(.+)$",
-        r"pickup\s+(?:as\s+soon\s+as\s+)?(.+)$",
-        rf"{re.escape(phrase)}\s+(.+)$",
-    )
-    invalid_values = {
-        "as soon as",
-        "arrives",
-        "at a",
-        "nearby store",
-    }
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
+    if key in AVAILABILITY_BADGE_SPECS:
+        return key
+    return AVAILABILITY_PHRASE_FIELDS.get(key.lower())
+
+
+def _availability_value_from_text(value, field_name):
+    field_name = _availability_field(field_name)
+    spec = AVAILABILITY_BADGE_SPECS.get(field_name)
+    text = collapse_ws(value)
+    if not spec or not text:
+        return None
+
+    for label in spec["labels"]:
+        match = re.fullmatch(
+            rf"{re.escape(label)}(?:\s+|,\s*)(.+)",
+            text,
+            re.I,
+        )
         if match:
-            result = collapse_ws(match.group(1).strip(" ,.-"))
-            if result and result.lower() not in invalid_values:
-                return result
+            return normalize_availability_value(match.group(1), field_name)
+    return None
+
+
+def normalize_availability_value(value, field_name):
+    """Keep only a field's value, never a fulfillment label or another field."""
+    field_name = _availability_field(field_name)
+    if field_name not in AVAILABILITY_BADGE_SPECS:
+        return None
+
+    text = collapse_ws(value)
+    if not text:
+        return None
+
+    inline_value = _availability_value_from_text(text, field_name)
+    if inline_value:
+        return inline_value
+
+    lower = text.lower().strip(" ,.-")
+    all_labels = {
+        label.lower()
+        for spec in AVAILABILITY_BADGE_SPECS.values()
+        for label in spec["labels"]
+    }
+    invalid_values = all_labels | {
+        "arrives",
+        "as soon as",
+        "at a",
+        "delivery",
+        "nearby store",
+        "pickup at a",
+    }
+    if (
+        lower in invalid_values
+        or lower.startswith("pickup at a")
+        or lower.startswith("as soon as")
+        or lower.startswith("arrives")
+    ):
+        return None
+    if any(label in lower for label in all_labels):
+        return None
+    return text
+
+
+def _delivery_value_from_text(value, phrase):
+    return _availability_value_from_text(value, phrase)
+
+
+def _availability_member_values(member):
+    values = []
+    for content in member.get("content") or []:
+        if not isinstance(content, dict):
+            continue
+        value = collapse_ws(content.get("value") or content.get("text"))
+        if value:
+            values.append(value)
+    return values
+
+
+def _value_from_availability_member(member, field_name):
+    spec = AVAILABILITY_BADGE_SPECS[field_name]
+    values = _availability_member_values(member)
+    for index, value in enumerate(values):
+        if not any(label.lower() in value.lower() for label in spec["labels"]):
+            continue
+        inline_value = _availability_value_from_text(value, field_name)
+        if inline_value:
+            return inline_value
+        if index + 1 < len(values):
+            return normalize_availability_value(values[index + 1], field_name)
+        return None
     return None
 
 
 def _find_following_badge_value(item, phrase):
-    groups = (((item.get("badges") or {}).get("groupsV2")) or [])
-    phrase_lower = phrase.lower()
-    for group in groups:
-        for member in group.get("members") or []:
-            values = []
-            for content in member.get("content") or []:
-                value = collapse_ws(content.get("value") or content.get("text") or content.get("contDesc"))
-                if value:
-                    values.append(value)
-            for index, value in enumerate(values):
-                if phrase_lower in value.lower():
-                    inline_value = _delivery_value_from_text(value, phrase)
-                    if inline_value:
-                        return inline_value
-                    for next_value in values[index + 1:]:
-                        if next_value and next_value.lower() != value.lower():
-                            return next_value
-                    return value
+    field_name = _availability_field(phrase)
+    spec = AVAILABILITY_BADGE_SPECS.get(field_name)
+    if not spec:
+        return None
 
-    values = _badge_texts(item)
-    for index, value in enumerate(values):
-        if phrase_lower in value.lower():
-            inline_value = _delivery_value_from_text(value, phrase)
-            if inline_value:
-                return inline_value
-            for next_value in values[index + 1:index + 4]:
-                lower_next = next_value.lower()
-                if next_value and lower_next != value.lower() and phrase_lower not in lower_next:
-                    return next_value
-            return value
+    groups = (((item.get("badges") or {}).get("groupsV2")) or [])
+    members = [
+        member
+        for group in groups
+        if isinstance(group, dict)
+        for member in (group.get("members") or [])
+        if isinstance(member, dict)
+    ]
+
+    # Verified Walmart fulfillment members: pickup=L1051,
+    # delivery=L1052, shipping=L1053.
+    for member in members:
+        if str(member.get("memId") or "") == spec["mem_id"]:
+            return _value_from_availability_member(member, field_name)
+
+    # Fallback stays inside one member carrying this field's own label.
+    for member in members:
+        values = _availability_member_values(member)
+        if any(
+            label.lower() in value.lower()
+            for value in values
+            for label in spec["labels"]
+        ):
+            return _value_from_availability_member(member, field_name)
     return None
 
 
@@ -676,12 +783,61 @@ def parse_listing_card_element(card):
         )
     )
 
-    def delivery_value(phrase):
-        for text in badge_texts:
-            if phrase.lower() not in text.lower():
-                continue
-            return _delivery_value_from_text(text, phrase) or text
+    def delivery_value(field_name):
+        spec = AVAILABILITY_BADGE_SPECS[field_name]
+        for label in spec["labels"]:
+            text_nodes = card.xpath(
+                ".//text()[contains("
+                "translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                f"'{label.lower()}')]"
+            )
+            for text_node in text_nodes:
+                current = text_node.getparent()
+                for _ in range(3):
+                    if current is None:
+                        break
+                    container_text = collapse_ws(
+                        " ".join(current.xpath(".//text()"))
+                    )
+                    lower = (container_text or "").lower()
+                    present_fields = {
+                        candidate_field
+                        for candidate_field, candidate_spec in AVAILABILITY_BADGE_SPECS.items()
+                        if any(
+                            candidate_label.lower() in lower
+                            for candidate_label in candidate_spec["labels"]
+                        )
+                    }
+                    if present_fields == {field_name}:
+                        parsed = normalize_availability_value(
+                            container_text,
+                            field_name,
+                        )
+                        if parsed:
+                            return parsed
+                    current = current.getparent()
         return None
+
+    final_sku_price = None
+    original_sku_price = None
+    for price_node in card.xpath(".//*[@data-automation-id='product-price']"):
+        price_text = collapse_ws(price_node.text_content())
+        current_match = re.search(
+            r"current price\s+(?:Now\s+)?(\$\s*[\d,]+(?:\.\d{1,2})?)",
+            price_text or "",
+            re.I,
+        )
+        was_match = re.search(
+            r"\bWas\s+(\$\s*[\d,]+(?:\.\d{1,2})?)",
+            price_text or "",
+            re.I,
+        )
+        if current_match:
+            final_sku_price = format_money(current_match.group(1))
+        if was_match:
+            original_sku_price = format_money(was_match.group(1))
+        if final_sku_price:
+            break
 
     sku_status_parts = []
     if card.xpath(".//*[normalize-space(.)='Sponsored']"):
@@ -702,9 +858,11 @@ def parse_listing_card_element(card):
     return {
         "retailer_sku_name": retailer_sku_name,
         "offer": offer,
-        "pick_up_availability": delivery_value("Free pickup"),
-        "fastest_delivery": delivery_value("Free shipping"),
-        "delivery_availability": delivery_value("Delivery"),
+        "final_sku_price": final_sku_price,
+        "original_sku_price": original_sku_price,
+        "pick_up_availability": delivery_value("pick_up_availability"),
+        "fastest_delivery": delivery_value("fastest_delivery"),
+        "delivery_availability": delivery_value("delivery_availability"),
         "sku_status": ", ".join(_unique_texts(sku_status_parts)) if sku_status_parts else None,
         "available_quantity_for_purchase": available_quantity,
         "inventory_status": inventory_status,
@@ -733,11 +891,16 @@ def parse_listing_products(next_data, *, account_name, page_type, page_number, c
     products = []
     for item in _listing_items_from_next_data(next_data):
         product_url = absolute_walmart_url(item.get("canonicalUrl") or item.get("productPageUrl"))
+        final_sku_price, original_sku_price = _listing_price_values(
+            item.get("priceInfo")
+        )
         products.append({
             "account_name": account_name,
             "page_type": page_type,
             "retailer_sku_name": collapse_ws(item.get("name")),
             "offer": _extract_offer_count(item),
+            "final_sku_price": final_sku_price,
+            "original_sku_price": original_sku_price,
             "pick_up_availability": _find_following_badge_value(item, "Free pickup"),
             "fastest_delivery": _find_following_badge_value(item, "Free shipping"),
             "delivery_availability": _find_following_badge_value(item, "Delivery"),
@@ -797,6 +960,20 @@ def _was_price_string(price_info):
             if formatted:
                 return formatted
     return None
+
+
+def _listing_price_values(price_info):
+    if not isinstance(price_info, dict):
+        return None, None
+
+    final_sku_price = None
+    for key in ("linePrice", "linePriceDisplay"):
+        final_sku_price = format_money(price_info.get(key))
+        if final_sku_price:
+            break
+    if not final_sku_price:
+        final_sku_price = _price_string(price_info)
+    return final_sku_price, _was_price_string(price_info)
 
 
 def _dollar_amount_string(value):
