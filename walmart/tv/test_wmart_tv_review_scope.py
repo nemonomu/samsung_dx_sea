@@ -60,6 +60,11 @@ def bare_crawler():
     crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
     crawler._env_int = lambda name, default, minimum=1: default
     crawler._record_run_error = lambda *args, **kwargs: None
+    crawler.detail_next_data_workers = 1
+    crawler.detail_next_data_chunk_size = 40
+    crawler.zenrows_recovery_workers = 1
+    crawler.zenrows_recovery_attempts = 1
+    crawler.parallel_miss_reasons = {}
     return crawler
 
 
@@ -204,7 +209,7 @@ class ZenRowsRecoveryTests(unittest.TestCase):
         )
 
     @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
-    def test_recovery_worker_uses_zenrows_only_until_success(self, _sleep):
+    def test_recovery_rounds_use_zenrows_only_until_success(self, _sleep):
         crawler = bare_crawler()
         crawler.zenrows_recovery_attempts = 2
         calls = []
@@ -234,19 +239,24 @@ class ZenRowsRecoveryTests(unittest.TestCase):
             )
 
         crawler._crawl_detail_next_data_worker = fake_worker
-        result = crawler._crawl_detail_zenrows_recovery_worker(
-            1,
-            {'product_url': 'https://www.walmart.com/ip/100'},
+        recovered, unresolved = crawler.collect_detail_zenrows_recovery_parallel(
+            {
+                1: {
+                    'product': {'product_url': 'https://www.walmart.com/ip/100'},
+                    'reason': 'review_incomplete',
+                    'diagnostics': [],
+                    'error': None,
+                },
+            },
             {},
-            'review_incomplete',
         )
 
         self.assertEqual(calls, [True, True])
-        self.assertEqual(result[1]['item'], '100')
-        self.assertEqual(result[5], 2)
+        self.assertEqual(recovered[1]['item'], '100')
+        self.assertEqual(unresolved, {})
 
     @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
-    def test_recovery_worker_stops_after_ten_failed_attempts(self, _sleep):
+    def test_recovery_rounds_stop_after_ten_failed_attempts(self, _sleep):
         crawler = bare_crawler()
         crawler.zenrows_recovery_attempts = 10
         calls = []
@@ -265,17 +275,112 @@ class ZenRowsRecoveryTests(unittest.TestCase):
             )
 
         crawler._crawl_detail_next_data_worker = fake_worker
-        result = crawler._crawl_detail_zenrows_recovery_worker(
-            1,
-            {'product_url': 'https://www.walmart.com/ip/100'},
+        recovered, unresolved = crawler.collect_detail_zenrows_recovery_parallel(
+            {
+                1: {
+                    'product': {'product_url': 'https://www.walmart.com/ip/100'},
+                    'reason': 'review_incomplete',
+                    'diagnostics': [],
+                    'error': None,
+                },
+            },
             {},
-            'review_incomplete',
         )
 
         self.assertEqual(len(calls), 10)
         self.assertTrue(all(calls))
-        self.assertIsNone(result[1])
-        self.assertEqual(result[5], 10)
+        self.assertEqual(recovered, {})
+        self.assertIn(1, unresolved)
+        self.assertEqual(
+            unresolved[1]['diagnostics'][-1]['recovery_attempt'],
+            10,
+        )
+
+    @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
+    def test_recovery_rounds_remove_successes_from_later_rounds(self, _sleep):
+        crawler = bare_crawler()
+        crawler.zenrows_recovery_attempts = 3
+        call_counts = {1: 0, 2: 0}
+
+        def fake_worker(index, product, mst_specs, zenrows_only=False):
+            self.assertTrue(zenrows_only)
+            call_counts[index] += 1
+            succeeds = index == 1 or call_counts[index] == 2
+            if succeeds:
+                return (
+                    index,
+                    {
+                        'item': str(index * 100),
+                        '_detail_source': 'zenrows_static',
+                    },
+                    None,
+                    None,
+                    [],
+                )
+            return (
+                index,
+                None,
+                None,
+                'no_next_data',
+                [{'stage': 'detail_next_data_no_next_data'}],
+            )
+
+        misses = {
+            index: {
+                'product': {
+                    'product_url': f'https://www.walmart.com/ip/{index * 100}',
+                },
+                'reason': 'no_next_data',
+                'diagnostics': [],
+                'error': None,
+            }
+            for index in (1, 2)
+        }
+        crawler._crawl_detail_next_data_worker = fake_worker
+
+        recovered, unresolved = crawler.collect_detail_zenrows_recovery_parallel(
+            misses,
+            {},
+        )
+
+        self.assertEqual(call_counts, {1: 1, 2: 2})
+        self.assertEqual(set(recovered), {1, 2})
+        self.assertEqual(unresolved, {})
+
+    def test_initial_pass_retries_each_miss_once_before_defer(self):
+        crawler = bare_crawler()
+        crawler.load_mst_specs_cache = lambda products: {}
+        calls = []
+
+        def fake_worker(index, product, mst_specs, zenrows_only=False):
+            calls.append(zenrows_only)
+            if len(calls) == 1:
+                return (
+                    index,
+                    None,
+                    None,
+                    'no_next_data',
+                    [{'stage': 'detail_next_data_no_next_data'}],
+                )
+            return (
+                index,
+                {
+                    'item': '100',
+                    '_detail_source': 'direct',
+                },
+                None,
+                None,
+                [],
+            )
+
+        crawler._crawl_detail_next_data_worker = fake_worker
+        results, misses, _ = crawler._collect_detail_initial_parallel([
+            (1, {'product_url': 'https://www.walmart.com/ip/100'}),
+        ])
+
+        self.assertEqual(calls, [False, False])
+        self.assertEqual(results[1]['item'], '100')
+        self.assertEqual(misses, {})
 
     def test_parallel_miss_is_recovered_without_run_error(self):
         crawler = bare_crawler()
@@ -422,14 +527,28 @@ class DetailRunFlowTests(unittest.TestCase):
         crawler.initialize = lambda: True
         crawler.load_product_list = lambda: products
 
-        def fake_collect(indexed_products):
-            crawler.parallel_miss_reasons = {2: 'review_incomplete'}
-            return {1: recovered}
+        def fake_initial_collect(indexed_products):
+            misses = {
+                2: {
+                    'product': products[1],
+                    'reason': 'review_incomplete',
+                    'diagnostics': [{
+                        'stage': 'review_next_data_incomplete',
+                        'message': 'collected 19',
+                    }],
+                    'error': None,
+                },
+            }
+            return {1: recovered}, misses, {}
+
+        def fake_final_recovery(misses, mst_specs):
+            return {}, misses
 
         def fail_browser_fallback(*args, **kwargs):
             raise AssertionError('run must not call browser fallback')
 
-        crawler.collect_detail_next_data_parallel = fake_collect
+        crawler._collect_detail_initial_parallel = fake_initial_collect
+        crawler.collect_detail_zenrows_recovery_parallel = fake_final_recovery
         crawler.crawl_detail = fail_browser_fallback
         detail_saved = []
         listing_saved = []
@@ -445,6 +564,80 @@ class DetailRunFlowTests(unittest.TestCase):
         self.assertIsNone(listing_saved[0]['count_of_reviews'])
         self.assertEqual(listing_saved[0]['_detail_source'], 'listing_fallback')
         self.assertEqual(crawler.detail_report['target_records'], 2)
+        self.assertEqual(crawler.detail_report['detail_records'], 1)
+        self.assertEqual(crawler.detail_report['saved_records'], 2)
+
+    @patch('walmart.tv.wmart_tv_dt.time.sleep', return_value=None)
+    def test_run_defers_all_chunk_misses_to_one_final_queue(self, _sleep):
+        crawler = bare_crawler()
+        crawler.batch_id = 'w_test'
+        crawler.test_mode = False
+        crawler.db_conn = None
+        crawler.spec_diffs = []
+        crawler.detail_next_data_chunk_size = 1
+        crawler.detail_report = {
+            'product': 'TV',
+            'main_records': 0,
+            'bsr_records': 0,
+            'target_records': 0,
+            'detail_records': 0,
+            'saved_records': 0,
+            'redirects': [],
+            'run_errors': [],
+        }
+        products = [
+            {
+                'product_url': 'https://www.walmart.com/ip/100',
+                'retailer_sku_name': 'First TV',
+                'page_type': 'main',
+                'final_sku_price': '$100.00',
+            },
+            {
+                'product_url': 'https://www.walmart.com/ip/200',
+                'retailer_sku_name': 'Second TV',
+                'page_type': 'main',
+                'final_sku_price': '$200.00',
+            },
+        ]
+        events = []
+        crawler.initialize = lambda: True
+        crawler.load_product_list = lambda: products
+
+        def fake_initial_collect(indexed_products):
+            index, product = indexed_products[0]
+            events.append(f'initial-{index}')
+            return {}, {
+                index: {
+                    'product': product,
+                    'reason': 'no_next_data',
+                    'diagnostics': [],
+                    'error': None,
+                },
+            }, {}
+
+        def fake_final_recovery(misses, mst_specs):
+            events.append('recovery-' + ','.join(str(index) for index in sorted(misses)))
+            recovered = products[0].copy()
+            recovered.update({
+                'item': '100',
+                '_detail_source': 'zenrows_static',
+                'detailed_review_content': 'review1 - recovered review',
+            })
+            return {1: recovered}, {2: misses[2]}
+
+        crawler._collect_detail_initial_parallel = fake_initial_collect
+        crawler.collect_detail_zenrows_recovery_parallel = fake_final_recovery
+        detail_saved = []
+        listing_saved = []
+        crawler.save_detail_result = lambda row: detail_saved.append(row) or True
+        crawler.save_to_retail_com = lambda row: listing_saved.append(row) or True
+
+        self.assertTrue(crawler.run())
+        self.assertEqual(events, ['initial-1', 'initial-2', 'recovery-1,2'])
+        self.assertEqual(len(detail_saved), 1)
+        self.assertEqual(detail_saved[0]['item'], '100')
+        self.assertEqual(len(listing_saved), 1)
+        self.assertEqual(listing_saved[0]['item'], '200')
         self.assertEqual(crawler.detail_report['detail_records'], 1)
         self.assertEqual(crawler.detail_report['saved_records'], 2)
 

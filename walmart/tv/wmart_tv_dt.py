@@ -273,9 +273,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             'WALMART_TV_ZENROWS_RECOVERY_WORKERS',
             self.detail_next_data_workers,
         )
-        self.zenrows_recovery_attempts = self._env_int(
-            'WALMART_TV_ZENROWS_RECOVERY_ATTEMPTS',
+        self.zenrows_recovery_attempts = min(
             10,
+            self._env_int(
+                'WALMART_TV_ZENROWS_RECOVERY_ATTEMPTS',
+                10,
+            ),
         )
         self.similar_json_fallback_enabled = self._env_bool('WALMART_TV_SIMILAR_JSON_FALLBACK', True)
         self.similar_json_wait_ms = self._env_int('WALMART_TV_SIMILAR_JSON_WAIT_MS', 6000, minimum=0)
@@ -348,10 +351,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             total_saved = 0
             indexed_products = list(enumerate(product_list, 1))
             total_products = len(product_list)
+            deferred_misses = {}
+            deferred_mst_specs = {}
 
             for chunk_start in range(0, len(indexed_products), self.detail_next_data_chunk_size):
                 chunk = indexed_products[chunk_start:chunk_start + self.detail_next_data_chunk_size]
-                fast_results = self.collect_detail_next_data_parallel(chunk)
+                fast_results, chunk_misses, mst_specs = self._collect_detail_initial_parallel(chunk)
+                deferred_misses.update(chunk_misses)
+                deferred_mst_specs.update(mst_specs)
 
                 for i, product in chunk:
                     combined_data = None
@@ -371,21 +378,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                                 f"price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}"
                             )
                         else:
-                            miss_reason = self.parallel_miss_reasons.get(i) or 'unknown'
+                            miss_entry = chunk_misses.get(i) or {}
+                            miss_reason = miss_entry.get('reason') or 'unknown'
                             print(
-                                f"  [NEXT_DATA MISS] reason={miss_reason}; "
-                                "ZenRows recovery exhausted"
+                                f"  [NEXT_DATA DEFERRED] reason={miss_reason}; "
+                                "immediate retry exhausted, queued for final ZenRows recovery"
                             )
-                            if self.save_listing_fallback(product, miss_reason):
-                                total_saved += 1
-                                self._record_saved(detail=False)
-                                print("  [LISTING-ONLY SAVED] original listing row preserved")
-                            else:
-                                self._record_run_error(
-                                    'listing_fallback_save_failed',
-                                    product,
-                                    f'reason={miss_reason}',
-                                )
                             continue
 
                         if combined_data:
@@ -410,6 +408,82 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                         # 검증된 detail row가 없으면 불완전한 listing-only row를 저장하지 않는다.
                         self._record_run_error('detail', product, e)
                         continue
+
+            unresolved = {}
+            if deferred_misses:
+                print(
+                    f"\n[INFO] Initial detail pass complete: "
+                    f"deferred={len(deferred_misses)}; starting final ZenRows recovery"
+                )
+                recovered, unresolved = self.collect_detail_zenrows_recovery_parallel(
+                    deferred_misses,
+                    deferred_mst_specs,
+                )
+                self.parallel_miss_reasons = {
+                    index: entry.get('reason') or 'unknown'
+                    for index, entry in unresolved.items()
+                }
+
+                for i, initial_entry in sorted(deferred_misses.items()):
+                    product = initial_entry.get('product') or {}
+                    retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
+                    product_url = product.get('product_url', 'N/A')
+                    url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
+                    print(f"\n[{i}/{total_products}] {retailer_sku_name}")
+                    print(f"  URL: {url_display}")
+
+                    combined_data = recovered.get(i)
+                    if combined_data:
+                        review_count = self._formatted_review_count(
+                            combined_data.get('detailed_review_content')
+                        )
+                        print(
+                            f"  [ZENROWS FINAL HIT] source={combined_data.get('_detail_source')}, "
+                            f"item={combined_data.get('item') or '-'}, "
+                            f"price={combined_data.get('final_sku_price') or '-'}, "
+                            f"reviews={review_count}"
+                        )
+                        if self.save_detail_result(combined_data):
+                            total_saved += 1
+                            self._record_saved(detail=True)
+                        else:
+                            self._record_run_error(
+                                'detail_save_rejected',
+                                product,
+                                'validated recovery row was not saved',
+                            )
+                        time.sleep(random.uniform(0.05, 0.15))
+                        continue
+
+                    unresolved_entry = unresolved.get(i) or initial_entry
+                    miss_reason = unresolved_entry.get('reason') or 'unknown'
+                    message = self._parallel_miss_message(
+                        unresolved_entry.get('diagnostics')
+                    )
+                    detail = f"reason={miss_reason}"
+                    if message:
+                        detail = f"{detail}; {message}"
+                    self._record_run_error(
+                        'detail_zenrows_recovery_exhausted',
+                        product,
+                        detail,
+                    )
+                    print(
+                        f"  [NEXT_DATA MISS] reason={miss_reason}; "
+                        "final ZenRows recovery exhausted"
+                    )
+                    if self.save_listing_fallback(product, miss_reason):
+                        total_saved += 1
+                        self._record_saved(detail=False)
+                        print("  [LISTING-ONLY SAVED] original listing row preserved")
+                    else:
+                        self._record_run_error(
+                            'listing_fallback_save_failed',
+                            product,
+                            f'reason={miss_reason}',
+                        )
+            else:
+                self.parallel_miss_reasons = {}
 
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
             print(f"[DONE] Processed: {len(product_list)}, Saved: {total_saved}, Table: {table_name}, batch_id: {self.batch_id}")
@@ -875,55 +949,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             })
             return index, None, e, 'worker_exception', diagnostics
 
-    def _crawl_detail_zenrows_recovery_worker(
-        self,
-        index,
-        product,
-        mst_specs,
-        initial_reason,
-    ):
-        diagnostics = []
-        last_error = None
-        last_reason = initial_reason or 'unknown'
-
-        for attempt in range(1, self.zenrows_recovery_attempts + 1):
-            (
-                _,
-                combined_data,
-                error,
-                reason,
-                attempt_diagnostics,
-            ) = self._crawl_detail_next_data_worker(
-                index,
-                product,
-                mst_specs,
-                zenrows_only=True,
-            )
-            for diagnostic in attempt_diagnostics or []:
-                enriched = dict(diagnostic)
-                enriched['recovery_attempt'] = attempt
-                diagnostics.append(enriched)
-
-            if combined_data:
-                source = combined_data.get('_detail_source')
-                if source in ('zenrows_static', 'zenrows_js'):
-                    return index, combined_data, None, None, diagnostics, attempt
-                diagnostics.append({
-                    'stage': 'zenrows_recovery_invalid_source',
-                    'product': product,
-                    'message': f'unexpected recovery source={source}',
-                    'recovery_attempt': attempt,
-                })
-                error = RuntimeError(f'unexpected recovery source={source}')
-                reason = 'invalid_recovery_source'
-
-            last_error = error
-            last_reason = reason or self._parallel_miss_reason(attempt_diagnostics) or last_reason
-            if attempt < self.zenrows_recovery_attempts:
-                time.sleep(random.uniform(0.25, 0.75))
-
-        return index, None, last_error, last_reason, diagnostics, self.zenrows_recovery_attempts
-
     def _parallel_miss_reason(self, diagnostics):
         stages = [
             str(item.get('stage') or '')
@@ -988,10 +1013,9 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if examples:
             print(f"[INFO] {label} examples: {' | '.join(examples)}")
 
-    def collect_detail_next_data_parallel(self, indexed_products):
+    def _collect_detail_initial_parallel(self, indexed_products):
         if not indexed_products:
-            self.parallel_miss_reasons = {}
-            return {}
+            return {}, {}, {}
 
         workers = min(self.detail_next_data_workers, len(indexed_products))
         products = [product for _, product in indexed_products]
@@ -1034,6 +1058,89 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         self._print_parallel_miss_summary('NextData parallel MISS', initial_misses)
 
         if initial_misses:
+            retry_workers = min(self.detail_next_data_workers, len(initial_misses))
+            retry_misses = {}
+            print(
+                f"[INFO] Immediate detail retry: {len(initial_misses)} products, "
+                f"workers={retry_workers}, attempts=1"
+            )
+            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._crawl_detail_next_data_worker,
+                        index,
+                        entry.get('product') or {},
+                        mst_specs,
+                    ): (index, entry)
+                    for index, entry in initial_misses.items()
+                }
+                for future in as_completed(future_map):
+                    index, initial_entry = future_map[future]
+                    product = initial_entry.get('product') or {}
+                    try:
+                        (
+                            result_index,
+                            combined_data,
+                            error,
+                            reason,
+                            retry_diagnostics,
+                        ) = future.result()
+                    except Exception as e:
+                        result_index = index
+                        combined_data = None
+                        error = e
+                        reason = 'worker_exception'
+                        retry_diagnostics = [{
+                            'stage': 'worker_exception',
+                            'product': product,
+                            'message': str(e),
+                        }]
+
+                    if combined_data:
+                        results[result_index] = combined_data
+                        continue
+
+                    diagnostics = list(initial_entry.get('diagnostics') or [])
+                    for diagnostic in retry_diagnostics or []:
+                        enriched = dict(diagnostic)
+                        enriched['immediate_retry'] = 1
+                        diagnostics.append(enriched)
+                    final_reason = (
+                        reason
+                        or self._parallel_miss_reason(retry_diagnostics)
+                        or initial_entry.get('reason')
+                        or 'unknown'
+                    )
+                    retry_misses[result_index] = {
+                        'product': product,
+                        'reason': final_reason,
+                        'diagnostics': diagnostics,
+                        'error': error,
+                    }
+
+            recovered_count = len(initial_misses) - len(retry_misses)
+            initial_misses = retry_misses
+            print(
+                f"[INFO] Immediate detail retry result: "
+                f"{recovered_count} recovered, remaining={len(initial_misses)}"
+            )
+            self._print_parallel_miss_summary(
+                'Immediate detail retry MISS',
+                initial_misses,
+            )
+
+        return results, initial_misses, mst_specs
+
+    def collect_detail_next_data_parallel(self, indexed_products):
+        if not indexed_products:
+            self.parallel_miss_reasons = {}
+            return {}
+
+        results, initial_misses, mst_specs = self._collect_detail_initial_parallel(
+            indexed_products
+        )
+
+        if initial_misses:
             recovered, unresolved = self.collect_detail_zenrows_recovery_parallel(
                 initial_misses,
                 mst_specs,
@@ -1069,68 +1176,116 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not misses:
             return {}, {}
 
-        workers = min(self.zenrows_recovery_workers, len(misses))
         recovered = {}
-        unresolved = {}
+        pending = {
+            index: {
+                'product': entry.get('product') or {},
+                'reason': entry.get('reason') or 'unknown',
+                'diagnostics': list(entry.get('diagnostics') or []),
+                'error': entry.get('error'),
+            }
+            for index, entry in misses.items()
+        }
         print(
             f"[INFO] ZenRows MISS recovery queue: {len(misses)} products, "
-            f"workers={workers}, attempts={self.zenrows_recovery_attempts}"
+            f"workers={min(self.zenrows_recovery_workers, len(misses))}, "
+            f"rounds={self.zenrows_recovery_attempts}"
         )
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    self._crawl_detail_zenrows_recovery_worker,
-                    index,
-                    entry.get('product') or {},
-                    mst_specs,
-                    entry.get('reason'),
-                ): (index, entry)
-                for index, entry in misses.items()
-            }
-            for future in as_completed(future_map):
-                index, initial_entry = future_map[future]
-                product = initial_entry.get('product') or {}
-                try:
-                    (
-                        result_index,
-                        combined_data,
-                        error,
-                        reason,
-                        recovery_diagnostics,
-                        attempts,
-                    ) = future.result()
-                except Exception as e:
-                    result_index = index
-                    combined_data = None
-                    error = e
-                    reason = 'worker_exception'
-                    attempts = self.zenrows_recovery_attempts
-                    recovery_diagnostics = [{
-                        'stage': 'worker_exception',
-                        'product': product,
-                        'message': str(e),
-                    }]
+        for attempt in range(1, self.zenrows_recovery_attempts + 1):
+            if not pending:
+                break
 
-                if combined_data:
-                    recovered[result_index] = combined_data
-                    print(
-                        f"[INFO] ZenRows recovery HIT: #{result_index} "
-                        f"item={combined_data.get('item') or '-'} "
-                        f"source={combined_data.get('_detail_source')} "
-                        f"attempt={attempts}"
-                    )
-                    continue
+            round_size = len(pending)
+            workers = min(self.zenrows_recovery_workers, round_size)
+            round_unresolved = {}
+            round_recovered = 0
+            print(
+                f"[INFO] ZenRows recovery round {attempt}/"
+                f"{self.zenrows_recovery_attempts}: "
+                f"products={round_size}, workers={workers}"
+            )
 
-                diagnostics = list(initial_entry.get('diagnostics') or [])
-                diagnostics.extend(recovery_diagnostics or [])
-                final_reason = reason or self._parallel_miss_reason(diagnostics)
-                unresolved[result_index] = {
-                    'product': product,
-                    'reason': final_reason,
-                    'diagnostics': diagnostics,
-                    'error': error,
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._crawl_detail_next_data_worker,
+                        index,
+                        entry.get('product') or {},
+                        mst_specs,
+                        True,
+                    ): (index, entry)
+                    for index, entry in pending.items()
                 }
+                for future in as_completed(future_map):
+                    index, initial_entry = future_map[future]
+                    product = initial_entry.get('product') or {}
+                    try:
+                        (
+                            result_index,
+                            combined_data,
+                            error,
+                            reason,
+                            recovery_diagnostics,
+                        ) = future.result()
+                    except Exception as e:
+                        result_index = index
+                        combined_data = None
+                        error = e
+                        reason = 'worker_exception'
+                        recovery_diagnostics = [{
+                            'stage': 'worker_exception',
+                            'product': product,
+                            'message': str(e),
+                        }]
+
+                    source = combined_data.get('_detail_source') if combined_data else None
+                    if combined_data and source not in ('zenrows_static', 'zenrows_js'):
+                        recovery_diagnostics = list(recovery_diagnostics or [])
+                        recovery_diagnostics.append({
+                            'stage': 'zenrows_recovery_invalid_source',
+                            'product': product,
+                            'message': f'unexpected recovery source={source}',
+                        })
+                        combined_data = None
+                        error = RuntimeError(f'unexpected recovery source={source}')
+                        reason = 'invalid_recovery_source'
+
+                    if combined_data:
+                        recovered[result_index] = combined_data
+                        round_recovered += 1
+                        print(
+                            f"[INFO] ZenRows recovery HIT: #{result_index} "
+                            f"item={combined_data.get('item') or '-'} "
+                            f"source={source} round={attempt}"
+                        )
+                        continue
+
+                    diagnostics = list(initial_entry.get('diagnostics') or [])
+                    for diagnostic in recovery_diagnostics or []:
+                        enriched = dict(diagnostic)
+                        enriched['recovery_attempt'] = attempt
+                        diagnostics.append(enriched)
+                    final_reason = (
+                        reason
+                        or self._parallel_miss_reason(recovery_diagnostics)
+                        or initial_entry.get('reason')
+                        or 'unknown'
+                    )
+                    round_unresolved[result_index] = {
+                        'product': product,
+                        'reason': final_reason,
+                        'diagnostics': diagnostics,
+                        'error': error,
+                    }
+
+            pending = round_unresolved
+            print(
+                f"[INFO] ZenRows recovery round {attempt} result: "
+                f"recovered={round_recovered}, remaining={len(pending)}"
+            )
+            if pending and attempt < self.zenrows_recovery_attempts:
+                time.sleep(random.uniform(0.5, 1.5))
 
         print(
             f"[INFO] ZenRows MISS recovery result: "
@@ -1138,9 +1293,9 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         )
         self._print_parallel_miss_summary(
             'ZenRows recovery unresolved',
-            unresolved,
+            pending,
         )
-        return recovered, unresolved
+        return recovered, pending
 
     def _apply_fast_artifacts(self, combined_data):
         if not combined_data:
@@ -1685,24 +1840,28 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return self.collect_detail_next_data_parallel([(1, product)]).get(1)
 
         mst_specs = self.load_mst_specs_cache([product])
-        (
-            _,
-            combined_data,
-            error,
-            reason,
-            diagnostics,
-            _,
-        ) = self._crawl_detail_zenrows_recovery_worker(
-            1,
-            product,
+        misses = {
+            1: {
+                'product': product,
+                'reason': 'zenrows_recovery_requested',
+                'diagnostics': [],
+                'error': None,
+            }
+        }
+        recovered, unresolved = self.collect_detail_zenrows_recovery_parallel(
+            misses,
             mst_specs,
-            'zenrows_recovery_requested',
         )
+        combined_data = recovered.get(1)
         if combined_data:
             return combined_data
 
+        unresolved_entry = unresolved.get(1) or misses[1]
+        diagnostics = unresolved_entry.get('diagnostics') or []
+        error = unresolved_entry.get('error')
+        reason = unresolved_entry.get('reason') or 'unknown'
         message = self._parallel_miss_message(diagnostics)
-        detail = f"reason={reason or 'unknown'}"
+        detail = f"reason={reason}"
         if message:
             detail = f"{detail}; {message}"
         if error and not message:
