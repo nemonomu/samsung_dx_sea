@@ -56,6 +56,7 @@ from walmart.tv.wmart_tv_next_data import (
     parse_discount_type_from_html,
     parse_review_page,
     product_scope_query_params,
+    repair_similar_text_encoding,
     review_response_scope_error,
 )
 
@@ -664,7 +665,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
     @staticmethod
     def _normalize_similar_value(value):
-        text = str(value or '').strip()
+        text = str(repair_similar_text_encoding(value) or '').strip()
         if not text:
             return None
         polluted_patterns = (
@@ -689,7 +690,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         }
         names = []
         seen = set()
-        for part in str(value).split(' ||| '):
+        for part in text.split(' ||| '):
             name = ' '.join(part.split())
             if not name:
                 continue

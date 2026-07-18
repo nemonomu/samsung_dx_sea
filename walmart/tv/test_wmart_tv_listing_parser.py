@@ -6,6 +6,8 @@ from walmart.tv.wmart_tv_next_data import (
     normalize_availability_value,
     parse_listing_card_element,
     parse_listing_products,
+    parse_similar_product_names,
+    repair_similar_text_encoding,
 )
 
 
@@ -159,6 +161,52 @@ class ListingHtmlParserTests(unittest.TestCase):
         self.assertIsNone(row['pick_up_availability'])
         self.assertIsNone(row['fastest_delivery'])
         self.assertIsNone(row['delivery_availability'])
+
+
+class SimilarEncodingRepairTests(unittest.TestCase):
+    def test_repairs_confirmed_right_quote_mojibake(self):
+        polluted = 'Sony 55\u00e2\u20ac\u009d class BRAVIA 7'
+        self.assertEqual(
+            repair_similar_text_encoding(polluted),
+            'Sony 55\u201d class BRAVIA 7',
+        )
+
+    def test_preserves_unrelated_unicode_exactly(self):
+        clean = 'Bang & Olufsen Beovision \u2013 CanvasTV\u2122 65\u201d'
+        self.assertEqual(repair_similar_text_encoding(clean), clean)
+
+    def test_repairs_before_similar_name_deduplication(self):
+        next_data = {
+            'props': {
+                'pageProps': {
+                    'initialData': {
+                        'contentLayout': {
+                            'modules': [{
+                                'type': 'ItemCarousel',
+                                'configs': {
+                                    'title': 'Similar items you might like',
+                                    'products': [
+                                        {
+                                            'usItemId': '200',
+                                            'name': 'Sony 55\u00e2\u20ac\u009d class BRAVIA 7',
+                                        },
+                                        {
+                                            'usItemId': '200',
+                                            'name': 'Sony 55\u201d class BRAVIA 7',
+                                        },
+                                    ],
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        self.assertEqual(
+            parse_similar_product_names(next_data, current_item='100'),
+            'Sony 55\u201d class BRAVIA 7',
+        )
 
 
 if __name__ == '__main__':

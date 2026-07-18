@@ -1187,6 +1187,18 @@ SIMILAR_UUID_IMAGE_RE = re.compile(
     r"(?:\.[0-9a-f]+)?\.(?:jpe?g|png|webp|gif|avif)$",
     re.I,
 )
+SIMILAR_MOJIBAKE_REPLACEMENTS = (
+    ("\u00e2\u20ac\u009d", "\u201d"),
+)
+
+
+def repair_similar_text_encoding(value):
+    if value is None:
+        return None
+    text = str(value)
+    for polluted, repaired in SIMILAR_MOJIBAKE_REPLACEMENTS:
+        text = text.replace(polluted, repaired)
+    return text
 
 
 def _similar_product_item_id(node):
@@ -1200,7 +1212,9 @@ def _similar_product_item_id(node):
 
 
 def _similar_product_name(node):
-    name = collapse_ws(node.get("name") or node.get("title") or node.get("productName"))
+    name = collapse_ws(repair_similar_text_encoding(
+        node.get("name") or node.get("title") or node.get("productName")
+    ))
     if not name:
         return None
     lower = name.lower()
@@ -1255,7 +1269,7 @@ def _join_unique_similar_names(pairs, current_item=None, limit=30):
     current_item = str(current_item) if current_item else None
     for item, name in pairs:
         item = str(item).strip() if item is not None else None
-        name = collapse_ws(name)
+        name = collapse_ws(repair_similar_text_encoding(name))
         if not name or not item or (current_item and item == current_item):
             continue
         key = (item, name.lower())

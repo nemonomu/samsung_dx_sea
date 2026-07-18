@@ -791,6 +791,17 @@ class DetailSaveGuardTests(unittest.TestCase):
         self.assertIsNone(saved_rows[0]['original_sku_price'])
         self.assertIsNone(saved_rows[0]['savings'])
 
+    def test_similar_normalizer_repairs_encoding_before_db_write(self):
+        value = (
+            'Sony 55\u00e2\u20ac\u009d class BRAVIA 7 ||| '
+            'Bang & Olufsen Beovision \u2013 CanvasTV\u2122'
+        )
+        self.assertEqual(
+            bare_crawler()._normalize_similar_value(value),
+            'Sony 55\u201d class BRAVIA 7 ||| '
+            'Bang & Olufsen Beovision \u2013 CanvasTV\u2122',
+        )
+
     def test_listing_fallback_never_writes_item_mst(self):
         crawler = bare_crawler()
         saved_rows = []
