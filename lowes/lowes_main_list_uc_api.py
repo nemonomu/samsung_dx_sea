@@ -50,6 +50,9 @@ API_RETRY_STATUS_CODES = {
     if value.strip()
 }
 STORE_SEED_TIMEOUT_SECONDS = float(os.getenv("LOWES_UC_STORE_SEED_TIMEOUT_SECONDS", "45"))
+SESSION_MAX_ATTEMPTS = max(1, int(os.getenv("LOWES_UC_SESSION_MAX_ATTEMPTS", "3")))
+SESSION_RETRY_SLEEP_SECONDS = float(os.getenv("LOWES_UC_SESSION_RETRY_SLEEP_SECONDS", "60"))
+FAILED_PAGES_RETRY_PASSES = max(0, int(os.getenv("LOWES_UC_FAILED_PAGES_RETRY_PASSES", "1")))
 USER_DATA_DIR = os.getenv("LOWES_UC_USER_DATA_DIR", "").strip()
 PROFILE_DIR = os.getenv("LOWES_UC_PROFILE_DIR", "").strip()
 SET_STORE_COOKIES = os.getenv("LOWES_SET_STORE_COOKIES", "0").strip().lower() not in {"0", "false", "no"}
@@ -269,11 +272,12 @@ def fetch_api(driver, url):
     return driver.execute_async_script(script, url, API_WAIT_SECONDS * 1000)
 
 
-def collect_pages(driver, tasks, logger):
+def collect_pages(driver, tasks, logger, reset_benchmark=True):
     results = []
     adjusted_next_offset = None
     last_page_count = None
-    reset_main_benchmark_csv(MAIN_PROGRESS_CSV)
+    if reset_benchmark:
+        reset_main_benchmark_csv(MAIN_PROGRESS_CSV)
     run_started = time.time()
     run_started_at = datetime.now().isoformat(timespec="seconds")
     completed = 0
@@ -485,6 +489,69 @@ def wait_for_search_ready(driver, logger):
     return False
 
 
+def quit_driver(driver, logger):
+    try:
+        driver.quit()
+    except Exception as exc:
+        logger.write(f"WARN  driver quit failed: {exc}")
+
+
+def launch_search_session(logger):
+    # Akamai flags individual browser sessions, not the machine: once the search
+    # page shows Access Denied every request from that session (including the
+    # in-page API fetches) gets the cached 403, so the only recovery is a fresh
+    # browser, not more retries in the same one.
+    search_url = build_search_url()
+    driver = None
+    for session_attempt in range(1, SESSION_MAX_ATTEMPTS + 1):
+        driver = launch_driver(logger)
+        try:
+            seed_store_cookies(driver, logger)
+            logger.write(f"OPEN  {search_url} session_attempt={session_attempt}/{SESSION_MAX_ATTEMPTS}")
+            driver.get(search_url)
+            time.sleep(BOOT_WAIT_SECONDS)
+            ready = wait_for_search_ready(driver, logger)
+        except WebDriverException as exc:
+            logger.write(f"WARN  session open failed: {exc}")
+            ready = False
+        try:
+            logger.write(f"READY title={driver.title!r} url={driver.current_url}")
+        except WebDriverException:
+            pass
+        if ready or session_attempt >= SESSION_MAX_ATTEMPTS:
+            if not ready:
+                logger.write("WARN  search ready failed after all session attempts; continue with current session")
+            return driver
+        quit_driver(driver, logger)
+        sleep_seconds = SESSION_RETRY_SLEEP_SECONDS * session_attempt
+        logger.write(f"RELAUNCH session in {sleep_seconds:g}s (search page not ready)")
+        time.sleep(sleep_seconds)
+    return driver
+
+
+def collect_pages_with_recovery(session, tasks, logger):
+    results = collect_pages(session["driver"], tasks, logger)
+    for retry_pass in range(1, FAILED_PAGES_RETRY_PASSES + 1):
+        failed_tasks = [
+            (result["page"], result["offset"]) for result in results if result["status_code"] != 200
+        ]
+        if not failed_tasks:
+            break
+        logger.write(
+            f"RECOVER pass={retry_pass}/{FAILED_PAGES_RETRY_PASSES} "
+            f"failed_pages={[page for page, _ in failed_tasks]} relaunch session"
+        )
+        quit_driver(session["driver"], logger)
+        time.sleep(SESSION_RETRY_SLEEP_SECONDS)
+        session["driver"] = launch_search_session(logger)
+        retry_results = collect_pages(session["driver"], failed_tasks, logger, reset_benchmark=False)
+        results_by_page = {result["page"]: result for result in results}
+        for result in retry_results:
+            results_by_page[result["page"]] = result
+        results = [results_by_page[page] for page in sorted(results_by_page)]
+    return results
+
+
 def main():
     make_dirs()
     logger = RunLogger(RUN_ROOT / "logs/run.log")
@@ -499,21 +566,16 @@ def main():
         f"SEARCH_TERM={SEARCH_TERM} pages={pages} page_size={PAGE_SIZE} "
         f"boot_wait_seconds={BOOT_WAIT_SECONDS} ready_timeout_seconds={READY_TIMEOUT_SECONDS} "
         f"api_wait_seconds={API_WAIT_SECONDS} api_attempts={API_MAX_ATTEMPTS} "
-        f"api_retry_sleep_seconds={API_RETRY_SLEEP_SECONDS} page_sleep_seconds={API_PAGE_SLEEP_SECONDS}"
+        f"api_retry_sleep_seconds={API_RETRY_SLEEP_SECONDS} page_sleep_seconds={API_PAGE_SLEEP_SECONDS} "
+        f"session_attempts={SESSION_MAX_ATTEMPTS} session_retry_sleep_seconds={SESSION_RETRY_SLEEP_SECONDS} "
+        f"failed_pages_retry_passes={FAILED_PAGES_RETRY_PASSES}"
     )
 
-    driver = launch_driver(logger)
+    session = {"driver": launch_search_session(logger)}
     try:
-        seed_store_cookies(driver, logger)
-        search_url = build_search_url()
-        logger.write(f"OPEN  {search_url}")
-        driver.get(search_url)
-        time.sleep(BOOT_WAIT_SECONDS)
-        wait_for_search_ready(driver, logger)
-        logger.write(f"READY title={driver.title!r} url={driver.current_url}")
-        fetch_results = collect_pages(driver, tasks, logger)
+        fetch_results = collect_pages_with_recovery(session, tasks, logger)
     finally:
-        driver.quit()
+        quit_driver(session["driver"], logger)
 
     rows, raw_pages, seen_ids = parse_pages(fetch_results, logger)
     parsed_dir = RUN_ROOT / "parsed"
