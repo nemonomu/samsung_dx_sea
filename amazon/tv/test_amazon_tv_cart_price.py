@@ -6,6 +6,7 @@ from amazon.tv.amazon_tv_cart_price import (
     extract_active_cart_line,
     extract_ewc_cart_line,
     extract_pdp_customer_visible_price,
+    has_generic_see_price_in_cart_message,
     has_hidden_cart_price_message,
     parse_html,
     resolve_hidden_pdp_price,
@@ -31,6 +32,19 @@ LOGGED_OUT_PDP = """
 <html><body><div id="corePriceDisplay_desktop_feature_div">
   <a>See price in cart</a>
 </div></body></html>
+"""
+
+GENERIC_SEE_PRICE_PDP = """
+<html><body>
+  <table class="a-lineitem"><tbody><tr><td>
+    <a class="a-link-normal" href="#">See price in cart</a>
+  </td></tr></tbody></table>
+  <form id="addToCart" action="/gp/product/handle-buy-box/ref=dp_start-bbf_1_glance">
+    <input name="items[0.base][customerVisiblePrice][displayString]"
+           value="$2,997.95">
+    <input name="items[0.base][asin]" value="B0DXMZQ3MN">
+  </form>
+</body></html>
 """
 
 EWC_HTML = """
@@ -80,6 +94,22 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
 
     def test_generic_logged_out_message_does_not_match(self):
         self.assertFalse(has_hidden_cart_price_message(parse_html(LOGGED_OUT_PDP)))
+
+    def test_generic_see_price_state_is_scoped_to_pdp_price_table(self):
+        self.assertTrue(
+            has_generic_see_price_in_cart_message(
+                parse_html(GENERIC_SEE_PRICE_PDP)
+            )
+        )
+        self.assertFalse(
+            has_generic_see_price_in_cart_message(parse_html(LOGGED_OUT_PDP))
+        )
+        self.assertEqual(
+            resolve_hidden_pdp_price(
+                parse_html(GENERIC_SEE_PRICE_PDP), "B0DXMZQ3MN", None
+            ),
+            ("$2,997.95", True),
+        )
 
     def test_ewc_price_is_scoped_to_exact_asin(self):
         line = extract_ewc_cart_line(parse_html(EWC_HTML), "B0DXMZQ3MN")

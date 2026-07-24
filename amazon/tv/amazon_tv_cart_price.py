@@ -17,6 +17,7 @@ HIDDEN_CART_PRICE_MESSAGE = (
     "to see our price, add this item to your cart. "
     "you can always remove it later."
 )
+GENERIC_SEE_PRICE_IN_CART_MESSAGE = "see price in cart"
 
 
 class CartPriceParseError(ValueError):
@@ -69,6 +70,20 @@ def has_hidden_cart_price_message(tree):
     for node in nodes:
         text = " ".join(node.text_content().split()).casefold()
         if HIDDEN_CART_PRICE_MESSAGE in text:
+            return True
+    return False
+
+
+def has_generic_see_price_in_cart_message(tree):
+    """Detect the exact generic hidden-price label in the PDP price table."""
+    nodes = tree.xpath(
+        "//table["
+        "contains(concat(' ', normalize-space(@class), ' '), ' a-lineitem ')"
+        "]//a"
+    )
+    for node in nodes:
+        text = " ".join(node.text_content().split()).casefold()
+        if text == GENERIC_SEE_PRICE_IN_CART_MESSAGE:
             return True
     return False
 
@@ -128,12 +143,16 @@ def extract_pdp_customer_visible_price(tree, asin):
 def resolve_hidden_pdp_price(tree, asin, current_price):
     """Use the exact-ASIN PDP form price only for a hidden-price PDP state.
 
-    Returns ``(price, used_fallback)``. A normal dollar price is preserved,
-    and unavailable or generic logged-out states are not replaced.
+    Returns ``(price, used_fallback)``. A normal dollar price is preserved.
+    Long-form and exact price-table ``See price in cart`` states are eligible;
+    unavailable and unrelated page text are not replaced.
     """
     if current_price and "$" in str(current_price):
         return current_price, False
-    if not has_hidden_cart_price_message(tree):
+    if not (
+        has_hidden_cart_price_message(tree)
+        or has_generic_see_price_in_cart_message(tree)
+    ):
         return current_price, False
     hidden_price = extract_pdp_customer_visible_price(tree, asin)
     if hidden_price is None:
