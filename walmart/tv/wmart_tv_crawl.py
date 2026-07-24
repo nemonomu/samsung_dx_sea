@@ -101,6 +101,7 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     detail_report = detail_report or {}
     redirects = detail_report.get('redirects') or []
     run_errors = detail_report.get('run_errors') or []
+    review_mismatches = detail_report.get('review_mismatches') or []
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -122,7 +123,9 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     unsaved_records = max(target_records - saved_records, 0)
     missing_detail_records = max(target_records - detail_records, 0)
     detail_blocked = missing_detail_records > 0
-    has_warning = bool(redirects or run_errors or detail_blocked)
+    has_warning = bool(
+        redirects or run_errors or review_mismatches or detail_blocked
+    )
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
     lines = [
@@ -157,6 +160,18 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
             lines.append(
                 f"  - stage={item.get('stage')} url={item.get('url') or ''} "
                 f"message={item.get('message')}"
+            )
+    if review_mismatches:
+        lines.append(
+            "- 상품페이지 리뷰 수와 수집 리뷰 본문 수 불일치: "
+            f"{len(review_mismatches)}건"
+        )
+        for item in review_mismatches[:20]:
+            lines.append(
+                f"  - PDP reviews={item.get('pdp_review_count')}, "
+                f"expected bodies={item.get('expected_review_bodies')}, "
+                f"collected bodies={item.get('collected_review_bodies')} "
+                f"url={item.get('url') or ''}"
             )
     if redirects:
         lines.append(f"- redirects: {len(redirects)}")

@@ -298,6 +298,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             'target_records': 0,
             'detail_records': 0,
             'saved_records': 0,
+            'review_mismatches': [],
             'redirects': [],
             'run_errors': [],
         }
@@ -1342,6 +1343,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not combined_data:
             return False
 
+        review_mismatch = combined_data.pop('_review_mismatch', None)
         self._apply_fast_artifacts(combined_data)
         raw_star_rating = ' '.join(str(combined_data.get('star_rating') or '').split())
         raw_star_match = re.search(r'\d+(?:\.(\d+))?', raw_star_rating)
@@ -1414,21 +1416,15 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 )
                 return False
 
-        expected_review_count = min(review_total, 20)
-        collected_review_count = self._formatted_review_count(
-            combined_data.get('detailed_review_content')
-        )
-        if expected_review_count > collected_review_count:
-            print(
-                f"  [SAVE SKIP] detailed reviews incomplete: item={item}, "
-                f"expected={expected_review_count}, collected={collected_review_count}"
-            )
-            return False
-
         if not self.upsert_item_mst(combined_data):
             print(f"  [SAVE SKIP] tv_item_mst write failed: item={item}")
             return False
-        return self.save_to_retail_com(combined_data)
+        saved = self.save_to_retail_com(combined_data)
+        if saved and review_mismatch:
+            self.detail_report.setdefault('review_mismatches', []).append(
+                review_mismatch
+            )
+        return saved
 
     def collect_reviews_next_data(
         self,
@@ -1481,7 +1477,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             last_page = required_pages + extra_page_limit if total >= 20 else required_pages
             return expected, required_pages, last_page
 
-        review_total_hint = review_total if review_total is not None and review_total > 0 else 1
+        review_total_hint = review_total if review_total is not None else 1
         expected_review_count, page_limit, max_page = review_limits(review_total_hint)
 
         page_number = 1
@@ -1531,14 +1527,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     and bool(parsed_star_rating)
                 )
                 if not parsed_summary_complete:
-                    last_reason = (
+                    summary_message = (
                         "review response summary incomplete: "
                         f"reviews={parsed.get('total_review_count')}, "
                         f"rating={parsed.get('star_rating')}, "
                         f"ratings={parsed.get('count_of_star_ratings')}"
                     )
-                    fatal_scope_error = last_reason
-                    continue
+                    if log:
+                        print(f"  [NEXT_DATA review INFO] {summary_message}; PDP summary preserved")
 
                 parsed_summary_key = (
                     parsed_review_total,
@@ -1558,36 +1554,55 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                         current_star_rating.lower(),
                         current_rating_total,
                     )
-                    if current_summary_complete and current_summary_key != parsed_summary_key:
-                        last_reason = (
+                    if (
+                        current_summary_complete
+                        and parsed_summary_complete
+                        and current_summary_key != parsed_summary_key
+                    ):
+                        summary_message = (
                             "PDP/review summary mismatch: "
                             f"pdp={current_summary_key}, review={parsed_summary_key}, "
                             f"scope={scope_params or '{}'}"
                         )
-                        fatal_scope_error = last_reason
-                        continue
+                        if log:
+                            print(f"  [NEXT_DATA review INFO] {summary_message}; PDP summary preserved")
 
-                    review_summary = {
+                    fallback_summary = {
                         'count_of_reviews': parsed.get('total_review_count'),
                         'star_rating': parsed.get('star_rating'),
                         'count_of_star_ratings': parsed.get('count_of_star_ratings'),
                     }
-                    review_total = parsed_review_total
-                    expected_review_count, page_limit, max_page = review_limits(review_total)
+                    for field_name, fallback_value in fallback_summary.items():
+                        if review_summary.get(field_name) in (None, '') and fallback_value not in (None, ''):
+                            review_summary[field_name] = fallback_value
+
+                    if review_total is None:
+                        review_total = normalize_int(review_summary.get('count_of_reviews'))
+                        if review_total is not None:
+                            expected_review_count, page_limit, max_page = review_limits(review_total)
                 else:
                     accepted_summary_key = (
                         normalize_int(review_summary.get('count_of_reviews')),
                         str(review_summary.get('star_rating') or '').strip().lower(),
                         normalize_int(review_summary.get('count_of_star_ratings')),
                     )
-                    if accepted_summary_key != parsed_summary_key:
-                        last_reason = (
+                    accepted_summary_complete = (
+                        accepted_summary_key[0] is not None
+                        and bool(accepted_summary_key[1])
+                        and accepted_summary_key[2] is not None
+                    )
+                    if (
+                        accepted_summary_complete
+                        and parsed_summary_complete
+                        and accepted_summary_key != parsed_summary_key
+                    ):
+                        summary_message = (
                             "review page summary mismatch: "
                             f"page1={accepted_summary_key}, page{page_number}={parsed_summary_key}, "
                             f"scope={scope_params or '{}'}"
                         )
-                        fatal_scope_error = last_reason
-                        continue
+                        if log:
+                            print(f"  [NEXT_DATA review INFO] {summary_message}; PDP summary preserved")
 
                 if review_total == 0:
                     page_added = True
@@ -1630,8 +1645,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not complete:
             message = f'expected {expected_review_count} reviews from {review_total}, collected {collected_reviews}'
             if log:
-                print(f"  [NEXT_DATA review WARNING] {message}")
-            add_error('review_next_data_incomplete', message)
+                print(f"  [NEXT_DATA review PARTIAL] {message}; available reviews will be saved")
 
         return detailed_review_content, review_summary, complete
 
@@ -1760,16 +1774,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 log=log,
             )
             if not review_complete:
-                add_diagnostic(
-                    'detail_next_data_review_incomplete',
-                    f"item={item}, expected={parsed.get('count_of_reviews')}, collected={self._formatted_review_count(detailed_review_content)}",
-                )
                 if log:
                     print(
-                        f"  [NEXT_DATA detail] review incomplete for item={item}; "
-                        "ZenRows recovery required"
+                        f"  [NEXT_DATA detail] partial review bodies accepted for item={item}; "
+                        f"pdp_reviews={parsed.get('count_of_reviews')}, "
+                        f"collected={self._formatted_review_count(detailed_review_content)}"
                     )
-                return None
 
             parsed.update(review_summary)
             self._fill_similar_from_json_response(parsed, url, item, client, log=log)
@@ -1796,6 +1806,21 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'detailed_review_content': detailed_review_content,
                 '_detail_source': source,
             })
+
+            pdp_review_total = normalize_int(parsed.get('count_of_reviews'))
+            collected_review_count = self._formatted_review_count(
+                detailed_review_content
+            )
+            if pdp_review_total is not None:
+                expected_review_count = min(pdp_review_total, 20)
+                if collected_review_count < expected_review_count:
+                    combined_data['_review_mismatch'] = {
+                        'item': item,
+                        'url': product.get('product_url') or url,
+                        'pdp_review_count': pdp_review_total,
+                        'expected_review_bodies': expected_review_count,
+                        'collected_review_bodies': collected_review_count,
+                    }
 
             extracted_sku = brand_sku or page_sku
             extracted_screen_size = name_screen_size or page_screen_size
