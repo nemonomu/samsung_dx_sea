@@ -5,7 +5,7 @@ Safety properties:
 - no review collection;
 - no automatic Add-to-Cart retry;
 - no automatic protection-plan selection;
-- exact-ASIN cart lookup only;
+- exact-ASIN+merchant production cart lookup;
 - an existing cart item is read without changing its quantity;
 - a newly added item is intentionally kept in the crawler account cart.
 
@@ -38,9 +38,11 @@ from amazon.tv.amazon_tv_cart_price import (
     CartPriceParseError,
     active_cart_total_count,
     extract_active_cart_line,
+    extract_active_cart_offer_line,
     extract_ewc_cart_line,
     extract_pdp_customer_visible_price,
-    has_hidden_cart_price_message,
+    extract_pdp_offer_identity,
+    is_hidden_pdp_price_state,
     normalize_asin,
     parse_html,
     resolve_hidden_pdp_price,
@@ -264,7 +266,7 @@ def _wait_for_ewc_line(page, asin, timeout_seconds=15):
     return None
 
 
-def _load_active_cart(crawler, asin):
+def _load_active_cart(crawler, asin, merchant_id=None):
     from amazon.tv.amazon_login import is_amazon_login_verified_dp
 
     crawler.page.get(CART_URL)
@@ -272,10 +274,12 @@ def _load_active_cart(crawler, asin):
     if not is_amazon_login_verified_dp(crawler.page):
         raise RuntimeError("Amazon login was not verified on the cart page")
     tree = _tree(crawler.page)
-    return (
-        extract_active_cart_line(tree, asin),
-        active_cart_total_count(tree),
+    line = (
+        extract_active_cart_offer_line(tree, asin, merchant_id)
+        if merchant_id
+        else extract_active_cart_line(tree, asin)
     )
+    return line, active_cart_total_count(tree)
 
 
 def run_cart_inspection(asin):
@@ -359,6 +363,68 @@ def run_pdp_price_inspection(asin, product_url):
                 print(f"[SMOKE WARNING] Browser cleanup failed: {exc}")
 
 
+def run_production_cart_resolver(asin, product_url):
+    """Exercise the production cart resolver without DB or review actions."""
+    from amazon.tv.amazon_login import is_amazon_login_verified_dp
+
+    crawler = _new_crawler("production_resolver")
+    try:
+        _setup_logged_in_browser(crawler)
+        asin = normalize_asin(asin)
+        crawler.page.get(product_url)
+        time.sleep(2)
+        if not is_amazon_login_verified_dp(crawler.page):
+            raise RuntimeError("Amazon login was not verified on the PDP")
+        loaded_asin = crawler.extract_item(crawler.page.url)
+        if loaded_asin != asin:
+            raise RuntimeError(
+                f"PDP ASIN mismatch: expected={asin}, loaded={loaded_asin}"
+            )
+
+        tree = _save_state(crawler, "production_resolver_before", asin)
+        price, used, source, restored_tree, resolution = (
+            crawler.resolve_hidden_price_from_cart(
+                tree,
+                asin,
+                product_url,
+                None,
+            )
+        )
+        if not used or not price or not source:
+            raise RuntimeError(
+                "production cart resolver did not return an exact cart price"
+            )
+        if not resolution or resolution.get("item") != asin:
+            raise RuntimeError("production cart resolver report is missing")
+        restored_offer = extract_pdp_offer_identity(restored_tree, asin)
+        if restored_offer is None:
+            raise RuntimeError("restored PDP offer identity was not found")
+        print(
+            f"[SMOKE PRODUCTION PASS] asin={asin}, "
+            f"merchant={restored_offer.merchant_id}, price={price}, "
+            f"source={source}"
+        )
+        print(
+            "[SMOKE] Production resolver used no database, reviews, Delete, "
+            "or quantity-decrease action."
+        )
+        return True
+    except Exception as exc:
+        print(f"[SMOKE PRODUCTION FAIL] {type(exc).__name__}: {exc}")
+        if crawler.page:
+            try:
+                _save_state(crawler, "production_resolver_failure", asin)
+            except Exception:
+                pass
+        return False
+    finally:
+        if crawler.page:
+            try:
+                crawler.page.quit()
+            except Exception as exc:
+                print(f"[SMOKE WARNING] Browser cleanup failed: {exc}")
+
+
 def run_smoke(asin, product_url):
     from amazon.tv.amazon_login import is_amazon_login_verified_dp
 
@@ -369,11 +435,34 @@ def run_smoke(asin, product_url):
         _setup_logged_in_browser(crawler)
         asin = normalize_asin(asin)
 
-        before_line, before_total = _load_active_cart(crawler, asin)
+        crawler.page.get(product_url)
+        time.sleep(2)
+        if not is_amazon_login_verified_dp(crawler.page):
+            raise RuntimeError("Amazon login was not verified on the PDP")
+        loaded_asin = crawler.extract_item(crawler.page.url)
+        if loaded_asin != asin:
+            raise RuntimeError(
+                f"PDP ASIN mismatch: expected={asin}, loaded={loaded_asin}"
+            )
+        pdp_tree = _tree(crawler.page)
+        if not is_hidden_pdp_price_state(pdp_tree, None):
+            raise RuntimeError("recognized hidden cart-price state was not found")
+        offer = extract_pdp_offer_identity(pdp_tree, asin)
+        if offer is None:
+            raise RuntimeError("exact PDP buy-box offer was not found")
+        print(
+            f"[SMOKE] PDP offer: asin={offer.asin}, "
+            f"merchant={offer.merchant_id}"
+        )
+
+        before_line, before_total = _load_active_cart(
+            crawler, asin, offer.merchant_id
+        )
         print(f"[SMOKE] cart total before: {before_total}")
         if before_line:
             print(
-                f"[SMOKE PASS] existing cart item: asin={before_line.asin}, "
+                f"[SMOKE PASS] existing exact offer: asin={before_line.asin}, "
+                f"merchant={before_line.merchant_id}, "
                 f"quantity={before_line.quantity}, price={before_line.price}, "
                 "action=read-only"
             )
@@ -389,14 +478,18 @@ def run_smoke(asin, product_url):
             raise RuntimeError(
                 f"PDP ASIN mismatch: expected={asin}, loaded={loaded_asin}"
             )
-        if not has_hidden_cart_price_message(_tree(crawler.page)):
-            raise RuntimeError("logged-in hidden cart-price message was not found")
-
-        pdp_price = extract_pdp_customer_visible_price(_tree(crawler.page), asin)
-        print(
-            f"[SMOKE] PDP customer-visible price: asin={asin}, "
-            f"price={pdp_price}"
-        )
+        refreshed_tree = _tree(crawler.page)
+        if not is_hidden_pdp_price_state(refreshed_tree, None):
+            raise RuntimeError("hidden cart-price state changed before Add")
+        refreshed_offer = extract_pdp_offer_identity(refreshed_tree, asin)
+        if refreshed_offer is None:
+            raise RuntimeError("PDP buy-box offer disappeared before Add")
+        if refreshed_offer.merchant_id != offer.merchant_id:
+            raise RuntimeError(
+                "PDP merchant changed before Add: "
+                f"expected={offer.merchant_id}, "
+                f"loaded={refreshed_offer.merchant_id}"
+            )
 
         button = _visible_add_to_cart_button(crawler.page)
         print(f"[SMOKE] Add-to-Cart once: asin={asin}")
@@ -425,11 +518,13 @@ def run_smoke(asin, product_url):
         else:
             print("[SMOKE] EWC not available; verifying through the full cart")
 
-        after_line, after_total = _load_active_cart(crawler, asin)
+        after_line, after_total = _load_active_cart(
+            crawler, asin, offer.merchant_id
+        )
         _save_state(crawler, "cart_after_add", asin)
         if after_line is None:
             raise RuntimeError(
-                "target ASIN was not found in the active cart after one Add "
+                "target ASIN+merchant was not found after one Add "
                 f"(before_total={before_total}, after_total={after_total})"
             )
         if after_line.quantity != 1:
@@ -446,14 +541,9 @@ def run_smoke(asin, product_url):
                 f"EWC/cart price mismatch: "
                 f"ewc={ewc_line.price}, cart={after_line.price}"
             )
-        if pdp_price and pdp_price != after_line.price:
-            raise RuntimeError(
-                f"PDP/cart price mismatch: "
-                f"pdp={pdp_price}, cart={after_line.price}"
-            )
-
         print(
-            f"[SMOKE PASS] newly added cart item: asin={after_line.asin}, "
+            f"[SMOKE PASS] newly added exact offer: asin={after_line.asin}, "
+            f"merchant={after_line.merchant_id}, "
             f"quantity={after_line.quantity}, price={after_line.price}, "
             f"cart_total={after_total}"
         )
@@ -511,12 +601,25 @@ def main():
         action="store_true",
         help="Read the exact-ASIN PDP form price without any cart mutation.",
     )
+    parser.add_argument(
+        "--production-cart-resolver",
+        action="store_true",
+        help=(
+            "Run the production exact-ASIN+merchant cart resolver without "
+            "database or review actions. Requires --live --keep-in-cart."
+        ),
+    )
     args = parser.parse_args()
 
     asin = normalize_asin(args.asin)
     product_url = args.url or f"https://www.amazon.com/dp/{asin}"
     if args.inspect_pdp_price_only:
-        if args.inspect_cart_only or args.live or args.keep_in_cart:
+        if (
+            args.inspect_cart_only
+            or args.production_cart_resolver
+            or args.live
+            or args.keep_in_cart
+        ):
             parser.error(
                 "--inspect-pdp-price-only cannot be combined with cart or "
                 "live mutation flags"
@@ -524,12 +627,20 @@ def main():
         success = run_pdp_price_inspection(asin, product_url)
         raise SystemExit(0 if success else 1)
     if args.inspect_cart_only:
-        if args.live or args.keep_in_cart:
+        if args.production_cart_resolver or args.live or args.keep_in_cart:
             parser.error(
                 "--inspect-cart-only cannot be combined with --live or "
                 "--keep-in-cart"
             )
         success = run_cart_inspection(asin)
+        raise SystemExit(0 if success else 1)
+    if args.production_cart_resolver:
+        if not args.live or not args.keep_in_cart:
+            parser.error(
+                "--production-cart-resolver requires both --live and "
+                "--keep-in-cart"
+            )
+        success = run_production_cart_resolver(asin, product_url)
         raise SystemExit(0 if success else 1)
     if not args.live or not args.keep_in_cart:
         parser.error(

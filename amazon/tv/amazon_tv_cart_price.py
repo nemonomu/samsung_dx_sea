@@ -1,12 +1,14 @@
 """Pure HTML helpers for Amazon TV hidden cart prices.
 
 This module does not navigate Amazon, click elements, or access the database.
-It only parses a supplied PDP/cart HTML document and scopes every cart lookup
-to the exact ASIN requested by the caller.
+It only parses a supplied PDP/cart HTML document and can scope a cart lookup
+to the exact ASIN and merchant requested by the caller.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import re
+from urllib.parse import parse_qs, urlparse
 
 from lxml import html
 
@@ -30,6 +32,14 @@ class CartLine:
     quantity: int
     price: str
     source: str
+    merchant_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PdpOfferIdentity:
+    asin: str
+    merchant_id: str
+    offer_listing_id: str
 
 
 def parse_html(page_html):
@@ -54,6 +64,25 @@ def normalize_money(value):
     if not MONEY_RE.fullmatch(compact):
         raise CartPriceParseError(f"invalid cart price: {value!r}")
     return compact
+
+
+def normalize_amount_money(value):
+    try:
+        amount = Decimal(str(value or "").strip().replace(",", ""))
+    except InvalidOperation as exc:
+        raise CartPriceParseError(
+            f"invalid numeric cart price: {value!r}"
+        ) from exc
+    if amount < 0 or amount.as_tuple().exponent < -2:
+        raise CartPriceParseError(f"invalid numeric cart price: {value!r}")
+    return f"${amount:,.2f}"
+
+
+def normalize_merchant_id(value):
+    merchant_id = str(value or "").strip().upper()
+    if not merchant_id or not re.fullmatch(r"[A-Z0-9]{5,32}", merchant_id):
+        raise CartPriceParseError(f"invalid merchant ID: {value!r}")
+    return merchant_id
 
 
 def has_hidden_cart_price_message(tree):
@@ -88,13 +117,29 @@ def has_generic_see_price_in_cart_message(tree):
     return False
 
 
-def extract_pdp_customer_visible_price(tree, asin):
-    """Extract the exact-ASIN customer-visible price from the PDP buy-box form.
+def hidden_pdp_price_trigger(tree, current_price):
+    """Classify a recognized non-dollar hidden-price PDP state."""
+    if current_price and "$" in str(current_price):
+        return None
 
-    Amazon can render this value in the add-to-cart form even when the visible
-    price area contains only a hidden-price message. Ambiguous forms, ASINs, or
-    prices are rejected instead of guessing.
-    """
+    normalized = " ".join(str(current_price or "").split()).casefold()
+    if GENERIC_SEE_PRICE_IN_CART_MESSAGE in normalized:
+        return "see_price_in_cart"
+    if HIDDEN_CART_PRICE_MESSAGE in normalized:
+        return "to_see_our_price_add_to_cart"
+    if has_generic_see_price_in_cart_message(tree):
+        return "see_price_in_cart"
+    if has_hidden_cart_price_message(tree):
+        return "to_see_our_price_add_to_cart"
+    return None
+
+
+def is_hidden_pdp_price_state(tree, current_price):
+    """Return whether a non-dollar PDP value is a recognized hidden state."""
+    return hidden_pdp_price_trigger(tree, current_price) is not None
+
+
+def _matching_pdp_add_to_cart_form(tree, asin):
     asin = normalize_asin(asin)
     forms = tree.xpath(
         "//form[@id='addToCart' and "
@@ -123,9 +168,60 @@ def extract_pdp_customer_visible_price(tree, asin):
         raise CartPriceParseError(
             f"PDP returned {len(matching)} addToCart forms for ASIN {asin}"
         )
+    return matching[0]
+
+
+def extract_pdp_offer_identity(tree, asin):
+    """Return the exact current buy-box ASIN, merchant, and offer identity."""
+    asin = normalize_asin(asin)
+    form = _matching_pdp_add_to_cart_form(tree, asin)
+    if form is None:
+        return None
+
+    merchant_ids = {
+        normalize_merchant_id(value)
+        for value in form.xpath(".//input[@name='merchantID']/@value")
+        if str(value or "").strip()
+    }
+    if len(merchant_ids) != 1:
+        raise CartPriceParseError(
+            f"PDP returned {len(merchant_ids)} merchants for ASIN {asin}"
+        )
+
+    offer_ids = {
+        str(value or "").strip()
+        for value in form.xpath(
+            ".//input[@name='items[0.base][offerListingId]' "
+            "or @name='offerListingID']/@value"
+        )
+        if str(value or "").strip()
+    }
+    if len(offer_ids) != 1:
+        raise CartPriceParseError(
+            f"PDP returned {len(offer_ids)} offers for ASIN {asin}"
+        )
+
+    return PdpOfferIdentity(
+        asin=asin,
+        merchant_id=next(iter(merchant_ids)),
+        offer_listing_id=next(iter(offer_ids)),
+    )
+
+
+def extract_pdp_customer_visible_price(tree, asin):
+    """Extract the exact-ASIN customer-visible price from the PDP buy-box form.
+
+    Amazon can render this value in the add-to-cart form even when the visible
+    price area contains only a hidden-price message. Ambiguous forms, ASINs, or
+    prices are rejected instead of guessing.
+    """
+    asin = normalize_asin(asin)
+    form = _matching_pdp_add_to_cart_form(tree, asin)
+    if form is None:
+        return None
 
     prices = []
-    for value in matching[0].xpath(
+    for value in form.xpath(
         ".//input["
         "@name='items[0.base][customerVisiblePrice][displayString]'"
         "]/@value"
@@ -147,12 +243,7 @@ def resolve_hidden_pdp_price(tree, asin, current_price):
     Long-form and exact price-table ``See price in cart`` states are eligible;
     unavailable and unrelated page text are not replaced.
     """
-    if current_price and "$" in str(current_price):
-        return current_price, False
-    if not (
-        has_hidden_cart_price_message(tree)
-        or has_generic_see_price_in_cart_message(tree)
-    ):
+    if not is_hidden_pdp_price_state(tree, current_price):
         return current_price, False
     hidden_price = extract_pdp_customer_visible_price(tree, asin)
     if hidden_price is None:
@@ -275,3 +366,124 @@ def extract_active_cart_line(tree, asin):
         price=price,
         source="active_cart",
     )
+
+
+def _cart_row_merchant_ids(row, asin):
+    merchant_ids = set()
+    for href in row.xpath(
+        ".//a[contains(@href, '/gp/product/') and "
+        "contains(@href, 'smid=')]/@href"
+    ):
+        try:
+            parsed = urlparse(str(href))
+            if f"/GP/PRODUCT/{asin}" not in parsed.path.upper():
+                continue
+            values = parse_qs(parsed.query).get("smid", [])
+        except (TypeError, ValueError):
+            values = []
+        for value in values:
+            merchant_ids.add(normalize_merchant_id(value))
+    return merchant_ids
+
+
+def extract_active_cart_offer_line(tree, asin, merchant_id):
+    """Extract a cart price only for the exact active ASIN and merchant.
+
+    The merchant is read from the active cart product link's ``smid`` query
+    parameter and compared with the PDP buy-box form's ``merchantID``. Rows
+    with a missing or different merchant are never used.
+    """
+    asin = normalize_asin(asin)
+    merchant_id = normalize_merchant_id(merchant_id)
+    rows = [
+        row
+        for row in tree.xpath(
+            "//*[@id='sc-active-cart']"
+            "//div[@data-asin and "
+            "contains(concat(' ', normalize-space(@class), ' '), "
+            "' sc-list-item ')]"
+        )
+        if str(row.get("data-asin") or "").strip().upper() == asin
+    ]
+
+    matching = []
+    for row in rows:
+        row_merchants = _cart_row_merchant_ids(row, asin)
+        if len(row_merchants) > 1:
+            raise CartPriceParseError(
+                f"active cart row has ambiguous merchants for ASIN {asin}: "
+                f"{sorted(row_merchants)}"
+            )
+        if row_merchants == {merchant_id}:
+            matching.append(row)
+
+    if not matching:
+        return None
+    if len(matching) != 1:
+        raise CartPriceParseError(
+            f"active cart returned {len(matching)} rows for ASIN {asin} "
+            f"and merchant {merchant_id}"
+        )
+
+    row = matching[0]
+    quantity = _row_quantity(row, "active cart offer", asin)
+    price = _single_price(
+        row,
+        ".//div[contains(concat(' ', normalize-space(@class), ' '), "
+        "' sc-apex-cart-price ')]"
+        "//span[contains(concat(' ', normalize-space(@class), ' '), "
+        "' a-offscreen ')]",
+        "active cart offer",
+        asin,
+    )
+    data_price = row.get("data-price")
+    if str(data_price or "").strip():
+        normalized_data_price = normalize_amount_money(data_price)
+        if normalized_data_price != price:
+            raise CartPriceParseError(
+                f"active cart visible/data price mismatch for ASIN {asin}: "
+                f"visible={price}, data={normalized_data_price}"
+            )
+    return CartLine(
+        asin=asin,
+        quantity=quantity,
+        price=price,
+        source="active_cart_offer",
+        merchant_id=merchant_id,
+    )
+
+
+def build_cart_price_report_lines(resolutions, limit=50):
+    """Build stable plain-text email lines for resolved cart-price offers."""
+    unique = []
+    positions = {}
+    for resolution in resolutions or []:
+        item = {
+            "item": " ".join(str(resolution.get("item") or "-").split()),
+            "price": " ".join(str(resolution.get("price") or "-").split()),
+            "source": " ".join(str(resolution.get("source") or "-").split()),
+            "trigger": " ".join(str(resolution.get("trigger") or "-").split()),
+            "merchant": " ".join(
+                str(resolution.get("merchant") or "-").split()
+            ),
+            "quantity": resolution.get("quantity"),
+        }
+        key = (item["item"], item["merchant"])
+        if key in positions:
+            unique[positions[key]] = item
+        else:
+            positions[key] = len(unique)
+            unique.append(item)
+
+    lines = [f"cart-price resolved: {len(unique)}"]
+    for item in unique[:limit]:
+        quantity = item["quantity"]
+        quantity_text = "-" if quantity is None else str(quantity)
+        lines.append(
+            f"- item={item['item']} price={item['price']} "
+            f"source={item['source']} trigger={item['trigger']} "
+            f"merchant={item['merchant']} quantity={quantity_text}"
+        )
+    if len(unique) > limit:
+        lines.append(f"- omitted: {len(unique) - limit}")
+    return lines

@@ -3,15 +3,19 @@ import unittest
 from amazon.tv.amazon_tv_cart_price import (
     CartPriceParseError,
     active_cart_total_count,
+    build_cart_price_report_lines,
     extract_active_cart_line,
+    extract_active_cart_offer_line,
     extract_ewc_cart_line,
     extract_pdp_customer_visible_price,
+    extract_pdp_offer_identity,
     has_generic_see_price_in_cart_message,
     has_hidden_cart_price_message,
+    hidden_pdp_price_trigger,
     parse_html,
     resolve_hidden_pdp_price,
 )
-from amazon.tv.amazon_tv_cart_price_smoke import (
+from amazon.tv.test.test_cart_price.amazon_tv_cart_price_smoke import (
     _save_state,
     _visible_add_to_cart_button,
     _visible_page_markers,
@@ -85,8 +89,146 @@ PDP_HIDDEN_FORM_HTML = """
 </body></html>
 """
 
+PDP_OFFER_HTML = """
+<html><body>
+  <form id="addToCart" action="/gp/product/handle-buy-box/ref=dp_start-bbf_1_glance">
+    <input name="items[0.base][customerVisiblePrice][displayString]"
+           value="$2,997.95">
+    <input name="items[0.base][asin]" value="B0DXMZQ3MN">
+    <input name="items[0.base][offerListingId]" value="offer-current">
+    <input name="offerListingID" value="offer-current">
+    <input name="merchantID" value="A13ACIRM091OJE">
+  </form>
+</body></html>
+"""
+
+MULTI_SELLER_SAME_ASIN_CART_HTML = """
+<html><body>
+  <div id="sc-active-cart" data-cart-total-item-count="2">
+    <div class="a-row sc-list-item" data-asin="B0DXMZQ3MN" data-quantity="1"
+         data-price="2500.00">
+      <a class="sc-product-link"
+         href="/gp/product/B0DXMZQ3MN?smid=ADIFFERENT01&amp;psc=1">other</a>
+      <div class="sc-apex-cart-price"><span class="a-offscreen">$2,500.00</span></div>
+    </div>
+    <div class="a-row sc-list-item" data-asin="B0DXMZQ3MN" data-quantity="2"
+         data-price="2997.95">
+      <a class="sc-product-link"
+         href="/gp/product/B0DXMZQ3MN?smid=A13ACIRM091OJE&amp;psc=1">target</a>
+      <div class="sc-apex-cart-price"><span class="a-offscreen">$2,997.95</span></div>
+    </div>
+  </div>
+</body></html>
+"""
+
 
 class AmazonTVCartPriceParserTests(unittest.TestCase):
+    @staticmethod
+    def _ensure_test_config_module():
+        try:
+            __import__("config")
+        except ModuleNotFoundError:
+            import sys
+            import types
+
+            config = types.ModuleType("config")
+            config.DB_CONFIG = {}
+            config.EMAIL_CONFIG = {}
+            sys.modules["config"] = config
+
+    def test_cart_price_resolution_is_logged_and_deduplicated(self):
+        import contextlib
+        import io
+
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+        crawler = object.__new__(AmazonTVDetailCrawler)
+        crawler.detail_report = {"cart_price_resolutions": []}
+        resolution = {
+            "item": "B0DXMZQ3MN",
+            "price": "$2,997.95",
+            "source": "cart_existing_exact_offer",
+            "trigger": "see_price_in_cart",
+            "merchant": "A13ACIRM091OJE",
+            "quantity": 1,
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertTrue(crawler._record_cart_price_resolution(resolution))
+            self.assertFalse(crawler._record_cart_price_resolution(resolution))
+            updated = dict(resolution)
+            updated["source"] = "cart_after_one_add_exact_offer"
+            self.assertTrue(crawler._record_cart_price_resolution(updated))
+        self.assertEqual(len(crawler.detail_report["cart_price_resolutions"]), 1)
+        self.assertEqual(
+            crawler.detail_report["cart_price_resolutions"][0]["source"],
+            "cart_after_one_add_exact_offer",
+        )
+        self.assertIn(
+            "[CART PRICE REPORT] resolved item=B0DXMZQ3MN",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "[CART PRICE REPORT] updated item=B0DXMZQ3MN",
+            output.getvalue(),
+        )
+
+    def test_amazon_email_body_always_contains_cart_price_audit(self):
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_crawl import build_amazon_tv_email_report
+
+        body, severity = build_amazon_tv_email_report(
+            crawl_results={
+                "main": {"success": True, "records": 1},
+                "bsr": {"success": True, "records": 1},
+                "detail": {"success": True, "records": 1},
+            },
+            detail_report={
+                "detail_records": 1,
+                "saved_records": 1,
+                "cart_price_resolutions": [{
+                    "item": "B0DXMZQ3MN",
+                    "price": "$2,997.95",
+                    "source": "cart_existing_exact_offer",
+                    "trigger": "see_price_in_cart",
+                    "merchant": "A13ACIRM091OJE",
+                    "quantity": 1,
+                }],
+            },
+            log_file="test.log",
+            elapsed=60,
+            failed_stages=[],
+        )
+        self.assertEqual(severity, "ok")
+        self.assertIn("cart-price resolved: 1", body)
+        self.assertIn("item=B0DXMZQ3MN price=$2,997.95", body)
+
+    def test_cart_price_email_lines_are_deduplicated_and_auditable(self):
+        resolution = {
+            "item": "B0DXMZQ3MN",
+            "price": "$2,997.95",
+            "source": "cart_existing_exact_offer",
+            "trigger": "see_price_in_cart",
+            "merchant": "A13ACIRM091OJE",
+            "quantity": 1,
+        }
+        lines = build_cart_price_report_lines([resolution, resolution])
+        self.assertEqual(lines[0], "cart-price resolved: 1")
+        self.assertEqual(
+            lines[1],
+            "- item=B0DXMZQ3MN price=$2,997.95 "
+            "source=cart_existing_exact_offer trigger=see_price_in_cart "
+            "merchant=A13ACIRM091OJE quantity=1",
+        )
+
+        updated = dict(resolution)
+        updated["price"] = "$2,899.95"
+        updated["source"] = "cart_after_one_add_exact_offer"
+        updated_lines = build_cart_price_report_lines([resolution, updated])
+        self.assertEqual(updated_lines[0], "cart-price resolved: 1")
+        self.assertIn("price=$2,899.95", updated_lines[1])
+
     def test_long_hidden_price_message_matches(self):
         self.assertTrue(
             has_hidden_cart_price_message(parse_html(LOGGED_IN_HIDDEN_PDP))
@@ -109,6 +251,12 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
                 parse_html(GENERIC_SEE_PRICE_PDP), "B0DXMZQ3MN", None
             ),
             ("$2,997.95", True),
+        )
+        self.assertEqual(
+            hidden_pdp_price_trigger(
+                parse_html(GENERIC_SEE_PRICE_PDP), None
+            ),
+            "see_price_in_cart",
         )
 
     def test_ewc_price_is_scoped_to_exact_asin(self):
@@ -163,6 +311,61 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         self.assertIsNone(
             extract_pdp_customer_visible_price(tree, "B000000000")
         )
+
+    def test_pdp_offer_identity_comes_from_exact_asin_form(self):
+        offer = extract_pdp_offer_identity(
+            parse_html(PDP_OFFER_HTML), "B0DXMZQ3MN"
+        )
+        self.assertEqual(offer.asin, "B0DXMZQ3MN")
+        self.assertEqual(offer.merchant_id, "A13ACIRM091OJE")
+        self.assertEqual(offer.offer_listing_id, "offer-current")
+        self.assertIsNone(
+            extract_pdp_offer_identity(
+                parse_html(PDP_OFFER_HTML), "B000000000"
+            )
+        )
+
+    def test_cart_offer_price_requires_exact_asin_and_merchant(self):
+        tree = parse_html(MULTI_SELLER_SAME_ASIN_CART_HTML)
+        target = extract_active_cart_offer_line(
+            tree, "B0DXMZQ3MN", "A13ACIRM091OJE"
+        )
+        self.assertEqual(target.quantity, 2)
+        self.assertEqual(target.price, "$2,997.95")
+        self.assertEqual(target.merchant_id, "A13ACIRM091OJE")
+        self.assertEqual(target.source, "active_cart_offer")
+        self.assertIsNone(
+            extract_active_cart_offer_line(
+                tree, "B0DXMZQ3MN", "ANOTINCART01"
+            )
+        )
+
+    def test_cart_offer_rejects_duplicate_matching_seller_rows(self):
+        duplicate = MULTI_SELLER_SAME_ASIN_CART_HTML.replace(
+            "</div>\n  </div>\n</body>",
+            """
+            </div>
+            <div class="a-row sc-list-item" data-asin="B0DXMZQ3MN" data-quantity="1">
+              <a href="/gp/product/B0DXMZQ3MN?smid=A13ACIRM091OJE">duplicate</a>
+              <div class="sc-apex-cart-price"><span class="a-offscreen">$1.00</span></div>
+            </div>
+          </div>
+        </body>""",
+            1,
+        )
+        with self.assertRaises(CartPriceParseError):
+            extract_active_cart_offer_line(
+                parse_html(duplicate), "B0DXMZQ3MN", "A13ACIRM091OJE"
+            )
+
+    def test_cart_offer_rejects_visible_data_price_mismatch(self):
+        mismatch = MULTI_SELLER_SAME_ASIN_CART_HTML.replace(
+            'data-price="2997.95"', 'data-price="2997.94"'
+        )
+        with self.assertRaises(CartPriceParseError):
+            extract_active_cart_offer_line(
+                parse_html(mismatch), "B0DXMZQ3MN", "A13ACIRM091OJE"
+            )
 
     def test_pdp_customer_visible_price_rejects_ambiguous_forms(self):
         duplicate = PDP_HIDDEN_FORM_HTML.replace(

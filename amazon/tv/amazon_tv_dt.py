@@ -44,16 +44,25 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
-from amazon.tv.amazon_login import ensure_amazon_login_dp
+from amazon.tv.amazon_login import (
+    ensure_amazon_login_dp,
+    is_amazon_login_verified_dp,
+)
 from amazon.tv.amazon_tv_cart_price import (
     CartPriceParseError,
-    resolve_hidden_pdp_price,
+    extract_active_cart_offer_line,
+    extract_ewc_cart_line,
+    extract_pdp_offer_identity,
+    hidden_pdp_price_trigger,
+    is_hidden_pdp_price_state,
+    parse_html,
 )
 
 # Dedicated trusted profile for Amazon detail collection.
 # Seed it once from regular Chrome, then preserve the authenticated
 # crawler session so a successful RDP verification is not overwritten.
 TRUSTED_PROFILE_DIR = r'C:\chrome_profile_amzn'
+CART_URL = 'https://www.amazon.com/gp/cart/view.html'
 TRUSTED_PROFILE_SOURCE = os.path.join(
     os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
 # 사본에 필요한 최소 파일 (Cookies가 핵심 — 세션 신원)
@@ -222,6 +231,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             'login_cookie_snapshot_saved': None,
             'redirects': [],
             'run_errors': [],
+            'cart_price_resolutions': [],
             'review_gated_count': 0,     # 리뷰 로그인 게이트 감지 상품 수
             'review_gate_restarts': 0,   # 게이트로 인한 브라우저 재시작 횟수
         }
@@ -237,6 +247,43 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             'AMAZON_TV_CHROME_DEBUG_PORT', '9223'
         )
         self.browser_profile_directory = 'Default'
+        # Never click Add twice for the same ASIN+merchant during one process,
+        # including crawl_detail retries after a browser/navigation failure.
+        self._cart_add_attempted_offers = set()
+
+    def _record_cart_price_resolution(self, resolution):
+        """Record one successful exact-offer cart price without duplicates."""
+        records = self.detail_report.setdefault('cart_price_resolutions', [])
+        key = (
+            resolution.get('item'),
+            resolution.get('merchant'),
+        )
+        for existing in records:
+            existing_key = (
+                existing.get('item'),
+                existing.get('merchant'),
+            )
+            if existing_key == key:
+                if existing == resolution:
+                    return False
+                existing.clear()
+                existing.update(resolution)
+                action = 'updated'
+                break
+        else:
+            records.append(dict(resolution))
+            action = 'resolved'
+
+        print(
+            f'  [CART PRICE REPORT] {action} '
+            f"item={resolution.get('item')}, "
+            f"price={resolution.get('price')}, "
+            f"source={resolution.get('source')}, "
+            f"trigger={resolution.get('trigger')}, "
+            f"merchant={resolution.get('merchant')}, "
+            f"quantity={resolution.get('quantity')}"
+        )
+        return True
 
     def _normalize_redirect_name(self, value):
         """Compare redirect names by ignoring only whitespace runs and case."""
@@ -729,6 +776,237 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     # ========================================================================
     # Detail Crawl
     # ========================================================================
+    @staticmethod
+    def _is_visibly_rendered(element):
+        return bool(element.states.is_displayed and element.states.has_rect)
+
+    def _visible_cart_add_button(self):
+        buttons = self.page.eles(
+            'css:input#add-to-cart-button[name="submit.add-to-cart"]'
+        ) or []
+        visible = [
+            button for button in buttons
+            if self._is_visibly_rendered(button)
+        ]
+        if len(visible) != 1:
+            raise RuntimeError(
+                'expected one visible Add-to-Cart button, '
+                f'found {len(visible)}'
+            )
+        return visible[0]
+
+    def _visible_warranty_decline_button(self, asin):
+        panes = self.page.eles('css:#attach-warranty-pane', timeout=0.2) or []
+        visible_panes = [
+            pane for pane in panes if self._is_visibly_rendered(pane)
+        ]
+        if not visible_panes:
+            return None
+        if len(visible_panes) != 1:
+            raise RuntimeError(
+                f'expected one visible warranty pane, found {len(visible_panes)}'
+            )
+
+        pane_tree = parse_html(self.page.html)
+        pane_asins = {
+            str(value or '').strip().upper()
+            for value in pane_tree.xpath("//*[@id='attach-baseAsin']/@value")
+            if str(value or '').strip()
+        }
+        if pane_asins != {asin}:
+            raise RuntimeError(
+                f'warranty pane ASIN mismatch: expected={asin}, '
+                f'found={sorted(pane_asins)}'
+            )
+
+        buttons = self.page.eles(
+            "css:#attach-warranty-pane "
+            "#attachSiNoCoverage input.a-button-input[type='submit']",
+            timeout=0.2,
+        ) or []
+        visible_buttons = [
+            button for button in buttons
+            if self._is_visibly_rendered(button)
+        ]
+        if len(visible_buttons) != 1:
+            raise RuntimeError(
+                'expected one visible warranty No-thanks button, '
+                f'found {len(visible_buttons)}'
+            )
+        return visible_buttons[0]
+
+    def _wait_after_cart_add(self, asin, timeout_seconds=15):
+        """Decline one exact-ASIN warranty pane; never select a plan."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            decline = self._visible_warranty_decline_button(asin)
+            if decline:
+                print(
+                    f'  [CART PRICE] Warranty No-thanks once: item={asin}'
+                )
+                if not self.click_element(
+                    decline, label='Cart price warranty No-thanks'
+                ):
+                    raise RuntimeError('warranty No-thanks click failed')
+                time.sleep(1)
+                return 'warranty_declined'
+
+            try:
+                if extract_ewc_cart_line(parse_html(self.page.html), asin):
+                    return 'ewc_ready'
+            except CartPriceParseError:
+                pass
+            time.sleep(0.5)
+        return 'no_interstitial_detected'
+
+    def _load_exact_cart_offer(self, offer):
+        self.page.get(CART_URL)
+        time.sleep(random.uniform(1.5, 2.5))
+        if not self.recover_amazon_pages():
+            raise RuntimeError('Amazon cart recovery unresolved')
+        if not is_amazon_login_verified_dp(self.page):
+            raise RuntimeError('Amazon login was not verified on the cart page')
+        return extract_active_cart_offer_line(
+            parse_html(self.page.html),
+            offer.asin,
+            offer.merchant_id,
+        )
+
+    def _restore_exact_offer_pdp(self, product_url, offer):
+        self.page.get(product_url)
+        time.sleep(random.uniform(1.5, 2.5))
+        if not self.recover_amazon_pages():
+            raise RuntimeError('Amazon PDP recovery unresolved after cart')
+
+        loaded_asin = self.extract_item(self.page.url)
+        if loaded_asin != offer.asin:
+            raise RuntimeError(
+                f'PDP ASIN changed after cart: expected={offer.asin}, '
+                f'loaded={loaded_asin}'
+            )
+
+        restored_tree = parse_html(
+            self.page.run_js('return document.documentElement.outerHTML')
+        )
+        restored_offer = extract_pdp_offer_identity(
+            restored_tree, offer.asin
+        )
+        if restored_offer is None:
+            raise RuntimeError(
+                f'PDP offer missing after cart: item={offer.asin}'
+            )
+        if restored_offer.merchant_id != offer.merchant_id:
+            raise RuntimeError(
+                'PDP merchant changed after cart: '
+                f'expected={offer.merchant_id}, '
+                f'loaded={restored_offer.merchant_id}'
+            )
+        return restored_tree, restored_offer
+
+    def resolve_hidden_price_from_cart(
+        self, tree, item, product_url, current_price
+    ):
+        """Resolve a hidden price from the exact ASIN+merchant cart row.
+
+        An existing matching row is read without mutation. If it is absent,
+        Add-to-Cart is clicked at most once per ASIN+merchant for this process,
+        a matching warranty pane is declined once, and the new item is kept.
+        The PDP is restored before normal spec/review collection continues.
+        """
+        if not is_hidden_pdp_price_state(tree, current_price):
+            return current_price, False, None, tree, None
+
+        trigger = hidden_pdp_price_trigger(tree, current_price)
+
+        offer = extract_pdp_offer_identity(tree, item)
+        if offer is None:
+            raise CartPriceParseError(
+                f'PDP buy-box offer missing for ASIN {item}'
+            )
+
+        resolved_price = current_price
+        resolved_source = None
+        restored_tree = tree
+        try:
+            line = self._load_exact_cart_offer(offer)
+            if line is not None:
+                resolved_price = line.price
+                resolved_source = 'cart_existing_exact_offer'
+                print(
+                    '  [CART PRICE] Existing exact offer: '
+                    f'item={offer.asin}, merchant={offer.merchant_id}, '
+                    f'quantity={line.quantity}, price={line.price}'
+                )
+            else:
+                restored_tree, restored_offer = self._restore_exact_offer_pdp(
+                    product_url, offer
+                )
+                if not is_hidden_pdp_price_state(
+                    restored_tree, current_price
+                ):
+                    raise RuntimeError(
+                        f'hidden-price state changed before Add: item={offer.asin}'
+                    )
+
+                add_key = (offer.asin, offer.merchant_id)
+                if add_key in self._cart_add_attempted_offers:
+                    raise RuntimeError(
+                        'Add-to-Cart already attempted for exact offer in this '
+                        f'process: item={offer.asin}, merchant={offer.merchant_id}'
+                    )
+                if restored_offer.merchant_id != offer.merchant_id:
+                    raise RuntimeError(
+                        'PDP merchant changed before Add: '
+                        f'expected={offer.merchant_id}, '
+                        f'loaded={restored_offer.merchant_id}'
+                    )
+
+                add_button = self._visible_cart_add_button()
+                self._cart_add_attempted_offers.add(add_key)
+                print(
+                    '  [CART PRICE] Add-to-Cart once: '
+                    f'item={offer.asin}, merchant={offer.merchant_id}'
+                )
+                if not self.click_element(
+                    add_button, label='Cart price Add-to-Cart'
+                ):
+                    raise RuntimeError('Add-to-Cart click failed')
+                response = self._wait_after_cart_add(offer.asin)
+                print(f'  [CART PRICE] Add response: {response}')
+
+                line = self._load_exact_cart_offer(offer)
+                if line is None:
+                    raise RuntimeError(
+                        'exact ASIN+merchant row was not found after one Add: '
+                        f'item={offer.asin}, merchant={offer.merchant_id}'
+                    )
+                if line.quantity != 1:
+                    raise RuntimeError(
+                        'new exact offer quantity must be 1: '
+                        f'item={offer.asin}, quantity={line.quantity}'
+                    )
+                resolved_price = line.price
+                resolved_source = 'cart_after_one_add_exact_offer'
+                print(
+                    '  [CART PRICE] Added exact offer kept in cart: '
+                    f'item={offer.asin}, merchant={offer.merchant_id}, '
+                    f'price={line.price}'
+                )
+        finally:
+            restored_tree, _ = self._restore_exact_offer_pdp(
+                product_url, offer
+            )
+
+        resolution = {
+            'item': offer.asin,
+            'price': resolved_price,
+            'source': resolved_source,
+            'trigger': trigger,
+            'merchant': offer.merchant_id,
+            'quantity': line.quantity,
+        }
+        return resolved_price, True, resolved_source, restored_tree, resolution
+
     def _handle_review_gate(self, item):
         """리뷰 로그인 게이트 감지 시 대응: 기록/스냅샷만 하고 계속 진행.
 
@@ -781,32 +1059,43 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             # 필드별 추출
             # =====================================================================================================
 
-            # 3단계 리뷰 섹션 이동 전략 결정: 링크가 있으면 top 이동 후 클릭, 없으면 현재 위치에서 섹션 탐색
-            review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
-            has_review_link = bool(review_link_xpath and tree.xpath(review_link_xpath))
-
             # ========== 1단계: 가격/상태 필드 ==========
             final_sku_price = self.extract_final_sku_price(tree)
             final_sku_price_source = (
                 'xpath' if final_sku_price and '$' in final_sku_price else None
             )
             try:
-                final_sku_price, used_hidden_pdp_price = resolve_hidden_pdp_price(
+                (
+                    final_sku_price,
+                    used_cart_price,
+                    cart_price_source,
+                    tree,
+                    cart_price_resolution,
+                ) = self.resolve_hidden_price_from_cart(
                     tree,
                     item,
+                    product_url,
                     final_sku_price,
                 )
-                if used_hidden_pdp_price:
-                    final_sku_price_source = 'pdp_customer_visible_price'
+                if used_cart_price:
+                    final_sku_price_source = cart_price_source
+                    self._record_cart_price_resolution(cart_price_resolution)
                     print(
-                        f"  [가격] hidden PDP fallback 적용: "
-                        f"item={item}, price={final_sku_price}"
+                        f"  [CART PRICE] Hidden PDP resolved: "
+                        f"item={item}, price={final_sku_price}, "
+                        f"source={cart_price_source}"
                     )
             except CartPriceParseError as exc:
                 print(
-                    f"  [WARNING] hidden PDP 가격 fallback 거부: "
+                    f"  [WARNING] Exact cart price rejected: "
                     f"item={item}, reason={exc}"
                 )
+
+            # 장바구니 확인 후 복원된 PDP DOM을 기준으로 리뷰 섹션을 판단한다.
+            review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
+            has_review_link = bool(
+                review_link_xpath and tree.xpath(review_link_xpath)
+            )
             original_sku_price = None
             if final_sku_price and '$' in final_sku_price:
                 original_sku_price = self.extract_original_sku_price(tree, 'original_sku_price')

@@ -61,6 +61,7 @@ from amazon.tv.amazon_tv_main import AmazonTVMainCrawler
 from amazon.tv.amazon_tv_bsr import AmazonTVBSRCrawler
 from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
 from amazon.tv.amazon_tv_dt_update import AmazonTVDetailUpdateCrawler
+from amazon.tv.amazon_tv_cart_price import build_cart_price_report_lines
 from common.base_crawler import BaseCrawler
 from common.alert_hhp_monitor import format_elapsed_time
 from config import EMAIL_CONFIG
@@ -123,6 +124,7 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
     login_cookie_snapshot_saved = detail_report.get(
         'login_cookie_snapshot_saved'
     )
+    cart_price_resolutions = detail_report.get('cart_price_resolutions') or []
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -158,6 +160,8 @@ def build_amazon_tv_email_report(crawl_results, detail_report, log_file, elapsed
         f"elapsed: {concise_elapsed_time(elapsed)}",
         '',
     ]
+    lines.extend(build_cart_price_report_lines(cart_price_resolutions))
+    lines.append('')
 
     if severity == 'ok':
         lines.append('특이사항 없음')
