@@ -84,15 +84,18 @@ def _visible_add_to_cart_button(page):
         'css:input#add-to-cart-button[name="submit.add-to-cart"]'
     ) or []
     visible = []
+    visibility_errors = []
     for button in buttons:
         try:
-            if button.is_displayed():
+            if button.states.is_displayed:
                 visible.append(button)
-        except Exception:
-            continue
+        except Exception as exc:
+            visibility_errors.append(type(exc).__name__)
     if len(visible) != 1:
         raise RuntimeError(
-            f"expected one visible Add-to-Cart button, found {len(visible)}"
+            f"expected one visible Add-to-Cart button, found {len(visible)} "
+            f"(candidates={len(buttons)}, "
+            f"visibility_errors={visibility_errors})"
         )
     return visible[0]
 

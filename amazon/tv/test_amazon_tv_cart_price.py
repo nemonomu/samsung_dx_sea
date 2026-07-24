@@ -8,6 +8,7 @@ from amazon.tv.amazon_tv_cart_price import (
     has_hidden_cart_price_message,
     parse_html,
 )
+from amazon.tv.amazon_tv_cart_price_smoke import _visible_add_to_cart_button
 
 
 LOGGED_IN_HIDDEN_PDP = """
@@ -105,6 +106,26 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         invalid = EWC_HTML.replace("$2,997.95", "See price in cart")
         with self.assertRaises(CartPriceParseError):
             extract_ewc_cart_line(parse_html(invalid), "B0DXMZQ3MN")
+
+    def test_visible_add_button_uses_drissionpage_states_api(self):
+        class FakeStates:
+            is_displayed = True
+
+        class FakeButton:
+            states = FakeStates()
+
+        class FakePage:
+            def eles(self, locator):
+                self.locator = locator
+                return [FakeButton()]
+
+        page = FakePage()
+        button = _visible_add_to_cart_button(page)
+        self.assertIsInstance(button, FakeButton)
+        self.assertEqual(
+            page.locator,
+            'css:input#add-to-cart-button[name="submit.add-to-cart"]',
+        )
 
 
 if __name__ == "__main__":
