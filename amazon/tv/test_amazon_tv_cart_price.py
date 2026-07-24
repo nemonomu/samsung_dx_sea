@@ -11,6 +11,7 @@ from amazon.tv.amazon_tv_cart_price import (
 from amazon.tv.amazon_tv_cart_price_smoke import (
     _save_state,
     _visible_add_to_cart_button,
+    _visible_page_markers,
 )
 
 
@@ -131,6 +132,12 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         )
 
     def test_save_state_records_url_without_cart_mutation(self):
+        class FakeStates:
+            is_displayed = False
+
+        class FakeElement:
+            states = FakeStates()
+
         class FakePage:
             html = """
                 <html><body>
@@ -138,6 +145,9 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
                 </body></html>
             """
             url = "https://www.amazon.com/example"
+
+            def eles(self, locator, timeout=0):
+                return [FakeElement()]
 
         class FakeCrawler:
             page = FakePage()
@@ -153,6 +163,27 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         tree = _save_state(crawler, "post_add_response", "B0DXMZQ3MN")
         self.assertEqual(tree.xpath("string(//*[@data-asin])").strip(), "No Thanks")
         self.assertEqual(crawler.saved, [("post_add_response", 10)])
+
+    def test_visible_markers_ignore_hidden_html_templates(self):
+        class FakeStates:
+            def __init__(self, displayed):
+                self.is_displayed = displayed
+
+        class FakeElement:
+            def __init__(self, displayed):
+                self.states = FakeStates(displayed)
+
+        class FakePage:
+            def eles(self, locator, timeout=0):
+                if locator == "css:#sc-buy-box-ptc-button-announce":
+                    return [FakeElement(True)]
+                if "Added to Cart" in locator:
+                    return [FakeElement(False)]
+                return []
+
+        markers, errors = _visible_page_markers(FakePage())
+        self.assertEqual(markers, ["proceed to checkout"])
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

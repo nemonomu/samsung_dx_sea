@@ -46,14 +46,33 @@ from amazon.tv.amazon_tv_cart_price import (
 
 CART_URL = "https://www.amazon.com/gp/cart/view.html"
 DEFAULT_ASIN = "B0DXMZQ3MN"
-POST_CLICK_MARKERS = (
-    "added to cart",
-    "add a protection plan",
-    "no thanks",
-    "continue shopping",
-    "proceed to checkout",
-    "was removed from shopping cart",
-    "sorry, we just need to make sure",
+VISIBLE_MARKER_LOCATORS = (
+    (
+        "added to cart",
+        'xpath://*[not(self::script) and normalize-space(text())="Added to Cart"]',
+    ),
+    (
+        "add a protection plan",
+        'xpath://*[contains(normalize-space(text()), "Add a protection plan")]',
+    ),
+    (
+        "no thanks",
+        'xpath://*[not(self::script) and normalize-space(text())="No Thanks"]',
+    ),
+    (
+        "continue shopping",
+        'xpath://*[contains(normalize-space(text()), "Continue shopping")]',
+    ),
+    ("proceed to checkout", "css:#sc-buy-box-ptc-button-announce"),
+    (
+        "was removed from shopping cart",
+        'xpath://a[contains(normalize-space(.), "was removed from Shopping Cart")]',
+    ),
+    (
+        "sorry, we just need to make sure",
+        'xpath://*[contains(normalize-space(text()), '
+        '"Sorry, we just need to make sure")]',
+    ),
 )
 
 
@@ -72,17 +91,30 @@ def _new_crawler(mode):
     )
 
 
+def _visible_page_markers(page):
+    """Return diagnostic markers that are actually displayed in the browser."""
+    visible = []
+    errors = []
+    for marker, locator in VISIBLE_MARKER_LOCATORS:
+        try:
+            elements = page.eles(locator, timeout=0.2) or []
+            if any(element.states.is_displayed for element in elements):
+                visible.append(marker)
+        except Exception as exc:
+            errors.append(f"{marker}:{type(exc).__name__}")
+    return visible, errors
+
+
 def _save_state(crawler, tag, asin):
     """Save the current DOM and URL without clicking or changing the page."""
     page_html = crawler.page.html
     tree = parse_html(page_html)
-    normalized_text = " ".join(tree.text_content().split()).casefold()
-    markers = [marker for marker in POST_CLICK_MARKERS if marker in normalized_text]
+    markers, marker_errors = _visible_page_markers(crawler.page)
     asin_occurrences = page_html.upper().count(asin)
     print(f"[SMOKE STATE] tag={tag}, url={crawler.page.url}")
     print(
         f"[SMOKE STATE] asin={asin}, html_occurrences={asin_occurrences}, "
-        f"markers={markers}"
+        f"visible_markers={markers}, marker_errors={marker_errors}"
     )
 
     filepath = crawler.save_debug_html(tag, max_files=10)
@@ -184,13 +216,13 @@ def run_cart_inspection(asin):
         line, total = _load_active_cart(crawler, asin)
         tree = _save_state(crawler, "cart_inspect", asin)
         raw_occurrences = crawler.page.html.upper().count(asin)
-        removed_notice = "was removed from shopping cart" in " ".join(
-            tree.text_content().split()
-        ).casefold()
+        visible_markers, marker_errors = _visible_page_markers(crawler.page)
+        removed_notice = "was removed from shopping cart" in visible_markers
         print(f"[SMOKE INSPECT] cart total: {total}")
         print(
             f"[SMOKE INSPECT] raw ASIN occurrences in HTML: {raw_occurrences}; "
-            f"removed_notice={removed_notice}"
+            f"visible_removed_notice={removed_notice}; "
+            f"marker_errors={marker_errors}"
         )
         if line:
             print(
