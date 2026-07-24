@@ -45,6 +45,10 @@ setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
 from amazon.tv.amazon_login import ensure_amazon_login_dp
+from amazon.tv.amazon_tv_cart_price import (
+    CartPriceParseError,
+    resolve_hidden_pdp_price,
+)
 
 # Dedicated trusted profile for Amazon detail collection.
 # Seed it once from regular Chrome, then preserve the authenticated
@@ -783,6 +787,26 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
             # ========== 1단계: 가격/상태 필드 ==========
             final_sku_price = self.extract_final_sku_price(tree)
+            final_sku_price_source = (
+                'xpath' if final_sku_price and '$' in final_sku_price else None
+            )
+            try:
+                final_sku_price, used_hidden_pdp_price = resolve_hidden_pdp_price(
+                    tree,
+                    item,
+                    final_sku_price,
+                )
+                if used_hidden_pdp_price:
+                    final_sku_price_source = 'pdp_customer_visible_price'
+                    print(
+                        f"  [가격] hidden PDP fallback 적용: "
+                        f"item={item}, price={final_sku_price}"
+                    )
+            except CartPriceParseError as exc:
+                print(
+                    f"  [WARNING] hidden PDP 가격 fallback 거부: "
+                    f"item={item}, reason={exc}"
+                )
             original_sku_price = None
             if final_sku_price and '$' in final_sku_price:
                 original_sku_price = self.extract_original_sku_price(tree, 'original_sku_price')
@@ -938,7 +962,10 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             print(f"\n──── 결과 요약 ────")
             print(f"  ├─ item: {item or '-'}")
             print(f"  ├─ sku: {f'{sku} (출처: {sku_source})' if sku and sku_source else (sku or '-')}")
-            print(f"  ├─ final_sku_price: {final_sku_price or '-'}")
+            print(
+                f"  ├─ final_sku_price: "
+                f"{f'{final_sku_price} (출처: {final_sku_price_source})' if final_sku_price_source else (final_sku_price or '-')}"
+            )
             print(f"  ├─ original_sku_price: {original_sku_price or '-'}")
             print(f"  ├─ star_rating: {star_rating or '-'}")
             print(f"  ├─ count_of_star_ratings: {count_of_star_ratings or '-'}")

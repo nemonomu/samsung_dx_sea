@@ -125,6 +125,22 @@ def extract_pdp_customer_visible_price(tree, asin):
     return prices[0]
 
 
+def resolve_hidden_pdp_price(tree, asin, current_price):
+    """Use the exact-ASIN PDP form price only for a hidden-price PDP state.
+
+    Returns ``(price, used_fallback)``. A normal dollar price is preserved,
+    and unavailable or generic logged-out states are not replaced.
+    """
+    if current_price and "$" in str(current_price):
+        return current_price, False
+    if not has_hidden_cart_price_message(tree):
+        return current_price, False
+    hidden_price = extract_pdp_customer_visible_price(tree, asin)
+    if hidden_price is None:
+        return current_price, False
+    return hidden_price, True
+
+
 def active_cart_total_count(tree):
     nodes = tree.xpath("//*[@id='sc-active-cart']")
     if len(nodes) != 1:

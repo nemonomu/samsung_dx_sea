@@ -43,6 +43,7 @@ from amazon.tv.amazon_tv_cart_price import (
     has_hidden_cart_price_message,
     normalize_asin,
     parse_html,
+    resolve_hidden_pdp_price,
 )
 
 
@@ -97,6 +98,11 @@ def _new_crawler(mode):
     )
 
 
+def _is_visibly_rendered(element):
+    """Require both element visibility and a rendered layout rectangle."""
+    return bool(element.states.is_displayed and element.states.has_rect)
+
+
 def _visible_page_markers(page):
     """Return diagnostic markers that are actually displayed in the browser."""
     visible = []
@@ -104,7 +110,7 @@ def _visible_page_markers(page):
     for marker, locator in VISIBLE_MARKER_LOCATORS:
         try:
             elements = page.eles(locator, timeout=0.2) or []
-            if any(element.states.is_displayed for element in elements):
+            if any(_is_visibly_rendered(element) for element in elements):
                 visible.append(marker)
         except Exception as exc:
             errors.append(f"{marker}:{type(exc).__name__}")
@@ -170,7 +176,7 @@ def _visible_add_to_cart_button(page):
     visibility_errors = []
     for button in buttons:
         try:
-            if button.states.is_displayed:
+            if _is_visibly_rendered(button):
                 visible.append(button)
         except Exception as exc:
             visibility_errors.append(type(exc).__name__)
@@ -186,7 +192,7 @@ def _visible_add_to_cart_button(page):
 def _visible_warranty_decline_button(page, asin):
     """Return the exact visible No-thanks control for the target product."""
     panes = page.eles("css:#attach-warranty-pane", timeout=0.2) or []
-    visible_panes = [pane for pane in panes if pane.states.is_displayed]
+    visible_panes = [pane for pane in panes if _is_visibly_rendered(pane)]
     if not visible_panes:
         return None
     if len(visible_panes) != 1:
@@ -213,7 +219,7 @@ def _visible_warranty_decline_button(page, asin):
         "#attachSiNoCoverage input.a-button-input[type='submit']",
         timeout=0.2,
     ) or []
-    visible_buttons = [button for button in buttons if button.states.is_displayed]
+    visible_buttons = [button for button in buttons if _is_visibly_rendered(button)]
     if len(visible_buttons) != 1:
         raise RuntimeError(
             "expected one visible warranty No-thanks button, "
@@ -329,10 +335,12 @@ def run_pdp_price_inspection(asin, product_url):
                 f"PDP ASIN mismatch: expected={asin}, loaded={loaded_asin}"
             )
         tree = _save_state(crawler, "pdp_price_inspect", asin)
-        price = extract_pdp_customer_visible_price(tree, asin)
-        if price is None:
+        price, used_hidden_pdp_price = resolve_hidden_pdp_price(
+            tree, asin, None
+        )
+        if price is None or not used_hidden_pdp_price:
             raise RuntimeError(
-                "exact-ASIN customer-visible price was not found in the PDP form"
+                "authenticated hidden-price PDP fallback was not applicable"
             )
         print(
             f"[SMOKE PDP PASS] asin={asin}, price={price}, "

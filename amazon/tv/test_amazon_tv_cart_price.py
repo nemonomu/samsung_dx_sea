@@ -8,6 +8,7 @@ from amazon.tv.amazon_tv_cart_price import (
     extract_pdp_customer_visible_price,
     has_hidden_cart_price_message,
     parse_html,
+    resolve_hidden_pdp_price,
 )
 from amazon.tv.amazon_tv_cart_price_smoke import (
     _save_state,
@@ -144,9 +145,36 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
                 parse_html(duplicate), "B0DXMZQ3MN"
             )
 
+    def test_hidden_pdp_price_resolver_is_limited_to_hidden_price_state(self):
+        hidden_tree = parse_html(
+            PDP_HIDDEN_FORM_HTML.replace(
+                "<body>",
+                "<body><div class='priceToPayReplacementText'>"
+                "To see our price, add this item to your cart. "
+                "You can always remove it later.</div>",
+            )
+        )
+        self.assertEqual(
+            resolve_hidden_pdp_price(hidden_tree, "B0DXMZQ3MN", None),
+            ("$2,997.95", True),
+        )
+        self.assertEqual(
+            resolve_hidden_pdp_price(
+                hidden_tree, "B0DXMZQ3MN", "$3,100.00"
+            ),
+            ("$3,100.00", False),
+        )
+        self.assertEqual(
+            resolve_hidden_pdp_price(
+                parse_html(PDP_HIDDEN_FORM_HTML), "B0DXMZQ3MN", None
+            ),
+            (None, False),
+        )
+
     def test_visible_add_button_uses_drissionpage_states_api(self):
         class FakeStates:
             is_displayed = True
+            has_rect = True
 
         class FakeButton:
             states = FakeStates()
@@ -167,6 +195,7 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
     def test_save_state_records_url_without_cart_mutation(self):
         class FakeStates:
             is_displayed = False
+            has_rect = False
 
         class FakeElement:
             states = FakeStates()
@@ -199,8 +228,9 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
 
     def test_visible_markers_ignore_hidden_html_templates(self):
         class FakeStates:
-            def __init__(self, displayed):
+            def __init__(self, displayed, has_rect=None):
                 self.is_displayed = displayed
+                self.has_rect = displayed if has_rect is None else has_rect
 
         class FakeElement:
             def __init__(self, displayed):
@@ -218,9 +248,24 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         self.assertEqual(markers, ["proceed to checkout"])
         self.assertEqual(errors, [])
 
+        class NoRectPage(FakePage):
+            def eles(self, locator, timeout=0):
+                if "Added to Cart" in locator:
+                    return [FakeElement(True)]
+                if locator == "css:#sc-buy-box-ptc-button-announce":
+                    element = FakeElement(True)
+                    element.states.has_rect = False
+                    return [element]
+                return []
+
+        markers, errors = _visible_page_markers(NoRectPage())
+        self.assertEqual(markers, ["added to cart"])
+        self.assertEqual(errors, [])
+
     def test_visible_warranty_decline_is_scoped_to_exact_asin(self):
         class FakeStates:
             is_displayed = True
+            has_rect = True
 
         class FakeElement:
             states = FakeStates()
