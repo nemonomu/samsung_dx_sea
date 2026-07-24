@@ -8,7 +8,10 @@ from amazon.tv.amazon_tv_cart_price import (
     has_hidden_cart_price_message,
     parse_html,
 )
-from amazon.tv.amazon_tv_cart_price_smoke import _visible_add_to_cart_button
+from amazon.tv.amazon_tv_cart_price_smoke import (
+    _save_state,
+    _visible_add_to_cart_button,
+)
 
 
 LOGGED_IN_HIDDEN_PDP = """
@@ -126,6 +129,30 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
             page.locator,
             'css:input#add-to-cart-button[name="submit.add-to-cart"]',
         )
+
+    def test_save_state_records_url_without_cart_mutation(self):
+        class FakePage:
+            html = """
+                <html><body>
+                  <div data-asin="B0DXMZQ3MN">No Thanks</div>
+                </body></html>
+            """
+            url = "https://www.amazon.com/example"
+
+        class FakeCrawler:
+            page = FakePage()
+
+            def __init__(self):
+                self.saved = []
+
+            def save_debug_html(self, tag, max_files=3):
+                self.saved.append((tag, max_files))
+                return None
+
+        crawler = FakeCrawler()
+        tree = _save_state(crawler, "post_add_response", "B0DXMZQ3MN")
+        self.assertEqual(tree.xpath("string(//*[@data-asin])").strip(), "No Thanks")
+        self.assertEqual(crawler.saved, [("post_add_response", 10)])
 
 
 if __name__ == "__main__":

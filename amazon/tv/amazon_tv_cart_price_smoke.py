@@ -46,10 +46,55 @@ from amazon.tv.amazon_tv_cart_price import (
 
 CART_URL = "https://www.amazon.com/gp/cart/view.html"
 DEFAULT_ASIN = "B0DXMZQ3MN"
+POST_CLICK_MARKERS = (
+    "added to cart",
+    "add a protection plan",
+    "no thanks",
+    "continue shopping",
+    "proceed to checkout",
+    "was removed from shopping cart",
+    "sorry, we just need to make sure",
+)
 
 
 def _tree(page):
     return parse_html(page.html)
+
+
+def _new_crawler(mode):
+    from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return AmazonTVDetailCrawler(
+        batch_id=f"amazon_tv_cart_price_{mode}_{timestamp}",
+        test_mode=True,
+        require_amazon_login=False,
+    )
+
+
+def _save_state(crawler, tag, asin):
+    """Save the current DOM and URL without clicking or changing the page."""
+    page_html = crawler.page.html
+    tree = parse_html(page_html)
+    normalized_text = " ".join(tree.text_content().split()).casefold()
+    markers = [marker for marker in POST_CLICK_MARKERS if marker in normalized_text]
+    asin_occurrences = page_html.upper().count(asin)
+    print(f"[SMOKE STATE] tag={tag}, url={crawler.page.url}")
+    print(
+        f"[SMOKE STATE] asin={asin}, html_occurrences={asin_occurrences}, "
+        f"markers={markers}"
+    )
+
+    filepath = crawler.save_debug_html(tag, max_files=10)
+    if filepath:
+        url_path = os.path.splitext(filepath)[0] + ".url.txt"
+        try:
+            with open(url_path, "w", encoding="utf-8") as handle:
+                handle.write(str(crawler.page.url))
+            print(f"[SMOKE STATE] URL saved: {url_path}")
+        except OSError as exc:
+            print(f"[SMOKE WARNING] URL snapshot failed: {exc}")
+    return tree
 
 
 def _setup_logged_in_browser(crawler):
@@ -130,15 +175,49 @@ def _load_active_cart(crawler, asin):
     )
 
 
+def run_cart_inspection(asin):
+    """Read the exact ASIN from the active cart without any cart mutation."""
+    crawler = _new_crawler("inspect")
+    try:
+        _setup_logged_in_browser(crawler)
+        asin = normalize_asin(asin)
+        line, total = _load_active_cart(crawler, asin)
+        tree = _save_state(crawler, "cart_inspect", asin)
+        raw_occurrences = crawler.page.html.upper().count(asin)
+        removed_notice = "was removed from shopping cart" in " ".join(
+            tree.text_content().split()
+        ).casefold()
+        print(f"[SMOKE INSPECT] cart total: {total}")
+        print(
+            f"[SMOKE INSPECT] raw ASIN occurrences in HTML: {raw_occurrences}; "
+            f"removed_notice={removed_notice}"
+        )
+        if line:
+            print(
+                f"[SMOKE INSPECT PASS] active cart item: asin={line.asin}, "
+                f"quantity={line.quantity}, price={line.price}, action=read-only"
+            )
+        else:
+            print(
+                f"[SMOKE INSPECT PASS] asin={asin} is absent from the active "
+                "cart; action=read-only"
+            )
+        return True
+    except Exception as exc:
+        print(f"[SMOKE INSPECT FAIL] {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if crawler.page:
+            try:
+                crawler.page.quit()
+            except Exception as exc:
+                print(f"[SMOKE WARNING] Browser cleanup failed: {exc}")
+
+
 def run_smoke(asin, product_url):
     from amazon.tv.amazon_login import is_amazon_login_verified_dp
-    from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
 
-    crawler = AmazonTVDetailCrawler(
-        batch_id="amazon_tv_cart_price_smoke",
-        test_mode=True,
-        require_amazon_login=False,
-    )
+    crawler = _new_crawler("live")
     add_clicked = False
     try:
         _setup_logged_in_browser(crawler)
@@ -174,6 +253,7 @@ def run_smoke(asin, product_url):
         add_clicked = True
 
         ewc_line = _wait_for_ewc_line(crawler.page, asin)
+        _save_state(crawler, "post_add_response", asin)
         if ewc_line:
             print(
                 f"[SMOKE] EWC price: asin={ewc_line.asin}, "
@@ -183,9 +263,11 @@ def run_smoke(asin, product_url):
             print("[SMOKE] EWC not available; verifying through the full cart")
 
         after_line, after_total = _load_active_cart(crawler, asin)
+        _save_state(crawler, "cart_after_add", asin)
         if after_line is None:
             raise RuntimeError(
-                "target ASIN was not found in the active cart after one Add"
+                "target ASIN was not found in the active cart after one Add "
+                f"(before_total={before_total}, after_total={after_total})"
             )
         if after_line.quantity != 1:
             raise RuntimeError(
@@ -246,10 +328,23 @@ def main():
         action="store_true",
         help="Acknowledge that a newly added item will remain in the cart.",
     )
+    parser.add_argument(
+        "--inspect-cart-only",
+        action="store_true",
+        help="Read the exact ASIN from the cart without clicking Add or Delete.",
+    )
     args = parser.parse_args()
 
     asin = normalize_asin(args.asin)
     product_url = args.url or f"https://www.amazon.com/dp/{asin}"
+    if args.inspect_cart_only:
+        if args.live or args.keep_in_cart:
+            parser.error(
+                "--inspect-cart-only cannot be combined with --live or "
+                "--keep-in-cart"
+            )
+        success = run_cart_inspection(asin)
+        raise SystemExit(0 if success else 1)
     if not args.live or not args.keep_in_cart:
         parser.error(
             "live cart mutation is disabled; pass both --live and "
