@@ -4,6 +4,7 @@ Safety properties:
 - no database connection or write;
 - no review collection;
 - no automatic Add-to-Cart retry;
+- no automatic protection-plan selection;
 - exact-ASIN cart lookup only;
 - an existing cart item is read without changing its quantity;
 - a newly added item is intentionally kept in the crawler account cart.
@@ -38,6 +39,7 @@ from amazon.tv.amazon_tv_cart_price import (
     active_cart_total_count,
     extract_active_cart_line,
     extract_ewc_cart_line,
+    extract_pdp_customer_visible_price,
     has_hidden_cart_price_message,
     normalize_asin,
     parse_html,
@@ -55,9 +57,13 @@ VISIBLE_MARKER_LOCATORS = (
         "add a protection plan",
         'xpath://*[contains(normalize-space(text()), "Add a protection plan")]',
     ),
+    ("warranty pane", "css:#attach-warranty-pane"),
     (
         "no thanks",
-        'xpath://*[not(self::script) and normalize-space(text())="No Thanks"]',
+        "xpath://*[not(self::script) and "
+        "translate(normalize-space(text()), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')="
+        "'no thanks']",
     ),
     (
         "continue shopping",
@@ -177,6 +183,65 @@ def _visible_add_to_cart_button(page):
     return visible[0]
 
 
+def _visible_warranty_decline_button(page, asin):
+    """Return the exact visible No-thanks control for the target product."""
+    panes = page.eles("css:#attach-warranty-pane", timeout=0.2) or []
+    visible_panes = [pane for pane in panes if pane.states.is_displayed]
+    if not visible_panes:
+        return None
+    if len(visible_panes) != 1:
+        raise RuntimeError(
+            f"expected one visible warranty pane, found {len(visible_panes)}"
+        )
+
+    asin = normalize_asin(asin)
+    base_asins = {
+        str(value or "").strip().upper()
+        for value in _tree(page).xpath(
+            "//*[@id='attach-baseAsin']/@value"
+        )
+        if str(value or "").strip()
+    }
+    if base_asins != {asin}:
+        raise RuntimeError(
+            f"warranty pane ASIN mismatch: expected={asin}, "
+            f"found={sorted(base_asins)}"
+        )
+
+    buttons = page.eles(
+        "css:#attach-warranty-pane "
+        "#attachSiNoCoverage input.a-button-input[type='submit']",
+        timeout=0.2,
+    ) or []
+    visible_buttons = [button for button in buttons if button.states.is_displayed]
+    if len(visible_buttons) != 1:
+        raise RuntimeError(
+            "expected one visible warranty No-thanks button, "
+            f"found {len(visible_buttons)}"
+        )
+    return visible_buttons[0]
+
+
+def _wait_for_add_response(page, asin, timeout_seconds=15):
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            line = extract_ewc_cart_line(_tree(page), asin)
+            if line:
+                return "ewc", line
+            decline_button = _visible_warranty_decline_button(page, asin)
+            if decline_button:
+                return "warranty", decline_button
+        except (CartPriceParseError, RuntimeError) as exc:
+            last_error = exc
+            break
+        time.sleep(1)
+    if last_error:
+        raise last_error
+    return None, None
+
+
 def _wait_for_ewc_line(page, asin, timeout_seconds=15):
     deadline = time.time() + timeout_seconds
     last_error = None
@@ -246,11 +311,52 @@ def run_cart_inspection(asin):
                 print(f"[SMOKE WARNING] Browser cleanup failed: {exc}")
 
 
+def run_pdp_price_inspection(asin, product_url):
+    """Read the exact-ASIN hidden PDP form price without any cart mutation."""
+    from amazon.tv.amazon_login import is_amazon_login_verified_dp
+
+    crawler = _new_crawler("pdp_inspect")
+    try:
+        _setup_logged_in_browser(crawler)
+        asin = normalize_asin(asin)
+        crawler.page.get(product_url)
+        time.sleep(2)
+        if not is_amazon_login_verified_dp(crawler.page):
+            raise RuntimeError("Amazon login was not verified on the PDP")
+        loaded_asin = crawler.extract_item(crawler.page.url)
+        if loaded_asin != asin:
+            raise RuntimeError(
+                f"PDP ASIN mismatch: expected={asin}, loaded={loaded_asin}"
+            )
+        tree = _save_state(crawler, "pdp_price_inspect", asin)
+        price = extract_pdp_customer_visible_price(tree, asin)
+        if price is None:
+            raise RuntimeError(
+                "exact-ASIN customer-visible price was not found in the PDP form"
+            )
+        print(
+            f"[SMOKE PDP PASS] asin={asin}, price={price}, "
+            "source=customerVisiblePrice, action=read-only"
+        )
+        print("[SMOKE] No Add, No-thanks, cart, or database action was used.")
+        return True
+    except Exception as exc:
+        print(f"[SMOKE PDP FAIL] {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if crawler.page:
+            try:
+                crawler.page.quit()
+            except Exception as exc:
+                print(f"[SMOKE WARNING] Browser cleanup failed: {exc}")
+
+
 def run_smoke(asin, product_url):
     from amazon.tv.amazon_login import is_amazon_login_verified_dp
 
     crawler = _new_crawler("live")
     add_clicked = False
+    no_thanks_clicked = False
     try:
         _setup_logged_in_browser(crawler)
         asin = normalize_asin(asin)
@@ -278,14 +384,31 @@ def run_smoke(asin, product_url):
         if not has_hidden_cart_price_message(_tree(crawler.page)):
             raise RuntimeError("logged-in hidden cart-price message was not found")
 
+        pdp_price = extract_pdp_customer_visible_price(_tree(crawler.page), asin)
+        print(
+            f"[SMOKE] PDP customer-visible price: asin={asin}, "
+            f"price={pdp_price}"
+        )
+
         button = _visible_add_to_cart_button(crawler.page)
         print(f"[SMOKE] Add-to-Cart once: asin={asin}")
         if not crawler.click_element(button, label="Smoke Add-to-Cart"):
             raise RuntimeError("Add-to-Cart click failed")
         add_clicked = True
 
-        ewc_line = _wait_for_ewc_line(crawler.page, asin)
+        response_type, response = _wait_for_add_response(crawler.page, asin)
         _save_state(crawler, "post_add_response", asin)
+        ewc_line = response if response_type == "ewc" else None
+        if response_type == "warranty":
+            print(f"[SMOKE] Warranty No-thanks once: asin={asin}")
+            if not crawler.click_element(
+                response, label="Smoke warranty No-thanks"
+            ):
+                raise RuntimeError("warranty No-thanks click failed")
+            no_thanks_clicked = True
+            ewc_line = _wait_for_ewc_line(crawler.page, asin)
+            _save_state(crawler, "post_no_thanks_response", asin)
+
         if ewc_line:
             print(
                 f"[SMOKE] EWC price: asin={ewc_line.asin}, "
@@ -315,6 +438,11 @@ def run_smoke(asin, product_url):
                 f"EWC/cart price mismatch: "
                 f"ewc={ewc_line.price}, cart={after_line.price}"
             )
+        if pdp_price and pdp_price != after_line.price:
+            raise RuntimeError(
+                f"PDP/cart price mismatch: "
+                f"pdp={pdp_price}, cart={after_line.price}"
+            )
 
         print(
             f"[SMOKE PASS] newly added cart item: asin={after_line.asin}, "
@@ -331,6 +459,11 @@ def run_smoke(asin, product_url):
                 "[SMOKE WARNING] Add-to-Cart was clicked once. "
                 "Inspect the target ASIN in the cart manually; "
                 "the script will not click Add or Delete again."
+            )
+        if no_thanks_clicked:
+            print(
+                "[SMOKE WARNING] Warranty No-thanks was clicked once; "
+                "no protection plan was selected."
             )
         return False
     finally:
@@ -365,10 +498,23 @@ def main():
         action="store_true",
         help="Read the exact ASIN from the cart without clicking Add or Delete.",
     )
+    parser.add_argument(
+        "--inspect-pdp-price-only",
+        action="store_true",
+        help="Read the exact-ASIN PDP form price without any cart mutation.",
+    )
     args = parser.parse_args()
 
     asin = normalize_asin(args.asin)
     product_url = args.url or f"https://www.amazon.com/dp/{asin}"
+    if args.inspect_pdp_price_only:
+        if args.inspect_cart_only or args.live or args.keep_in_cart:
+            parser.error(
+                "--inspect-pdp-price-only cannot be combined with cart or "
+                "live mutation flags"
+            )
+        success = run_pdp_price_inspection(asin, product_url)
+        raise SystemExit(0 if success else 1)
     if args.inspect_cart_only:
         if args.live or args.keep_in_cart:
             parser.error(

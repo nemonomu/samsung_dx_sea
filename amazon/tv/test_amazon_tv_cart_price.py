@@ -5,6 +5,7 @@ from amazon.tv.amazon_tv_cart_price import (
     active_cart_total_count,
     extract_active_cart_line,
     extract_ewc_cart_line,
+    extract_pdp_customer_visible_price,
     has_hidden_cart_price_message,
     parse_html,
 )
@@ -12,6 +13,7 @@ from amazon.tv.amazon_tv_cart_price_smoke import (
     _save_state,
     _visible_add_to_cart_button,
     _visible_page_markers,
+    _visible_warranty_decline_button,
 )
 
 
@@ -55,6 +57,16 @@ MULTI_ITEM_CART_HTML = """
     </div>
   </div>
   <span id="sc-subtotal-amount-activecart">$8,993.89</span>
+</body></html>
+"""
+
+PDP_HIDDEN_FORM_HTML = """
+<html><body>
+  <form id="addToCart" action="/gp/product/handle-buy-box/ref=dp_start-bbf_1_glance">
+    <input name="items[0.base][customerVisiblePrice][displayString]"
+           value="$2,997.95">
+    <input name="items[0.base][asin]" value="B0DXMZQ3MN">
+  </form>
 </body></html>
 """
 
@@ -110,6 +122,27 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         invalid = EWC_HTML.replace("$2,997.95", "See price in cart")
         with self.assertRaises(CartPriceParseError):
             extract_ewc_cart_line(parse_html(invalid), "B0DXMZQ3MN")
+
+    def test_pdp_customer_visible_price_is_scoped_to_exact_asin(self):
+        tree = parse_html(PDP_HIDDEN_FORM_HTML)
+        self.assertEqual(
+            extract_pdp_customer_visible_price(tree, "B0DXMZQ3MN"),
+            "$2,997.95",
+        )
+        self.assertIsNone(
+            extract_pdp_customer_visible_price(tree, "B000000000")
+        )
+
+    def test_pdp_customer_visible_price_rejects_ambiguous_forms(self):
+        duplicate = PDP_HIDDEN_FORM_HTML.replace(
+            "</body>",
+            PDP_HIDDEN_FORM_HTML.split("<body>", 1)[1].split("</body>", 1)[0]
+            + "</body>",
+        )
+        with self.assertRaises(CartPriceParseError):
+            extract_pdp_customer_visible_price(
+                parse_html(duplicate), "B0DXMZQ3MN"
+            )
 
     def test_visible_add_button_uses_drissionpage_states_api(self):
         class FakeStates:
@@ -184,6 +217,37 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
         markers, errors = _visible_page_markers(FakePage())
         self.assertEqual(markers, ["proceed to checkout"])
         self.assertEqual(errors, [])
+
+    def test_visible_warranty_decline_is_scoped_to_exact_asin(self):
+        class FakeStates:
+            is_displayed = True
+
+        class FakeElement:
+            states = FakeStates()
+
+        class FakePage:
+            html = """
+                <html><body>
+                  <input id="attach-baseAsin" value="B0DXMZQ3MN">
+                  <div id="attach-warranty-pane" style="display:block">
+                    <span id="attachSiNoCoverage">
+                      <input class="a-button-input" type="submit">
+                    </span>
+                  </div>
+                </body></html>
+            """
+
+            def eles(self, locator, timeout=0):
+                return [FakeElement()]
+
+        button = _visible_warranty_decline_button(
+            FakePage(), "B0DXMZQ3MN"
+        )
+        self.assertIsInstance(button, FakeElement)
+
+        FakePage.html = FakePage.html.replace("B0DXMZQ3MN", "B000000000")
+        with self.assertRaises(RuntimeError):
+            _visible_warranty_decline_button(FakePage(), "B0DXMZQ3MN")
 
 
 if __name__ == "__main__":

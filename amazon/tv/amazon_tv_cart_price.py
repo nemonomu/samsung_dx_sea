@@ -73,6 +73,58 @@ def has_hidden_cart_price_message(tree):
     return False
 
 
+def extract_pdp_customer_visible_price(tree, asin):
+    """Extract the exact-ASIN customer-visible price from the PDP buy-box form.
+
+    Amazon can render this value in the add-to-cart form even when the visible
+    price area contains only a hidden-price message. Ambiguous forms, ASINs, or
+    prices are rejected instead of guessing.
+    """
+    asin = normalize_asin(asin)
+    forms = tree.xpath(
+        "//form[@id='addToCart' and "
+        "contains(@action, '/gp/product/handle-buy-box')]"
+    )
+    matching = []
+    for form in forms:
+        form_asins = {
+            str(value or "").strip().upper()
+            for value in form.xpath(
+                ".//input[@name='items[0.base][asin]']/@value"
+            )
+            if str(value or "").strip()
+        }
+        if asin not in form_asins:
+            continue
+        if form_asins != {asin}:
+            raise CartPriceParseError(
+                f"PDP addToCart form has ambiguous ASINs: {sorted(form_asins)}"
+            )
+        matching.append(form)
+
+    if not matching:
+        return None
+    if len(matching) != 1:
+        raise CartPriceParseError(
+            f"PDP returned {len(matching)} addToCart forms for ASIN {asin}"
+        )
+
+    prices = []
+    for value in matching[0].xpath(
+        ".//input["
+        "@name='items[0.base][customerVisiblePrice][displayString]'"
+        "]/@value"
+    ):
+        price = normalize_money(value)
+        if price not in prices:
+            prices.append(price)
+    if len(prices) != 1:
+        raise CartPriceParseError(
+            f"PDP returned {len(prices)} customer-visible prices for ASIN {asin}"
+        )
+    return prices[0]
+
+
 def active_cart_total_count(tree):
     nodes = tree.xpath("//*[@id='sc-active-cart']")
     if len(nodes) != 1:
