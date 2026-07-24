@@ -1314,6 +1314,16 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 error.get('message') or '',
             )
 
+        review_notes = combined_data.pop('_review_notes', None) or []
+        for note in review_notes:
+            if note.get('logged'):
+                continue
+            print(
+                f"  [NEXT_DATA review INFO] "
+                f"stage={note.get('stage') or 'review_next_data'} "
+                f"message={note.get('message') or ''}"
+            )
+
     def build_listing_fallback_row(self, product):
         """Build a clean listing-only row without partial detail artifacts."""
         fallback = {field: None for field in self.EXTRACTED_FIELDS}
@@ -1437,6 +1447,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         next_data_client=None,
         record_errors=True,
         error_collector=None,
+        note_collector=None,
         log=True,
     ):
         client = next_data_client or self.next_data_client
@@ -1450,6 +1461,21 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     'product': product,
                     'message': str(message),
                 })
+
+        def add_note(stage, message):
+            note = {
+                'stage': stage,
+                'product': product,
+                'message': str(message),
+                'logged': bool(log),
+            }
+            if note_collector is not None:
+                note_collector.append(note)
+            if log:
+                print(
+                    f"  [NEXT_DATA review INFO] "
+                    f"stage={stage} message={message}"
+                )
 
         review_summary = {
             'count_of_reviews': count_of_reviews,
@@ -1630,7 +1656,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     print(f"  [NEXT_DATA review] page1: fallback reused {len(inline_reviews)} inline reviews from detail payload")
 
             if not page_added:
-                add_error(f'review_page{page_number}_next_data', last_reason)
+                stage = f'review_page{page_number}_next_data'
+                if page_number > page_limit:
+                    add_note(stage, last_reason)
+                else:
+                    add_error(stage, last_reason)
 
             detailed_review_content = format_reviews(review_texts, limit=20)
             collected_reviews = self._formatted_review_count(detailed_review_content)
@@ -1661,6 +1691,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
     ):
         client = next_data_client or self.next_data_client
         fast_errors = []
+        review_notes = []
         diagnostics_list = diagnostics if diagnostics is not None else []
 
         def add_diagnostic(stage, message):
@@ -1771,6 +1802,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 next_data_client=client,
                 record_errors=record_errors,
                 error_collector=fast_errors,
+                note_collector=review_notes,
                 log=log,
             )
             if not review_complete:
@@ -1846,6 +1878,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             if fast_errors:
                 combined_data['_fast_errors'] = fast_errors
+            if review_notes:
+                combined_data['_review_notes'] = review_notes
 
             if log:
                 review_count = self._formatted_review_count(detailed_review_content)

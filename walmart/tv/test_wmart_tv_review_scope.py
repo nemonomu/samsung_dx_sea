@@ -958,6 +958,171 @@ class ReviewCollectionTests(unittest.TestCase):
         self.assertEqual(detailed.count(' ||| ') + 1, 20)
         self.assertEqual(summary['count_of_reviews'], '20')
 
+    def test_optional_extra_page_misses_are_log_notes_not_errors(self):
+        source_url = (
+            'https://www.walmart.com/ip/example/100?classType=REGULAR'
+        )
+        page1 = build_review_url('100', 1, source_url)
+        page2 = build_review_url('100', 2, source_url)
+        page3 = build_review_url('100', 3, source_url)
+        page4 = build_review_url('100', 4, source_url)
+        client = FakeNextDataClient({
+            page1: review_next_data(
+                '100',
+                [f'p1-{index}' for index in range(10)],
+                20,
+                25,
+                4.5,
+                classType='REGULAR',
+            ),
+            page2: review_next_data(
+                '100',
+                [f'p2-{index}' for index in range(9)],
+                20,
+                25,
+                4.5,
+                classType='REGULAR',
+            ),
+            page3: review_next_data(
+                '100', [], 20, 25, 4.5, classType='REGULAR'
+            ),
+            page4: review_next_data(
+                '100', [], 20, 25, 4.5, classType='REGULAR'
+            ),
+        })
+        errors = []
+        notes = []
+        detailed, summary, complete = bare_crawler().collect_reviews_next_data(
+            '100',
+            '20',
+            [],
+            {'product_url': source_url},
+            star_rating='4.5',
+            count_of_star_ratings='25',
+            next_data_client=client,
+            record_errors=False,
+            error_collector=errors,
+            note_collector=notes,
+            log=False,
+        )
+
+        self.assertFalse(complete)
+        self.assertEqual(detailed.count(' ||| ') + 1, 19)
+        self.assertEqual(summary['count_of_reviews'], '20')
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [note['stage'] for note in notes],
+            ['review_page3_next_data', 'review_page4_next_data'],
+        )
+        self.assertTrue(all(note['message'] == 'no parsed reviews' for note in notes))
+        self.assertEqual(
+            client.urls,
+            [page1, page2, page3, page3, page4, page4],
+        )
+
+    def test_required_page_miss_remains_an_error(self):
+        source_url = (
+            'https://www.walmart.com/ip/example/100?classType=REGULAR'
+        )
+        page1 = build_review_url('100', 1, source_url)
+        page2 = build_review_url('100', 2, source_url)
+        page3 = build_review_url('100', 3, source_url)
+        page4 = build_review_url('100', 4, source_url)
+        empty_page = review_next_data(
+            '100', [], 20, 25, 4.5, classType='REGULAR'
+        )
+        client = FakeNextDataClient({
+            page1: review_next_data(
+                '100',
+                [f'p1-{index}' for index in range(10)],
+                20,
+                25,
+                4.5,
+                classType='REGULAR',
+            ),
+            page2: empty_page,
+            page3: empty_page,
+            page4: empty_page,
+        })
+        errors = []
+        notes = []
+
+        detailed, _, complete = bare_crawler().collect_reviews_next_data(
+            '100',
+            '20',
+            [],
+            {'product_url': source_url},
+            star_rating='4.5',
+            count_of_star_ratings='25',
+            next_data_client=client,
+            record_errors=False,
+            error_collector=errors,
+            note_collector=notes,
+            log=False,
+        )
+
+        self.assertFalse(complete)
+        self.assertEqual(detailed.count(' ||| ') + 1, 10)
+        self.assertEqual(
+            [error['stage'] for error in errors],
+            ['review_page2_next_data'],
+        )
+        self.assertEqual(
+            [note['stage'] for note in notes],
+            ['review_page3_next_data', 'review_page4_next_data'],
+        )
+
+    def test_optional_page_scope_mismatch_remains_an_error(self):
+        source_url = (
+            'https://www.walmart.com/ip/example/100?classType=REGULAR'
+        )
+        page1 = build_review_url('100', 1, source_url)
+        page2 = build_review_url('100', 2, source_url)
+        page3 = build_review_url('100', 3, source_url)
+        client = FakeNextDataClient({
+            page1: review_next_data(
+                '100',
+                [f'p1-{index}' for index in range(10)],
+                20,
+                25,
+                4.5,
+                classType='REGULAR',
+            ),
+            page2: review_next_data(
+                '100',
+                [f'p2-{index}' for index in range(9)],
+                20,
+                25,
+                4.5,
+                classType='REGULAR',
+            ),
+            page3: review_next_data(
+                '999', ['wrong item'], 1, 1, 1, classType='REGULAR'
+            ),
+        })
+        errors = []
+        notes = []
+
+        detailed, _, complete = bare_crawler().collect_reviews_next_data(
+            '100',
+            '20',
+            [],
+            {'product_url': source_url},
+            star_rating='4.5',
+            count_of_star_ratings='25',
+            next_data_client=client,
+            record_errors=False,
+            error_collector=errors,
+            note_collector=notes,
+            log=False,
+        )
+
+        self.assertFalse(complete)
+        self.assertIsNone(detailed)
+        self.assertEqual(errors[0]['stage'], 'review_scope_mismatch')
+        self.assertIn('expected=100, actual=999', errors[0]['message'])
+        self.assertEqual(notes, [])
+
     def test_missing_scope_is_rejected_without_partial_merge(self):
         url = build_review_url(ITEM, 1, SCOPED_PRODUCT_URL)
         client = FakeNextDataClient({
@@ -1123,6 +1288,28 @@ class DetailSaveGuardTests(unittest.TestCase):
         self.assertTrue(crawler.save_detail_result(row))
         self.assertEqual(db_calls, ['mst', 'retail'])
 
+    def test_optional_review_notes_are_logged_without_run_errors(self):
+        crawler = self.save_crawler()
+        crawler.detail_report = {
+            'review_mismatches': [],
+            'run_errors': [],
+        }
+        row = valid_detail_row()
+        row['_review_notes'] = [{
+            'stage': 'review_page3_next_data',
+            'message': 'no parsed reviews',
+            'logged': False,
+        }]
+
+        with patch('builtins.print') as print_mock:
+            self.assertTrue(crawler.save_detail_result(row))
+
+        self.assertEqual(crawler.detail_report['run_errors'], [])
+        self.assertTrue(any(
+            'review_page3_next_data' in str(call)
+            for call in print_mock.call_args_list
+        ))
+
     def test_listing_fallback_never_writes_item_mst(self):
         crawler = bare_crawler()
         saved_rows = []
@@ -1198,6 +1385,91 @@ class DetailReportTests(unittest.TestCase):
         self.assertIn('PDP reviews=20', body)
         self.assertNotIn('detail missing', body)
         self.assertNotIn('run errors', body)
+
+    def test_required_review_page_error_remains_in_email(self):
+        body, severity = build_walmart_tv_email_report(
+            crawl_results={},
+            detail_report={
+                'target_records': 1,
+                'detail_records': 1,
+                'saved_records': 1,
+                'review_mismatches': [],
+                'run_errors': [{
+                    'stage': 'review_page2_next_data',
+                    'url': 'https://www.walmart.com/ip/100',
+                    'message': 'no parsed reviews',
+                }],
+            },
+            log_file=None,
+            elapsed=1,
+            failed_stages=[],
+        )
+
+        self.assertEqual(severity, 'warning')
+        self.assertIn('run errors: 1', body)
+        self.assertIn('필수 리뷰 페이지 실패', body)
+        self.assertIn('stage=review_page2_next_data', body)
+        self.assertIn('message=no parsed reviews', body)
+
+    def test_run_error_email_uses_korean_labels_and_keeps_raw_details(self):
+        run_errors = [
+            {
+                'stage': 'review_scope_mismatch',
+                'url': 'https://www.walmart.com/ip/100',
+                'message': 'review response item mismatch: expected=100, actual=999',
+            },
+            {
+                'stage': 'review_scope_mismatch',
+                'url': 'https://www.walmart.com/ip/100',
+                'message': 'review response scope mismatch: classType expected=REGULAR, actual=VARIANT',
+            },
+            {
+                'stage': 'detail_zenrows_recovery_exhausted',
+                'url': 'https://www.walmart.com/ip/200',
+                'message': 'reason=price_missing; item=200',
+            },
+            {
+                'stage': 'detail_zenrows_recovery_exhausted',
+                'url': 'https://www.walmart.com/ip/300',
+                'message': 'reason=no_next_data; no __NEXT_DATA__',
+            },
+            {
+                'stage': 'detail_update',
+                'url': 'https://www.walmart.com/ip/400',
+                'message': 'database update failed',
+            },
+            {
+                'stage': 'new_unclassified_stage',
+                'url': 'https://www.walmart.com/ip/500',
+                'message': 'new error details',
+            },
+        ]
+
+        body, severity = build_walmart_tv_email_report(
+            crawl_results={},
+            detail_report={
+                'target_records': 6,
+                'detail_records': 6,
+                'saved_records': 6,
+                'review_mismatches': [],
+                'run_errors': run_errors,
+            },
+            log_file=None,
+            elapsed=1,
+            failed_stages=[],
+        )
+
+        self.assertEqual(severity, 'warning')
+        self.assertIn('실행 오류 / run errors: 6', body)
+        self.assertIn('다른 상품 리뷰 응답 감지', body)
+        self.assertIn('상품 범위 불일치', body)
+        self.assertIn('가격 누락으로 상세 복구 실패', body)
+        self.assertIn('상세페이지 데이터 응답 없음으로 상세 복구 실패', body)
+        self.assertIn('상세 데이터 업데이트 실패', body)
+        self.assertIn('기타 수집 오류', body)
+        for item in run_errors:
+            self.assertIn(f"stage={item['stage']}", body)
+            self.assertIn(f"message={item['message']}", body)
 
 
 class DetailUpdateSaveTests(unittest.TestCase):
