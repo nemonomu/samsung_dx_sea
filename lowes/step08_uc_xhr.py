@@ -57,6 +57,10 @@ PURCHASED_UNITS_RE = re.compile(
     r"\b\d[\d,]*(?:\.\d+)?\s*[kKmM]?\+?\s+(?:bought|purchased|sold)\b(?:\s+last\s+week)?",
     re.I,
 )
+REF_CAPACITY_FROM_DESCRIPTION_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(?:cu\.?\s*ft\.?|cuft|cubic\s*feet)\b",
+    re.I,
+)
 
 STORE = os.getenv('LOWES_API_STORE_ID', '289').lstrip('0') or '289'
 STORE_FMT = STORE.zfill(4) if len(STORE) <= 4 else STORE
@@ -115,6 +119,11 @@ def purchased_units_phrase(value):
     text = re.sub(r'\s+', ' ', str(value or '')).strip()
     match = PURCHASED_UNITS_RE.search(text)
     return match.group(0) if match else ''
+
+
+def ref_capacity_from_description(value):
+    match = REF_CAPACITY_FROM_DESCRIPTION_RE.search(str(value or ''))
+    return match.group(1) if match else ''
 
 
 def read_input_rows():
@@ -542,7 +551,12 @@ def parse_productdetail(sku, body):
     else:
         ref_type = appliance_type or _category_fallback_ref_type(product.get('categories', {}))
         out['ref_refrigerator_type'] = ref_type
-        ref_cap = capacity_overall or capacity_refrigerator or capacity_freezer
+        ref_cap = (
+            capacity_overall
+            or capacity_refrigerator
+            or capacity_freezer
+            or ref_capacity_from_description(out['detail_product_description'])
+        )
         out['ref_capacity'] = f'{ref_cap} Cu.Feet' if ref_cap else ''
 
     ratings = (obj.get('ratings', {}) or {}).get(sku) or {}
