@@ -185,8 +185,9 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
         try:
             cursor = self.db_conn.cursor()
 
-            # 크롤링으로 추출한 모든 필드 — None이면 NULL로 UPDATE
-            # (이번 실행에서 추출된 결과로 row의 추출 필드를 완전히 덮어씀)
+            # 크롤링으로 추출한 필드는 이번 결과로 덮어쓴다.
+            # 단, 리뷰 본문을 이번 실행에서 얻지 못한 경우(None)에는
+            # 기존 detailed_review_content를 유지해 정상 데이터를 지우지 않는다.
             # 필드 리스트는 부모의 EXTRACTED_FIELDS 사용 → 부모에 새 필드 추가 시 자동 반영
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             update_meta = {
@@ -198,7 +199,14 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                 **update_meta,
             }
 
-            updates = [f"{key} = %s" for key in update_data]
+            updates = [
+                (
+                    f"{key} = COALESCE(%s, {key})"
+                    if key == 'detailed_review_content'
+                    else f"{key} = %s"
+                )
+                for key in update_data
+            ]
             params = list(update_data.values())
             params.append(row_id)
             update_query = f"UPDATE {self.target_table} SET {', '.join(updates)} WHERE id = %s"

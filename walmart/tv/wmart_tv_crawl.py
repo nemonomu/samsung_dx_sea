@@ -97,10 +97,58 @@ def email_config_bool(value, default=False):
     return bool(value)
 
 
+RUN_ERROR_STAGE_LABELS = {
+    'detail': '상세페이지 처리 오류',
+    'detail_save_rejected': '검증된 상세 데이터 저장 실패',
+    'detail_update': '상세 데이터 업데이트 실패',
+    'listing_fallback_save_failed': '목록 데이터 대체 저장 실패',
+}
+
+DETAIL_RECOVERY_REASON_LABELS = {
+    'review_scope_mismatch': '다른 상품 리뷰 응답 또는 상품 범위 불일치로 상세 복구 실패',
+    'review_incomplete': '리뷰 본문 수집 불완전으로 상세 복구 실패',
+    'review_page_missing': '필수 리뷰 페이지 응답 누락으로 상세 복구 실패',
+    'price_missing': '가격 누락으로 상세 복구 실패',
+    'redirect_mismatch': '상품 범위 불일치로 상세 복구 실패',
+    'item_missing': '상품 번호 누락으로 상세 복구 실패',
+    'no_candidate_url': '상세페이지 주소 누락으로 상세 복구 실패',
+    'no_next_data': '상세페이지 데이터 응답 없음으로 상세 복구 실패',
+    'worker_exception': '상세 수집 작업 오류로 상세 복구 실패',
+    'invalid_recovery_source': '허용되지 않은 복구 응답으로 상세 복구 실패',
+    'unknown': '원인을 확인할 수 없는 상세 복구 실패',
+}
+
+
+def walmart_tv_run_error_label(item):
+    """Return a Korean operator-facing label without replacing raw diagnostics."""
+    stage = str((item or {}).get('stage') or '').strip()
+    message = str((item or {}).get('message') or '').strip()
+    message_lower = message.lower()
+
+    if stage.startswith('review_page') and stage.endswith('_next_data'):
+        return '필수 리뷰 페이지 실패'
+
+    if stage == 'review_scope_mismatch':
+        if 'item mismatch' in message_lower:
+            return '다른 상품 리뷰 응답 감지'
+        return '상품 범위 불일치'
+
+    if stage == 'detail_zenrows_recovery_exhausted':
+        match = re.search(r'(?:^|;\s*)reason=([^;\s]+)', message_lower)
+        reason = match.group(1) if match else 'unknown'
+        return DETAIL_RECOVERY_REASON_LABELS.get(
+            reason,
+            f'상세 복구 실패(미분류 원인: {reason})',
+        )
+
+    return RUN_ERROR_STAGE_LABELS.get(stage, '기타 수집 오류')
+
+
 def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapsed, failed_stages, error_message=None):
     detail_report = detail_report or {}
     redirects = detail_report.get('redirects') or []
     run_errors = detail_report.get('run_errors') or []
+    review_mismatches = detail_report.get('review_mismatches') or []
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -122,7 +170,9 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     unsaved_records = max(target_records - saved_records, 0)
     missing_detail_records = max(target_records - detail_records, 0)
     detail_blocked = missing_detail_records > 0
-    has_warning = bool(redirects or run_errors or detail_blocked)
+    has_warning = bool(
+        redirects or run_errors or review_mismatches or detail_blocked
+    )
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
     lines = [
@@ -142,24 +192,38 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
 
     lines.append('SOS' if severity == 'sos' else 'WARNING')
     if error_message:
-        lines.append(f'- fatal error: {error_message}')
+        lines.append(f'- 치명적 실행 오류 / fatal error: {error_message}')
     if failed_stages:
-        lines.append(f"- failed stages: {', '.join(failed_stages)}")
+        lines.append(f"- 실패 단계 / failed stages: {', '.join(failed_stages)}")
     if detail_blocked:
         lines.append(
-            f"- detail missing: {missing_detail_records}/{target_records} target URLs "
+            f"- 상세페이지 수집 누락 / detail missing: "
+            f"{missing_detail_records}/{target_records} target URLs "
             f"did not produce validated detail rows "
             f"(unsaved={unsaved_records}, listing_only={undetailed_records})"
         )
     if run_errors:
-        lines.append(f"- run errors: {len(run_errors)}")
+        lines.append(f"- 실행 오류 / run errors: {len(run_errors)}")
         for item in run_errors[:20]:
             lines.append(
-                f"  - stage={item.get('stage')} url={item.get('url') or ''} "
+                f"  - {walmart_tv_run_error_label(item)} | "
+                f"stage={item.get('stage')} url={item.get('url') or ''} "
                 f"message={item.get('message')}"
             )
+    if review_mismatches:
+        lines.append(
+            "- 상품페이지 리뷰 수와 수집 리뷰 본문 수 불일치: "
+            f"{len(review_mismatches)}건"
+        )
+        for item in review_mismatches[:20]:
+            lines.append(
+                f"  - PDP reviews={item.get('pdp_review_count')}, "
+                f"expected bodies={item.get('expected_review_bodies')}, "
+                f"collected bodies={item.get('collected_review_bodies')} "
+                f"url={item.get('url') or ''}"
+            )
     if redirects:
-        lines.append(f"- redirects: {len(redirects)}")
+        lines.append(f"- 상품 주소 변경 감지 / redirects: {len(redirects)}")
         for item in redirects[:50]:
             lines.append(
                 f"  - {item.get('url') or ''} ({item.get('decision')}) "
