@@ -123,16 +123,18 @@ def finalize_row(row, batch_id, crawl_dt):
     o["original_sku_price"] = money(was)
     o["savings"] = money(save)
 
-    # star_rating / count fallback: listing → detail.reviewStatistics
+    # star_rating / count fallback: detail.reviewStatistics → listing
+    # The review API is the source rendered in the PDP review section. Listing/search
+    # counts can lag behind it, so use them only when reviewStatistics is unavailable.
     # NULL = 수집 실패 (XHR error 등). 0 = 평가/리뷰 실재 없음 (page에서 0/Be the first).
     listing_rating = row.get("star_rating", "") or row.get("rating", "")
     listing_review_count = row.get("count_of_reviews", "") or row.get("review_count", "")
     detail_avg_rating = row.get("_pdp_average_rating", "")
     detail_total_reviews = row.get("_pdp_total_reviews", "")
-    o["star_rating"] = format_rating(listing_rating if str(listing_rating).strip() else detail_avg_rating)
-    fallback_count = listing_review_count if str(listing_review_count).strip() else detail_total_reviews
-    o["count_of_reviews"] = fallback_count
-    o["count_of_star_ratings"] = fallback_count
+    o["star_rating"] = format_rating(first_present(detail_avg_rating, listing_rating))
+    final_review_count = first_present(detail_total_reviews, listing_review_count)
+    o["count_of_reviews"] = final_review_count
+    o["count_of_star_ratings"] = final_review_count
     o["discount_type"] = row.get("discount_type", "")
     o["sku_popularity"] = row.get("sku_popularity", "")
     o["sku_status"] = row.get("sku_status", "")
