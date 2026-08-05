@@ -1,6 +1,7 @@
 import unittest
 
 from amazon.tv.amazon_tv_cart_price import (
+    CartLine,
     CartPriceParseError,
     active_cart_total_count,
     build_cart_price_report_lines,
@@ -101,6 +102,20 @@ PDP_OFFER_HTML = """
   </form>
 </body></html>
 """
+
+UNRECOGNIZED_TABLE_HIDDEN_PDP = PDP_OFFER_HTML.replace(
+    "<body>",
+    """<body>
+      <table class="a-lineitem"><tbody><tr>
+        <td>Price:</td>
+        <td>
+          To see our price, add this item to your cart.
+          You can always remove it later.
+          <a href="#">Why?</a>
+        </td>
+      </tr></tbody></table>
+    """,
+)
 
 MULTI_SELLER_SAME_ASIN_CART_HTML = """
 <html><body>
@@ -403,6 +418,123 @@ class AmazonTVCartPriceParserTests(unittest.TestCase):
             ),
             (None, False),
         )
+
+    def test_unrecognized_empty_price_reads_existing_exact_cart_offer_only(self):
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+        tree = parse_html(UNRECOGNIZED_TABLE_HIDDEN_PDP)
+        self.assertIsNone(hidden_pdp_price_trigger(tree, None))
+
+        crawler = object.__new__(AmazonTVDetailCrawler)
+        loaded_offers = []
+
+        def load_exact_offer(offer):
+            loaded_offers.append((offer.asin, offer.merchant_id))
+            return CartLine(
+                asin=offer.asin,
+                quantity=1,
+                price="$2,997.95",
+                source="active_cart_offer",
+                merchant_id=offer.merchant_id,
+            )
+
+        crawler._load_exact_cart_offer = load_exact_offer
+        crawler._restore_exact_offer_pdp = lambda url, offer: (tree, offer)
+        crawler._visible_cart_add_button = lambda: self.fail(
+            "read-only fallback must not inspect or click Add-to-Cart"
+        )
+
+        result = crawler.resolve_hidden_price_from_cart(
+            tree,
+            "B0DXMZQ3MN",
+            "https://www.amazon.com/dp/B0DXMZQ3MN",
+            None,
+        )
+
+        self.assertEqual(result[0], "$2,997.95")
+        self.assertTrue(result[1])
+        self.assertEqual(result[2], "cart_existing_exact_offer")
+        self.assertEqual(result[4]["trigger"], "unrecognized_price_state")
+        self.assertEqual(
+            loaded_offers,
+            [("B0DXMZQ3MN", "A13ACIRM091OJE")],
+        )
+
+    def test_unrecognized_empty_price_stays_null_when_exact_cart_offer_absent(self):
+        import contextlib
+        import io
+
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+        tree = parse_html(UNRECOGNIZED_TABLE_HIDDEN_PDP)
+        crawler = object.__new__(AmazonTVDetailCrawler)
+        crawler._load_exact_cart_offer = lambda offer: None
+        crawler._restore_exact_offer_pdp = lambda url, offer: (tree, offer)
+        crawler._visible_cart_add_button = lambda: self.fail(
+            "read-only fallback must not inspect or click Add-to-Cart"
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = crawler.resolve_hidden_price_from_cart(
+                tree,
+                "B0DXMZQ3MN",
+                "https://www.amazon.com/dp/B0DXMZQ3MN",
+                None,
+            )
+
+        self.assertIsNone(result[0])
+        self.assertFalse(result[1])
+        self.assertIsNone(result[2])
+        self.assertIsNone(result[4])
+        self.assertIn("issue_type=exact_cart_offer_not_found", output.getvalue())
+        self.assertIn("action=price_null", output.getvalue())
+
+    def test_unrecognized_nonempty_status_does_not_open_cart(self):
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+        tree = parse_html(UNRECOGNIZED_TABLE_HIDDEN_PDP)
+        crawler = object.__new__(AmazonTVDetailCrawler)
+        crawler._load_exact_cart_offer = lambda offer: self.fail(
+            "an explicit non-dollar status must not trigger a cart read"
+        )
+
+        result = crawler.resolve_hidden_price_from_cart(
+            tree,
+            "B0DXMZQ3MN",
+            "https://www.amazon.com/dp/B0DXMZQ3MN",
+            "Currently unavailable.",
+        )
+
+        self.assertEqual(result[0], "Currently unavailable.")
+        self.assertFalse(result[1])
+        self.assertIsNone(result[2])
+        self.assertIsNone(result[4])
+
+    def test_unrecognized_empty_price_without_exact_offer_does_not_open_cart(self):
+        self._ensure_test_config_module()
+        from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
+
+        tree = parse_html("<html><body><div>No price</div></body></html>")
+        crawler = object.__new__(AmazonTVDetailCrawler)
+        crawler._load_exact_cart_offer = lambda offer: self.fail(
+            "a PDP without an exact offer must not open the cart"
+        )
+
+        result = crawler.resolve_hidden_price_from_cart(
+            tree,
+            "B0DXMZQ3MN",
+            "https://www.amazon.com/dp/B0DXMZQ3MN",
+            None,
+        )
+
+        self.assertIsNone(result[0])
+        self.assertFalse(result[1])
+        self.assertIsNone(result[2])
+        self.assertIsNone(result[4])
 
     def test_visible_add_button_uses_drissionpage_states_api(self):
         class FakeStates:

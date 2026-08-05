@@ -908,15 +908,57 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
     ):
         """Resolve a hidden price from the exact ASIN+merchant cart row.
 
-        An existing matching row is read without mutation. If it is absent,
-        Add-to-Cart is clicked at most once per ASIN+merchant for this process,
-        a matching warranty pane is declined once, and the new item is kept.
-        The PDP is restored before normal spec/review collection continues.
+        Recognized hidden-price states keep the existing behavior: an existing
+        matching row is read first, then Add-to-Cart is clicked at most once
+        per ASIN+merchant when the row is absent. For an empty price whose PDP
+        state is not recognized, only an already-existing exact cart offer is
+        read; the item is never added. The PDP is restored before normal
+        spec/review collection continues.
         """
-        if not is_hidden_pdp_price_state(tree, current_price):
-            return current_price, False, None, tree, None
-
         trigger = hidden_pdp_price_trigger(tree, current_price)
+        if trigger is None:
+            # Preserve explicit non-dollar states such as "Currently
+            # unavailable.". The conservative cart fallback applies only
+            # when the price extractor returned no value at all.
+            if str(current_price or '').strip():
+                return current_price, False, None, tree, None
+
+            offer = extract_pdp_offer_identity(tree, item)
+            if offer is None:
+                return current_price, False, None, tree, None
+
+            restored_tree = tree
+            try:
+                line = self._load_exact_cart_offer(offer)
+            finally:
+                restored_tree, _ = self._restore_exact_offer_pdp(
+                    product_url, offer
+                )
+
+            if line is None:
+                print(
+                    '  [PRICE ISSUE] '
+                    f'item={offer.asin} '
+                    'issue_type=exact_cart_offer_not_found '
+                    'action=price_null'
+                )
+                return None, False, None, restored_tree, None
+
+            resolution = {
+                'item': offer.asin,
+                'price': line.price,
+                'source': 'cart_existing_exact_offer',
+                'trigger': 'unrecognized_price_state',
+                'merchant': offer.merchant_id,
+                'quantity': line.quantity,
+            }
+            return (
+                line.price,
+                True,
+                'cart_existing_exact_offer',
+                restored_tree,
+                resolution,
+            )
 
         offer = extract_pdp_offer_identity(tree, item)
         if offer is None:
