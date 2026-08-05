@@ -50,6 +50,7 @@ API_RETRY_STATUS_CODES = {
     if value.strip()
 }
 STORE_SEED_TIMEOUT_SECONDS = float(os.getenv("LOWES_UC_STORE_SEED_TIMEOUT_SECONDS", "45"))
+HOME_WARMUP_SECONDS = 10
 SESSION_MAX_ATTEMPTS = max(1, int(os.getenv("LOWES_UC_SESSION_MAX_ATTEMPTS", "3")))
 SESSION_RETRY_SLEEP_SECONDS = float(os.getenv("LOWES_UC_SESSION_RETRY_SLEEP_SECONDS", "60"))
 FAILED_PAGES_RETRY_PASSES = max(0, int(os.getenv("LOWES_UC_FAILED_PAGES_RETRY_PASSES", "1")))
@@ -428,6 +429,16 @@ def add_cookie(driver, name, value):
     )
 
 
+def warm_up_homepage(driver, logger):
+    logger.write(f"WARMUP homepage wait_seconds={HOME_WARMUP_SECONDS}")
+    try:
+        driver.set_page_load_timeout(STORE_SEED_TIMEOUT_SECONDS)
+        driver.get(LOWES_BASE_URL)
+    except (TimeoutException, WebDriverException) as exc:
+        logger.write(f"WARN  homepage warm-up page load failed; continue after wait: {exc}")
+    time.sleep(HOME_WARMUP_SECONDS)
+
+
 def seed_store_cookies(driver, logger):
     if not SET_STORE_COOKIES:
         return
@@ -435,12 +446,6 @@ def seed_store_cookies(driver, logger):
         f"SEED  store cookies store={API_STORE_ID} zip={API_STORE_ZIP} "
         f"state={API_STORE_STATE} nearby={API_NEARBY_STORES}"
     )
-    try:
-        driver.set_page_load_timeout(STORE_SEED_TIMEOUT_SECONDS)
-        driver.get(LOWES_BASE_URL)
-        time.sleep(2)
-    except (TimeoutException, WebDriverException) as exc:
-        logger.write(f"WARN  store cookie seed page load failed; continue with explicit cookies: {exc}")
     store_data = {
         "id": API_STORE_ID,
         "zip": API_STORE_ZIP,
@@ -506,6 +511,7 @@ def launch_search_session(logger):
     for session_attempt in range(1, SESSION_MAX_ATTEMPTS + 1):
         driver = launch_driver(logger)
         try:
+            warm_up_homepage(driver, logger)
             seed_store_cookies(driver, logger)
             logger.write(f"OPEN  {search_url} session_attempt={session_attempt}/{SESSION_MAX_ATTEMPTS}")
             driver.get(search_url)
@@ -564,7 +570,8 @@ def main():
     logger.write(f"RUN_ROOT={RUN_ROOT}")
     logger.write(
         f"SEARCH_TERM={SEARCH_TERM} pages={pages} page_size={PAGE_SIZE} "
-        f"boot_wait_seconds={BOOT_WAIT_SECONDS} ready_timeout_seconds={READY_TIMEOUT_SECONDS} "
+        f"home_warmup_seconds={HOME_WARMUP_SECONDS} boot_wait_seconds={BOOT_WAIT_SECONDS} "
+        f"ready_timeout_seconds={READY_TIMEOUT_SECONDS} "
         f"api_wait_seconds={API_WAIT_SECONDS} api_attempts={API_MAX_ATTEMPTS} "
         f"api_retry_sleep_seconds={API_RETRY_SLEEP_SECONDS} page_sleep_seconds={API_PAGE_SLEEP_SECONDS} "
         f"session_attempts={SESSION_MAX_ATTEMPTS} session_retry_sleep_seconds={SESSION_RETRY_SLEEP_SECONDS} "
