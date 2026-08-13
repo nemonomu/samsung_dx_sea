@@ -566,7 +566,7 @@ def collected_count_issues(category, collected_count):
     return []
 
 
-def detail_fetch_failure_issues(run_root):
+def detail_fetch_failure_issues(category, run_root):
     """Flag the step08 detail dead-page pattern where SKU batches die with
     "TypeError: Failed to fetch" once the browser page loses its bestbuy.com
     origin, which silently wipes retailer_sku_name_similar (and cascades to the
@@ -632,10 +632,13 @@ def detail_fetch_failure_issues(run_root):
     if error_counts:
         top_key = max(error_counts, key=error_counts.get)
         dominant = f", 주 원인: {top_key} ({error_counts[top_key]}건)"
+    recovery_category = str(category or "").strip().upper()
+    recovery_run_folder = Path(run_root).name
     return [
         f"detail 수집 실패 {attempted - succeeded}/{attempted} "
         f"(성공률 {round(success_rate * 100)}%){dominant} "
-        f"→ run_bestbuy_similar_recovery.bat 로 복구 필요"
+        f"→ PowerShell 복구 명령: "
+        f".\\run_bestbuy_similar_recovery.bat {recovery_category} {recovery_run_folder}"
     ]
 
 
@@ -901,7 +904,7 @@ def build_notification(category, run_root, status="success", failed_step="", fai
         issues.append("final_output.csv rows 0 또는 파일 없음")
     issues.extend(all_null_column_issues(category, rows, columns))
     issues.extend(critical_null_issues(rows, columns))
-    issues.extend(detail_fetch_failure_issues(run_root))
+    issues.extend(detail_fetch_failure_issues(category, run_root))
     review_issues, review_notes = review_completeness_issues(rows, run_root)
     issues.extend(review_issues)
     notes.extend(review_notes)
