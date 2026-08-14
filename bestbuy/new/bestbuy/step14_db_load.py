@@ -135,6 +135,9 @@ def normalize_value(value, data_type, column_name=""):
         return None
     data_type = str(data_type or "").lower()
     if data_type in {"integer", "bigint", "smallint"}:
+        if column_name == "promotion_position":
+            match = re.search(r"-?\d+", str(value))
+            value = match.group(0) if match else value
         try:
             return int(str(value).replace(",", "").strip())
         except ValueError:
@@ -431,6 +434,9 @@ def promotion_update_candidates(rows, batch_id=""):
             continue
         if batch_id and row_batch_id != batch_id:
             continue
+        page_type = str(row.get("page_type") or "").strip().lower()
+        if page_type != "main":
+            continue
         if str(row.get("target_source") or "").strip() == "promotion_backfill":
             continue
         promotion_type = str(row.get("promotion_type") or "").strip()
@@ -439,6 +445,7 @@ def promotion_update_candidates(rows, batch_id=""):
             continue
         normalized = dict(row)
         normalized["item"] = item
+        normalized["page_type"] = "main"
         candidates.append(normalized)
     return candidates
 
@@ -458,7 +465,7 @@ def update_promotion_only(cur, csv_path, table_name, dry_run=False, batch_id=UPD
             "batch_id_filter": batch_id,
         }
     columns = table_columns(cur, table_name) if cur else fallback_csv_columns(rows)
-    required = {"batch_id", "item", "promotion_type", "promotion_position"}
+    required = {"batch_id", "item", "page_type", "promotion_type", "promotion_position"}
     available = {name for name, _ in columns}
     missing = sorted(required - available)
     if missing:
@@ -469,20 +476,24 @@ def update_promotion_only(cur, csv_path, table_name, dry_run=False, batch_id=UPD
         sql = (
             f"UPDATE {quote_ident(TARGET_SCHEMA)}.{quote_ident(table_name)} "
             f"SET promotion_type = %s, promotion_position = %s "
-            f"WHERE batch_id = %s AND item = %s"
+            f"WHERE batch_id = %s AND item = %s AND page_type = %s"
         )
         updated = 0
         for row in rows:
+            params = [
+                row.get("promotion_type") or None,
+                normalize_value(row.get("promotion_position"), "integer", "promotion_position"),
+                str(row.get("batch_id") or "").strip(),
+                str(row.get("item") or "").strip(),
+            ]
+            params.append("main")
             cur.execute(
                 sql,
-                (
-                    row.get("promotion_type") or None,
-                    normalize_value(row.get("promotion_position"), "integer", "promotion_position"),
-                    str(row.get("batch_id") or "").strip(),
-                    str(row.get("item") or "").strip(),
-                ),
+                tuple(params),
             )
             updated += max(cur.rowcount, 0)
+        if updated != len(rows):
+            raise RuntimeError(f"promotion DB update count mismatch: {updated}/{len(rows)}")
     return {
         "csv": rel_path(csv_path),
         "table": f"{TARGET_SCHEMA}.{table_name}",
@@ -492,7 +503,91 @@ def update_promotion_only(cur, csv_path, table_name, dry_run=False, batch_id=UPD
         "dry_run": dry_run,
         "mode": "update_promotion_only",
         "batch_id_filter": batch_id,
-        "match_keys": ["batch_id", "item"],
+        "match_keys": ["batch_id", "item", "page_type"],
+        "updated_columns": ["promotion_type", "promotion_position"],
+    }
+
+
+def product_list_promotion_update_candidates(rows, batch_id=""):
+    candidates = []
+    for row in rows:
+        row_batch_id = str(row.get("batch_id") or "").strip()
+        sku_id = row_sku_id(row)
+        page_type = str(row.get("page_type") or "").strip().lower()
+        if not row_batch_id or not sku_id or page_type != "main":
+            continue
+        if batch_id and row_batch_id != batch_id:
+            continue
+        promotion_type = str(row.get("promotion_type") or "").strip()
+        promotion_position = str(row.get("promotion_position") or "").strip()
+        if not promotion_type and not promotion_position:
+            continue
+        normalized = dict(row)
+        normalized["sku_id"] = sku_id
+        normalized["page_type"] = "main"
+        candidates.append(normalized)
+    return candidates
+
+
+def update_product_list_promotion_only(
+    cur,
+    csv_path,
+    table_name,
+    dry_run=False,
+    batch_id=UPDATE_BATCH_ID,
+):
+    source_rows = read_csv(csv_path)
+    rows = product_list_promotion_update_candidates(source_rows, batch_id)
+    if not rows:
+        return {
+            "csv": rel_path(csv_path),
+            "table": f"{TARGET_SCHEMA}.{table_name}",
+            "csv_rows": len(source_rows),
+            "candidate_rows": 0,
+            "updated": 0,
+            "dry_run": dry_run,
+            "mode": "update_product_list_promotion_only",
+            "batch_id_filter": batch_id,
+        }
+    columns = table_columns(cur, table_name) if cur else fallback_csv_columns(rows)
+    required = {"batch_id", "sku_id", "page_type", "promotion_type", "promotion_position"}
+    available = {name for name, _ in columns}
+    missing = sorted(required - available)
+    if missing:
+        raise RuntimeError(f"DB product-list table is missing columns for promotion update: {missing}")
+    if dry_run:
+        updated = 0
+    else:
+        sql = (
+            f"UPDATE {quote_ident(TARGET_SCHEMA)}.{quote_ident(table_name)} "
+            f"SET promotion_type = %s, promotion_position = %s "
+            f"WHERE batch_id = %s AND sku_id = %s AND page_type = %s"
+        )
+        updated = 0
+        for row in rows:
+            cur.execute(
+                sql,
+                (
+                    row.get("promotion_type") or None,
+                    normalize_value(row.get("promotion_position"), "integer", "promotion_position"),
+                    str(row.get("batch_id") or "").strip(),
+                    str(row.get("sku_id") or "").strip(),
+                    "main",
+                ),
+            )
+            updated += max(cur.rowcount, 0)
+        if updated != len(rows):
+            raise RuntimeError(f"promotion product-list DB update count mismatch: {updated}/{len(rows)}")
+    return {
+        "csv": rel_path(csv_path),
+        "table": f"{TARGET_SCHEMA}.{table_name}",
+        "csv_rows": len(source_rows),
+        "candidate_rows": len(rows),
+        "updated": updated,
+        "dry_run": dry_run,
+        "mode": "update_product_list_promotion_only",
+        "batch_id_filter": batch_id,
+        "match_keys": ["batch_id", "sku_id", "page_type"],
         "updated_columns": ["promotion_type", "promotion_position"],
     }
 
@@ -566,6 +661,32 @@ def update_availability_only(cur, csv_path, table_name, dry_run=False, batch_id=
     }
 
 
+def db_load_manifest(started_at, final_result, product_list_result):
+    return {
+        "run_type": "step14_db_load",
+        "started_at": started_at,
+        "finished_at": now(),
+        "category": CATEGORY,
+        "dry_run": DRY_RUN,
+        "update_similar_only": UPDATE_SIMILAR_ONLY,
+        "update_availability_only": UPDATE_AVAILABILITY_ONLY,
+        "update_promotion_only": UPDATE_PROMOTION_ONLY,
+        "row_upsert_only": ROW_UPSERT_ONLY,
+        "row_upsert_nonblank_only": ROW_UPSERT_NONBLANK_ONLY,
+        "row_upsert_sku_filter_count": len(ROW_UPSERT_SKUS),
+        "row_upsert_item_filter_count": len(ROW_UPSERT_ITEMS),
+        "update_batch_id": UPDATE_BATCH_ID,
+        "run_root": rel_path(RUN_ROOT),
+        "final_output": final_result,
+        "product_list": product_list_result,
+    }
+
+
+def write_db_load_manifest(manifest):
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def main():
     started_at = now()
     config = db_config()
@@ -587,54 +708,52 @@ def main():
             connect_timeout=10,
         )
     if conn:
-        with conn:
-            with conn.cursor() as cur:
-                if UPDATE_AVAILABILITY_ONLY:
-                    final_result = update_availability_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
-                    product_list_result = {"skipped": True, "reason": "update_availability_only"}
-                elif UPDATE_PROMOTION_ONLY:
-                    final_result = update_promotion_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
-                    product_list_result = {"skipped": True, "reason": "update_promotion_only"}
-                elif UPDATE_SIMILAR_ONLY:
-                    final_result = update_similar_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
-                    product_list_result = {"skipped": True, "reason": "update_similar_only"}
-                else:
-                    final_result = load_one(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
-                    product_list_result = load_one(cur, PRODUCT_LIST_CSV, product_list_table, DRY_RUN)
-        conn.close()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    if UPDATE_AVAILABILITY_ONLY:
+                        final_result = update_availability_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
+                        product_list_result = {"skipped": True, "reason": "update_availability_only"}
+                    elif UPDATE_PROMOTION_ONLY:
+                        final_result = update_promotion_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
+                        product_list_result = update_product_list_promotion_only(
+                            cur,
+                            FINAL_OUTPUT_CSV,
+                            product_list_table,
+                            DRY_RUN,
+                        )
+                    elif UPDATE_SIMILAR_ONLY:
+                        final_result = update_similar_only(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
+                        product_list_result = {"skipped": True, "reason": "update_similar_only"}
+                    else:
+                        final_result = load_one(cur, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
+                        product_list_result = load_one(cur, PRODUCT_LIST_CSV, product_list_table, DRY_RUN)
+                manifest = db_load_manifest(started_at, final_result, product_list_result)
+                # Keep artifact/DB state atomic for update-only recovery: a manifest
+                # write failure raises before the connection context commits.
+                write_db_load_manifest(manifest)
+        finally:
+            conn.close()
     else:
         if UPDATE_AVAILABILITY_ONLY:
             final_result = update_availability_only(None, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
             product_list_result = {"skipped": True, "reason": "update_availability_only"}
         elif UPDATE_PROMOTION_ONLY:
             final_result = update_promotion_only(None, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
-            product_list_result = {"skipped": True, "reason": "update_promotion_only"}
+            product_list_result = update_product_list_promotion_only(
+                None,
+                FINAL_OUTPUT_CSV,
+                product_list_table,
+                DRY_RUN,
+            )
         elif UPDATE_SIMILAR_ONLY:
             final_result = update_similar_only(None, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
             product_list_result = {"skipped": True, "reason": "update_similar_only"}
         else:
             final_result = load_one(None, FINAL_OUTPUT_CSV, final_table, DRY_RUN)
             product_list_result = load_one(None, PRODUCT_LIST_CSV, product_list_table, DRY_RUN)
-
-    manifest = {
-        "run_type": "step14_db_load",
-        "started_at": started_at,
-        "finished_at": now(),
-        "category": CATEGORY,
-        "dry_run": DRY_RUN,
-        "update_similar_only": UPDATE_SIMILAR_ONLY,
-        "update_availability_only": UPDATE_AVAILABILITY_ONLY,
-        "update_promotion_only": UPDATE_PROMOTION_ONLY,
-        "row_upsert_only": ROW_UPSERT_ONLY,
-        "row_upsert_nonblank_only": ROW_UPSERT_NONBLANK_ONLY,
-        "row_upsert_sku_filter_count": len(ROW_UPSERT_SKUS),
-        "row_upsert_item_filter_count": len(ROW_UPSERT_ITEMS),
-        "update_batch_id": UPDATE_BATCH_ID,
-        "run_root": rel_path(RUN_ROOT),
-        "final_output": final_result,
-        "product_list": product_list_result,
-    }
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        manifest = db_load_manifest(started_at, final_result, product_list_result)
+        write_db_load_manifest(manifest)
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
 
 

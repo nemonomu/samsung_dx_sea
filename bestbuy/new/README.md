@@ -59,6 +59,14 @@ Lowe's dry-run:
 python -m lowes.lowes_orchestrator --dry-run --all
 ```
 
+BestBuy TV promotion만 복구할 때는 기존 실행 폴더를 정확히 지정합니다. 이 명령은 promotion 페이지만 다시 수집하고, 기존 `main` 상품과 겹치는 행의 `promotion_type`, `promotion_position`만 갱신합니다.
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat "C:\samsung_dx_sea\bestbuy\new\bestbuy\data\tv\20260813"
+```
+
+수집 결과가 검증 기준에 미달하면 기존 CSV와 DB는 갱신하지 않습니다. 복구 증거와 기존 파일 백업은 실행 폴더 아래 `promotion_recovery\<timestamp>`에 저장됩니다.
+
 ## 보안/데이터 정책
 
 아래 파일은 Git에 올리지 않습니다.

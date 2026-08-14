@@ -8,7 +8,13 @@ from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 
-from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, KRW_PER_USD, bestbuy_category, rel_path
+from .step00_config import (
+    DEFAULT_BESTBUY_RUN_ROOT,
+    KRW_PER_USD,
+    PROMOTION_TV_EXPECTED_MIN_ROWS,
+    bestbuy_category,
+    rel_path,
+)
 
 
 CATEGORY = bestbuy_category()
@@ -747,17 +753,23 @@ def listing_count_issues(category, run_root, rows, target_manifest):
             issues.append(f"trend listing sku {trend_count}/10")
 
     if category == "TV":
-        issue = collection_failed_issue("promotion", read_json(run_root / "promotion" / "summary.json"))
+        promotion_summary = read_json(run_root / "promotion" / "summary.json")
+        issue = collection_failed_issue("promotion", promotion_summary)
         if issue:
             issues.append(issue)
-        promotion_count = as_int(target_manifest.get("promotion_unique_count"))
-        if not promotion_count:
-            promotion_count = unique_csv_count(
+        promotion_count = max(
+            as_int(target_manifest.get("promotion_unique_count")),
+            unique_csv_count(
                 run_root / "promotion" / "parsed" / "all_promotion_products.csv",
                 "sku_id",
+            ),
+        )
+        promotion_expected = as_int(promotion_summary.get("expected_min_rows")) or PROMOTION_TV_EXPECTED_MIN_ROWS
+        if promotion_count < promotion_expected:
+            issues.append(
+                f"promotion listing sku {promotion_count}/{promotion_expected} "
+                f"→ PowerShell 복구 명령: .\\run_bestbuy_promotion_recovery.bat \"{run_root}\""
             )
-        if promotion_count <= 0:
-            issues.append(f"promotion listing sku {promotion_count}/18")
     return issues
 
 

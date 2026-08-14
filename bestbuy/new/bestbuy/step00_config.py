@@ -90,13 +90,19 @@ def load_env(path=None):
 
 load_env()
 
+PROMOTION_TV_HOME_THEATER_URL = (
+    "https://www.bestbuy.com/site/all-electronics-on-sale/all-tv-home-theater-on-sale/"
+    "pcmcat1690836748285.c?id=pcmcat1690836748285"
+)
+PROMOTION_TV_HEADLINE = "Don’t-miss deals on TVs"
+PROMOTION_TV_SUBHEADLINE = "Big savings for a limited time"
+PROMOTION_TV_EXPECTED_MIN_ROWS = 16
+
+
 BESTBUY_URLS = {
     "main_search": "https://www.bestbuy.com/site/searchpage.jsp?id=pcat17071&st=tv",
     "bsr_search": "https://www.bestbuy.com/site/searchpage.jsp?id=pcat17071&sp=Best-Selling&st=tv",
-    "promotion_tv_home_theater": (
-        "https://www.bestbuy.com/site/all-tv-home-theater-on-sale/tvs-on-sale/"
-        "pcmcat1720647543741.c?id=pcmcat1720647543741"
-    ),
+    "promotion_tv_home_theater": PROMOTION_TV_HOME_THEATER_URL,
     "trending_tvs_projectors": (
         "https://www.bestbuy.com/discover/trending-deals/"
         "trending-deals-tvs-projectors/pcmcat1752523988655"
@@ -104,7 +110,7 @@ BESTBUY_URLS = {
 }
 
 PROMOTION_LABELS = {
-    "pcmcat1690836748285-1": "DON'T-MISS DEALS ON TVs",
+    "pcmcat1690836748285-1": PROMOTION_TV_HEADLINE,
     "pcmcat1690836748285-2": "Featured deals",
     "pcmcat1690836748285-3": "On-sale lifestyle TVs as low as $799.99",
     "pcmcat1690836748285-5": "Save up to $1,500 on select OLED TVs",

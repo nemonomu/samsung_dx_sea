@@ -7,7 +7,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, bestbuy_dated_run_root, has_target_url, target_url
+from .step00_config import (
+    DEFAULT_BESTBUY_RUN_ROOT,
+    PROMOTION_TV_EXPECTED_MIN_ROWS,
+    bestbuy_dated_run_root,
+    has_target_url,
+    target_url,
+)
 
 
 PYTHON = sys.executable
@@ -127,7 +133,7 @@ STEPS = [
         {
             "BESTBUY_PROMOTION_PLACEMENT": "all",
             "BESTBUY_PROMOTION_FETCH_MODE": "browser_dom",
-            "BESTBUY_PROMOTION_EXPECTED_MIN_ROWS": "18",
+            "BESTBUY_PROMOTION_EXPECTED_MIN_ROWS": str(PROMOTION_TV_EXPECTED_MIN_ROWS),
             "BESTBUY_PROMOTION_BROWSER_HEADLESS": "0",
             "ZENROWS_TIMEOUT": "180",
         },
@@ -323,6 +329,8 @@ def apply_run_path_env(env):
     derived_paths = {
         "BESTBUY_OUTPUT_ROOT": output_root,
         "BESTBUY_DETAIL_RUN_ROOT": detail_root,
+        "BESTBUY_PROMOTION_RUN_ROOT": root / "promotion",
+        "BESTBUY_TRENDING_RUN_ROOT": root / "trending",
         "BESTBUY_DETAIL_TARGET_CSV": output_root / "bestbuy_final_targets.csv",
         "BESTBUY_FINAL_OUTPUT_CSV": output_root / "final_output.csv",
         "BESTBUY_PRODUCT_LIST_OUTPUT": output_root / "bestbuy_product_list.csv",

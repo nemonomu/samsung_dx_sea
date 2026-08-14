@@ -7,8 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from zenrows import ZenRowsClient
-
 from .step00_apollo import iter_apollo_push_payloads
 from .step00_browser_session import (
     add_intl_nosplash,
@@ -22,6 +20,9 @@ from .step00_browser_session import (
 from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
     PROMOTION_LABELS,
+    PROMOTION_TV_EXPECTED_MIN_ROWS,
+    PROMOTION_TV_HEADLINE,
+    PROMOTION_TV_SUBHEADLINE,
     bestbuy_category,
     load_initial_urls,
     rel_path,
@@ -51,7 +52,10 @@ PROMOTION_SCROLL_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_PROMOTION_SCROLL_JS_
 BROWSER_HEADLESS = env_bool("BESTBUY_PROMOTION_BROWSER_HEADLESS", "1")
 BROWSER_LOCAL_PORT = env_int("BESTBUY_PROMOTION_BROWSER_LOCAL_PORT", "0")
 PROMOTION_MAX_ATTEMPTS = max(1, int(os.getenv("BESTBUY_PROMOTION_MAX_ATTEMPTS", "5")))
-PROMOTION_EXPECTED_MIN_ROWS = max(0, int(os.getenv("BESTBUY_PROMOTION_EXPECTED_MIN_ROWS", "18")))
+PROMOTION_EXPECTED_MIN_ROWS = max(
+    0,
+    int(os.getenv("BESTBUY_PROMOTION_EXPECTED_MIN_ROWS", str(PROMOTION_TV_EXPECTED_MIN_ROWS))),
+)
 PROMOTION_RETRY_SLEEP_SECONDS = float(os.getenv("BESTBUY_PROMOTION_RETRY_SLEEP_SECONDS", "2"))
 PROMOTION_RETRY_STATUS_CODES = {
     int(value)
@@ -62,9 +66,9 @@ PROMOTION_RETRY_STATUS_CODES = {
     .split()
     if value.strip().isdigit()
 }
-PROMOTION_DOM_TYPE = os.getenv("BESTBUY_PROMOTION_DOM_TYPE", "DON'T-MISS DEALS ON TVs")
-PROMOTION_DOM_HEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_HEADLINE", "Don't-miss deals on TVs")
-PROMOTION_DOM_SUBHEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_SUBHEADLINE", "Big savings for a limited time")
+PROMOTION_DOM_HEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_HEADLINE", PROMOTION_TV_HEADLINE)
+PROMOTION_DOM_TYPE = os.getenv("BESTBUY_PROMOTION_DOM_TYPE", PROMOTION_DOM_HEADLINE)
+PROMOTION_DOM_SUBHEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_SUBHEADLINE", PROMOTION_TV_SUBHEADLINE)
 PROMOTION_DOM_SELECTOR = os.getenv("BESTBUY_PROMOTION_DOM_SELECTOR", ".pl-flex-carousel")
 ENDPOINT = os.getenv("BESTBUY_GRAPHQL_ENDPOINT", "https://www.bestbuy.com/gateway/graphql")
 PLACEMENT = os.getenv("BESTBUY_PROMOTION_PLACEMENT", "all")
@@ -1041,6 +1045,8 @@ def main():
         api_key = os.getenv("ZENROWS_API_KEY")
         if not api_key:
             raise RuntimeError("Set ZENROWS_API_KEY in .env")
+        from zenrows import ZenRowsClient
+
         client = ZenRowsClient(api_key)
     else:
         raise ValueError("BESTBUY_PROMOTION_FETCH_MODE must be browser_dom, browser_graphql, zenrows, or direct")

@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -14,10 +15,14 @@ from .bestbuy_orchestrator import (
     STEPS,
     apply_run_path_env,
 )
-from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, bestbuy_category, has_target_url
-from .step00_fulfillment_graphql import parse_fulfillment_response
-
-
+from .step00_config import (
+    DEFAULT_BESTBUY_RUN_ROOT,
+    PROMOTION_TV_EXPECTED_MIN_ROWS,
+    PROMOTION_TV_HEADLINE,
+    PROMOTION_TV_HOME_THEATER_URL,
+    bestbuy_category,
+    has_target_url,
+)
 PYTHON = sys.executable
 
 DEFAULT_STEP_NAMES = [
@@ -67,6 +72,20 @@ PRESERVE_SKIP_FIELDS = {
 }
 TIMESTAMP_FIELDS = {"crawl_datetime", "crawl_strdatetime"}
 AVAILABILITY_FIELDS = ("pick_up_availability", "fastest_delivery", "delivery_availability")
+PROMOTION_OVERLAY_FIELDS = (
+    "batch_id",
+    "item",
+    "page_type",
+    "sku_id",
+    "promotion_type",
+    "promotion_position",
+)
+PROMOTION_ARTIFACT_PATHS = (
+    ("final_output", Path("output/final_output.csv")),
+    ("final_targets", Path("output/bestbuy_final_targets.csv")),
+    ("product_list", Path("output/bestbuy_product_list.csv")),
+    ("detail_rows", Path("detail/parsed/detail_enriched_rows.csv")),
+)
 
 
 class StepFailure(RuntimeError):
@@ -316,7 +335,353 @@ def row_sku(row, lookup):
     return ""
 
 
+def item_from_product_url(value):
+    text = compact(value).split("?", 1)[0].rstrip("/")
+    if "/sku/" not in text.lower():
+        return ""
+    before_sku = text[: text.lower().rfind("/sku/")].rstrip("/")
+    item = before_sku.rsplit("/", 1)[-1].strip()
+    return item if item.lower() not in {"", "product", "site"} else ""
+
+
+def recovery_row_item(row):
+    return compact(row.get("item") or row.get("bsin")) or item_from_product_url(
+        row.get("product_url") or row.get("detail_url")
+    )
+
+
+def is_main_recovery_row(row):
+    page_type = compact(row.get("page_type")).lower()
+    if page_type:
+        return page_type == "main"
+    target_source = compact(row.get("target_source")).lower()
+    if target_source:
+        return target_source == "main"
+    return False
+
+
+def promotion_values_by_sku(rows):
+    grouped = {}
+    for row in rows:
+        sku = compact(row.get("sku_id"))
+        promotion_type = compact(row.get("promotion_type"))
+        promotion_position = compact(row.get("promotion_position"))
+        if not sku or not promotion_type or not promotion_position:
+            continue
+        pair = (promotion_type, promotion_position)
+        pairs = grouped.setdefault(sku, [])
+        if pair not in pairs:
+            pairs.append(pair)
+    return {
+        sku: {
+            "promotion_type": " ||| ".join(value[0] for value in values),
+            "promotion_position": " ||| ".join(value[1] for value in values),
+        }
+        for sku, values in grouped.items()
+    }
+
+
+def build_promotion_overlay_rows(promotion_rows, final_rows, target_rows, batch_id):
+    target_skus_by_key = {}
+    for row in target_rows:
+        if not is_main_recovery_row(row):
+            continue
+        sku = compact(row.get("sku_id"))
+        if not sku:
+            continue
+        for key in row_match_keys(row):
+            target_skus_by_key.setdefault(key, set()).add(sku)
+
+    main_by_sku = {}
+    main_sku_by_identity = {}
+    ambiguous_main_skus = set()
+    for row in final_rows:
+        if not is_main_recovery_row(row):
+            continue
+        row_batch_id = compact(row.get("batch_id"))
+        if row_batch_id != batch_id:
+            continue
+        sku = compact(row.get("sku_id"))
+        if not sku:
+            matched_skus = set()
+            for key in row_match_keys(row):
+                matched_skus.update(target_skus_by_key.get(key, set()))
+            if len(matched_skus) == 1:
+                sku = next(iter(matched_skus))
+            elif len(matched_skus) > 1:
+                raise RuntimeError(f"ambiguous main SKU match for item={recovery_row_item(row)}")
+        item = recovery_row_item(row)
+        if not sku or not item:
+            continue
+        identity = (row_batch_id, item.lower())
+        identity_owner = main_sku_by_identity.get(identity)
+        if identity_owner and identity_owner != sku:
+            raise RuntimeError(
+                "ambiguous main DB identity for promotion recovery: "
+                f"batch_id={row_batch_id} item={item} skus={identity_owner},{sku}"
+            )
+        main_sku_by_identity[identity] = sku
+        existing = main_by_sku.get(sku)
+        if existing and existing["identity"] != identity:
+            ambiguous_main_skus.add(sku)
+            continue
+        main_by_sku[sku] = {
+            "identity": identity,
+            "batch_id": row_batch_id,
+            "item": item,
+        }
+    if ambiguous_main_skus:
+        raise RuntimeError("ambiguous main rows for promotion SKUs: " + ",".join(sorted(ambiguous_main_skus)))
+
+    promotion_by_sku = promotion_values_by_sku(promotion_rows)
+    overlay_rows = []
+    for sku, values in promotion_by_sku.items():
+        main = main_by_sku.get(sku)
+        if not main:
+            continue
+        overlay_rows.append(
+            {
+                "batch_id": main["batch_id"],
+                "item": main["item"],
+                "page_type": "main",
+                "sku_id": sku,
+                "promotion_type": values["promotion_type"],
+                "promotion_position": values["promotion_position"],
+            }
+        )
+    stats = {
+        "collected_unique_skus": len(promotion_by_sku),
+        "existing_main_skus": len(main_by_sku),
+        "matched_main_skus": len(overlay_rows),
+        "unmatched_promotion_skus": sorted(set(promotion_by_sku) - set(main_by_sku)),
+    }
+    return overlay_rows, stats
+
+
+def read_csv_table(path):
+    path = Path(path)
+    if not path.exists():
+        return [], []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        return list(reader), list(reader.fieldnames or [])
+
+
+def prepare_promotion_artifact_updates(run_root, overlay_rows, batch_id):
+    overlay_by_sku = {compact(row.get("sku_id")): row for row in overlay_rows}
+    overlay_by_item = {}
+    for overlay_row in overlay_rows:
+        item = compact(overlay_row.get("item")).lower()
+        existing = overlay_by_item.get(item)
+        if existing and compact(existing.get("sku_id")) != compact(overlay_row.get("sku_id")):
+            raise RuntimeError(f"ambiguous promotion overlay item: {item}")
+        overlay_by_item[item] = overlay_row
+    plans = []
+    for label, relative_path in PROMOTION_ARTIFACT_PATHS:
+        path = run_root / relative_path
+        rows, fieldnames = read_csv_table(path)
+        if not rows:
+            continue
+        matched_skus = set()
+        changed_rows = 0
+        planned_rows = []
+        for source_row in rows:
+            row = dict(source_row)
+            if not is_main_recovery_row(row):
+                planned_rows.append(row)
+                continue
+            row_batch_id = compact(row.get("batch_id"))
+            if row_batch_id and row_batch_id != batch_id:
+                planned_rows.append(row)
+                continue
+            sku = compact(row.get("sku_id"))
+            overlay = overlay_by_sku.get(sku) if sku else None
+            if not sku:
+                overlay = overlay_by_item.get(recovery_row_item(row).lower())
+            if not overlay:
+                planned_rows.append(row)
+                continue
+            matched_skus.add(compact(overlay.get("sku_id")))
+            before = (compact(row.get("promotion_type")), compact(row.get("promotion_position")))
+            row["promotion_type"] = overlay["promotion_type"]
+            row["promotion_position"] = overlay["promotion_position"]
+            after = (compact(row.get("promotion_type")), compact(row.get("promotion_position")))
+            if before != after:
+                changed_rows += 1
+            planned_rows.append(row)
+        for field in ("promotion_type", "promotion_position"):
+            if field not in fieldnames:
+                fieldnames.append(field)
+        plans.append(
+            {
+                "label": label,
+                "path": path,
+                "rows": planned_rows,
+                "fieldnames": fieldnames,
+                "original_rows": rows,
+                "original_fieldnames": list(rows[0].keys()),
+                "matched_rows": len(matched_skus),
+                "changed_rows": changed_rows,
+            }
+        )
+
+    final_plan = next((plan for plan in plans if plan["label"] == "final_output"), None)
+    if not final_plan:
+        raise RuntimeError("promotion recovery requires output/final_output.csv")
+    if final_plan["matched_rows"] != len(overlay_rows):
+        raise RuntimeError(
+            "promotion overlay did not match every existing main row "
+            f"({final_plan['matched_rows']}/{len(overlay_rows)})"
+        )
+    return plans
+
+
+def write_csv_rows_atomic(path, rows, fieldnames):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        write_csv_rows(temp_path, rows, fieldnames)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def backup_promotion_recovery_inputs(run_root, recovery_root, plans):
+    before_root = recovery_root / "before"
+    for plan in plans:
+        source = plan["path"]
+        destination = before_root / source.relative_to(run_root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    canonical_promotion = run_root / "promotion"
+    if canonical_promotion.exists():
+        shutil.copytree(canonical_promotion, before_root / "promotion", dirs_exist_ok=True)
+    target_manifest = run_root / "output" / "bestbuy_final_targets.manifest.json"
+    if target_manifest.exists():
+        destination = before_root / "output" / target_manifest.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target_manifest, destination)
+
+
+def apply_prepared_promotion_updates(plans):
+    results = []
+    written = []
+    try:
+        for plan in plans:
+            write_csv_rows_atomic(plan["path"], plan["rows"], plan["fieldnames"])
+            written.append(plan)
+            results.append(
+                {
+                    "artifact": plan["label"],
+                    "path": str(plan["path"]),
+                    "matched_rows": plan["matched_rows"],
+                    "changed_rows": plan["changed_rows"],
+                    "updated_columns": ["promotion_type", "promotion_position"],
+                }
+            )
+    except Exception as exc:
+        try:
+            restore_prepared_promotion_updates(written)
+        except Exception as rollback_exc:
+            raise RuntimeError(
+                f"promotion artifact update failed ({exc}); rollback failed: {rollback_exc}"
+            ) from exc
+        raise
+    return results
+
+
+def restore_prepared_promotion_updates(plans):
+    rollback_errors = []
+    for plan in reversed(plans):
+        try:
+            write_csv_rows_atomic(
+                plan["path"],
+                plan["original_rows"],
+                plan["original_fieldnames"],
+            )
+        except Exception as exc:
+            rollback_errors.append(f"{plan['label']}: {exc}")
+    if rollback_errors:
+        raise RuntimeError("; ".join(rollback_errors))
+
+
+def publish_validated_promotion(staged_promotion_root, run_root):
+    canonical_promotion = run_root / "promotion"
+    canonical_promotion.mkdir(parents=True, exist_ok=True)
+    summary_path = staged_promotion_root / "summary.json"
+    if summary_path.exists():
+        shutil.copy2(summary_path, canonical_promotion / "summary.json")
+    for relative_path in (Path("parsed"), Path("raw/browser_dom")):
+        source = staged_promotion_root / relative_path
+        if source.exists():
+            shutil.copytree(source, canonical_promotion / relative_path, dirs_exist_ok=True)
+
+
+def update_promotion_target_manifest(run_root, collected_unique_skus, matched_main_skus, recovery_root):
+    path = run_root / "output" / "bestbuy_final_targets.manifest.json"
+    manifest = read_json(path)
+    if not manifest:
+        return {"skipped": True, "reason": "target manifest missing"}
+    manifest["promotion_unique_count"] = collected_unique_skus
+    manifest["promotion_recovery"] = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "matched_main_skus": matched_main_skus,
+        "recovery_root": str(recovery_root),
+        "updated_columns": ["promotion_type", "promotion_position"],
+    }
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return {
+        "path": str(path),
+        "promotion_unique_count": collected_unique_skus,
+        "matched_main_skus": matched_main_skus,
+    }
+
+
+def promotion_container_found(summary):
+    for item in summary.get("summaries") or []:
+        if item.get("container_found"):
+            return True
+    return bool(summary.get("container_found"))
+
+
+def validate_promotion_recovery(summary, rows, minimum_rows):
+    if summary.get("collection_failed") or summary.get("skipped"):
+        raise RuntimeError(f"promotion collection failed: {summary.get('reason') or summary.get('error') or 'unknown'}")
+    if not promotion_container_found(summary):
+        raise RuntimeError("promotion target container was not found")
+    urls = []
+    for item in summary.get("summaries") or []:
+        urls.extend([compact(item.get("url")), compact(item.get("browser_url"))])
+    if not any("pcmcat1690836748285" in value for value in urls):
+        raise RuntimeError("promotion collector did not use the verified pcmcat1690836748285 page")
+    promotion_by_sku = promotion_values_by_sku(rows)
+    if len(promotion_by_sku) < minimum_rows:
+        raise RuntimeError(
+            f"promotion collection below recovery minimum: {len(promotion_by_sku)}/{minimum_rows} unique SKUs"
+        )
+    unexpected_types = sorted(
+        {
+            compact(values.get("promotion_type"))
+            for values in rows
+            if compact(values.get("promotion_type")) != PROMOTION_TV_HEADLINE
+        }
+    )
+    if unexpected_types:
+        raise RuntimeError(f"unexpected promotion_type values: {unexpected_types}")
+    return {"unique_skus": len(promotion_by_sku), "minimum_rows": minimum_rows}
+
+
 def cached_availability_values(run_root):
+    from .step00_fulfillment_graphql import parse_fulfillment_response
+
     values_by_sku = {}
     raw_roots = sorted((run_root / "availability_backfill").glob("*/raw"))
     response_count = 0
@@ -443,6 +808,7 @@ def base_env(category, run_root, batch_id, preserve_table_env=False):
             "BESTBUY_FETCH_SPONSORED_ENRICHMENT": "0",
             "BESTBUY_DB_UPDATE_SIMILAR_ONLY": "0",
             "BESTBUY_DB_UPDATE_AVAILABILITY_ONLY": "0",
+            "BESTBUY_DB_UPDATE_PROMOTION_ONLY": "0",
             "BESTBUY_DB_ROW_UPSERT_ONLY": "1",
             "BESTBUY_DB_ROW_UPSERT_NONBLANK_ONLY": "1",
             "BESTBUY_DB_ROW_UPSERT_ALLOW_ALL": "0",
@@ -590,14 +956,24 @@ def echo_process_line(line):
         print(safe_line, end="")
 
 
-def run_step(step, category, base, log_handle, dry_run=False, refresh_all_availability=False):
+def run_step(
+    step,
+    category,
+    base,
+    log_handle,
+    dry_run=False,
+    refresh_all_availability=False,
+    env_overrides=None,
+):
     if should_skip_join_step(step, category):
         print(f"[sos:skip] step {step.key} {step.name}: not applicable for {category}")
         log_handle.write(f"[sos:skip] step {step.key} {step.name}: not applicable for {category}\n")
         return
     env = step_env(step, category, base, refresh_all_availability=refresh_all_availability)
+    env.update(env_overrides or {})
     command = [PYTHON, "-m", step.module]
-    interesting_env = {key: env[key] for key in sorted(step.env) if key in env}
+    interesting_keys = set(step.env) | set(env_overrides or {})
+    interesting_env = {key: env[key] for key in sorted(interesting_keys) if key in env}
     if step.name in {"main_list", "bsr_list", "detail_html", "review20", "availability_backfill"}:
         interesting_env.update(
             {
@@ -649,6 +1025,196 @@ def selected_steps(refresh_join_sources=False, no_db_load=False):
     if no_db_load:
         names = [name for name in names if name not in {"db_prepare", "db_load", "item_mst_load"}]
     return [step_by_name(name) for name in names]
+
+
+def write_promotion_recovery_manifest(path, manifest):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def run_promotion_only_recovery(category, run_root, batch_id, base, args, log_handle, recovery_root):
+    if category != "TV":
+        raise RuntimeError("--promotion-only is available only for TV")
+    if args.promotion_min_rows < 1:
+        raise RuntimeError("--promotion-min-rows must be at least 1")
+
+    staged_promotion_root = recovery_root / "promotion"
+    overlay_path = recovery_root / "overlay" / "promotion_updates.csv"
+    db_output_root = recovery_root / "db"
+    manifest_path = recovery_root / "manifest.json"
+    manifest = {
+        "run_type": "bestbuy_promotion_only_recovery",
+        "status": "running",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "category": category,
+        "batch_id": batch_id,
+        "run_root": str(run_root),
+        "recovery_root": str(recovery_root),
+        "source_url": PROMOTION_TV_HOME_THEATER_URL,
+        "promotion_type": PROMOTION_TV_HEADLINE,
+        "minimum_rows": args.promotion_min_rows,
+        "db_load": not args.no_db_load,
+        "updated_columns": ["promotion_type", "promotion_position"],
+        "new_rows_allowed": False,
+    }
+    write_promotion_recovery_manifest(manifest_path, manifest)
+
+    promotion_overrides = {
+        "BESTBUY_PROMOTION_RUN_ROOT": str(staged_promotion_root),
+        "BESTBUY_PROMOTION_REFERER": PROMOTION_TV_HOME_THEATER_URL,
+        "BESTBUY_PROMOTION_DOM_HEADLINE": PROMOTION_TV_HEADLINE,
+        "BESTBUY_PROMOTION_DOM_TYPE": PROMOTION_TV_HEADLINE,
+        "BESTBUY_PROMOTION_EXPECTED_MIN_ROWS": str(args.promotion_min_rows),
+        "BESTBUY_PROMOTION_FETCH_MODE": "browser_dom",
+        "BESTBUY_PROMOTION_BROWSER_HEADLESS": "0",
+    }
+    db_overrides = {
+        "BESTBUY_OUTPUT_ROOT": str(db_output_root),
+        "BESTBUY_FINAL_OUTPUT_CSV": str(overlay_path),
+        "BESTBUY_DB_UPDATE_PROMOTION_ONLY": "1",
+        "BESTBUY_DB_UPDATE_AVAILABILITY_ONLY": "0",
+        "BESTBUY_DB_UPDATE_SIMILAR_ONLY": "0",
+        "BESTBUY_DB_UPDATE_BATCH_ID": batch_id,
+        "BESTBUY_DB_ROW_UPSERT_ONLY": "0",
+        "BESTBUY_DB_ROW_UPSERT_SKUS": "",
+        "BESTBUY_DB_ROW_UPSERT_ITEMS": "",
+    }
+
+    try:
+        run_step(
+            step_by_name("promotion_deals"),
+            category,
+            base,
+            log_handle,
+            dry_run=args.dry_run,
+            env_overrides=promotion_overrides,
+        )
+        if args.dry_run:
+            if not args.no_db_load:
+                run_step(
+                    step_by_name("db_load"),
+                    category,
+                    base,
+                    log_handle,
+                    dry_run=True,
+                    env_overrides=db_overrides,
+                )
+            manifest.update(
+                {
+                    "status": "dry_run",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "overlay_csv": str(overlay_path),
+                }
+            )
+            write_promotion_recovery_manifest(manifest_path, manifest)
+            return manifest
+
+        summary_path = staged_promotion_root / "summary.json"
+        promotion_csv = staged_promotion_root / "parsed" / "all_promotion_products.csv"
+        summary = read_json(summary_path)
+        promotion_rows = read_csv_rows(promotion_csv)
+        validation = validate_promotion_recovery(summary, promotion_rows, args.promotion_min_rows)
+
+        final_rows = read_csv_rows(run_root / "output" / "final_output.csv")
+        target_rows = read_csv_rows(run_root / "output" / "bestbuy_final_targets.csv")
+        overlay_rows, overlay_stats = build_promotion_overlay_rows(
+            promotion_rows,
+            final_rows,
+            target_rows,
+            batch_id,
+        )
+        if not overlay_rows:
+            raise RuntimeError("promotion recovery found no overlap with existing main rows")
+        write_csv_rows_atomic(overlay_path, overlay_rows, PROMOTION_OVERLAY_FIELDS)
+
+        plans = prepare_promotion_artifact_updates(run_root, overlay_rows, batch_id)
+        backup_promotion_recovery_inputs(run_root, recovery_root, plans)
+
+        artifact_updates = apply_prepared_promotion_updates(plans)
+
+        db_result = {
+            "final_output": {"skipped": True, "reason": "--no-db-load"},
+            "product_list": {"skipped": True, "reason": "--no-db-load"},
+        }
+        if not args.no_db_load:
+            try:
+                db_output_root.mkdir(parents=True, exist_ok=True)
+                run_step(
+                    step_by_name("db_load"),
+                    category,
+                    base,
+                    log_handle,
+                    env_overrides=db_overrides,
+                )
+                db_manifest = read_json(db_output_root / "db_load_manifest.json")
+                db_result = {
+                    "final_output": db_manifest.get("final_output") or {},
+                    "product_list": db_manifest.get("product_list") or {},
+                }
+                for label, result in db_result.items():
+                    candidate_rows = status_int(result.get("candidate_rows"))
+                    updated_rows = status_int(result.get("updated"))
+                    if candidate_rows != len(overlay_rows):
+                        raise RuntimeError(
+                            f"promotion {label} DB candidate mismatch: "
+                            f"{candidate_rows}/{len(overlay_rows)}"
+                        )
+                    if updated_rows != len(overlay_rows):
+                        raise RuntimeError(
+                            f"promotion {label} DB update mismatch: {updated_rows}/{len(overlay_rows)}"
+                        )
+            except Exception as db_exc:
+                try:
+                    restore_prepared_promotion_updates(plans)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"promotion DB update failed ({db_exc}); artifact rollback failed: {rollback_exc}"
+                    ) from db_exc
+                raise
+
+        publish_validated_promotion(staged_promotion_root, run_root)
+        target_manifest_update = update_promotion_target_manifest(
+            run_root,
+            validation["unique_skus"],
+            len(overlay_rows),
+            recovery_root,
+        )
+
+        manifest.update(
+            {
+                "status": "completed",
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "validation": validation,
+                "overlay": overlay_stats,
+                "overlay_csv": str(overlay_path),
+                "artifact_updates": artifact_updates,
+                "target_manifest_update": target_manifest_update,
+                "db_result": db_result,
+                "promotion_summary": str(summary_path),
+                "promotion_csv": str(promotion_csv),
+            }
+        )
+        write_promotion_recovery_manifest(manifest_path, manifest)
+        message = (
+            f"[sos:promotion] collected={validation['unique_skus']} "
+            f"matched_main={len(overlay_rows)} "
+            f"db_updated={db_result['final_output'].get('updated', 'skipped')}"
+        )
+        print(message)
+        log_handle.write(message + "\n")
+        return manifest
+    except Exception as exc:
+        manifest.update(
+            {
+                "status": "failed",
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+        write_promotion_recovery_manifest(manifest_path, manifest)
+        raise
 
 
 def db_safety_check(before, run_root, allow_detail_failures=False):
@@ -726,6 +1292,17 @@ def parse_args():
         help="Existing run root to refill, e.g. C:\\...\\bestbuy\\data\\tv\\20260604",
     )
     parser.add_argument("--batch-id", default=os.getenv("BESTBUY_BATCH_ID", ""), help="Existing batch_id to replace")
+    parser.add_argument(
+        "--promotion-only",
+        action="store_true",
+        help="Refetch only TV promotion and update its two fields on existing main rows",
+    )
+    parser.add_argument(
+        "--promotion-min-rows",
+        type=int,
+        default=PROMOTION_TV_EXPECTED_MIN_ROWS,
+        help=f"Minimum validated promotion rows required before recovery (default {PROMOTION_TV_EXPECTED_MIN_ROWS})",
+    )
     parser.add_argument("--refresh-join-sources", action="store_true", help="Also refetch promotion/trending sources")
     parser.add_argument(
         "--refresh-all-availability",
@@ -760,6 +1337,10 @@ def main():
         raise RuntimeError(f"run_root does not exist: {run_root}")
     if not batch_id and not args.analysis_only:
         raise RuntimeError("batch_id is required and could not be inferred from output/final_output.csv")
+    if args.promotion_only and args.refresh_join_sources:
+        raise RuntimeError("--promotion-only cannot be combined with --refresh-join-sources")
+    if args.promotion_only and args.refresh_all_availability:
+        raise RuntimeError("--promotion-only cannot be combined with --refresh-all-availability")
 
     before = current_summary(run_root)
     existing_rows = read_csv_rows(run_root / "output" / "final_output.csv")
@@ -770,8 +1351,43 @@ def main():
 
     log_dir = run_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"sos_refill_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_prefix = "promotion_recovery" if args.promotion_only else "sos_refill"
+    log_path = log_dir / f"{log_prefix}_{run_timestamp}.log"
     base = base_env(category, run_root, batch_id, preserve_table_env=args.preserve_table_env)
+
+    if args.promotion_only:
+        recovery_root = run_root / "promotion_recovery" / run_timestamp
+        failed_step = step_by_name("promotion_deals")
+        try:
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+                log_handle.write(f"BestBuy promotion-only recovery started category={category} batch_id={batch_id}\n")
+                log_handle.write(f"run_root={run_root}\n")
+                try:
+                    run_promotion_only_recovery(
+                        category,
+                        run_root,
+                        batch_id,
+                        base,
+                        args,
+                        log_handle,
+                        recovery_root,
+                    )
+                except StepFailure as exc:
+                    failed_step = exc.step
+                    raise
+                log_handle.write("BestBuy promotion-only recovery completed\n")
+        except Exception:
+            if not args.no_notify and not args.dry_run:
+                notify(category, run_root, "failed", log_path, failed_step)
+            raise
+        after = current_summary(run_root)
+        print_summary(after, "after")
+        print(f"[sos:done] log={log_path}")
+        print(f"[sos:done] recovery={recovery_root}")
+        if not args.no_notify and not args.dry_run:
+            notify(category, run_root, "success", log_path)
+        return
 
     failed_step = None
     try:
