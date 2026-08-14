@@ -1,6 +1,6 @@
 # BestBuy TV Promotion Recovery Development Log - 2026-08-14
 
-Updated at: 2026-08-14 12:59:56 +09:00 (Asia/Seoul)
+Updated at: 2026-08-14 13:24:36 +09:00 (Asia/Seoul)
 
 ## Scope
 
@@ -34,6 +34,8 @@ Updated at: 2026-08-14 12:59:56 +09:00 (Asia/Seoul)
   - Builds a narrow overlay and invokes the existing promotion-only DB mode.
   - DB SQL updates only `promotion_type` and `promotion_position`: final table by batch/item/main page type and product-list table by batch/SKU/main page type.
   - Patches only those two fields in existing local artifacts after DB success; original artifacts are backed up under the recovery folder.
+  - The BAT supports double-click recovery: enter only the `YYYYMMDD` run folder or press Enter to select the newest valid dated run, confirm with `Y`, and infer `batch_id` from `final_output.csv`.
+  - Added a repository `.gitattributes` rule that checks out BAT files with CRLF so Windows `cmd.exe` parses the recovery launcher reliably.
 - Reset `BESTBUY_DB_UPDATE_PROMOTION_ONLY=0` in normal full-run/recovery entry points to prevent inherited update-only mode.
 
 ## Local validation
@@ -53,9 +55,28 @@ git diff --check
 
 Result: passed; no syntax or whitespace errors. No live collection or DB mutation was performed from the local development machine.
 
+Windows `cmd.exe` smoke checks:
+
+- No-argument interactive launch with a temporary dated fixture selected the newest run after Enter, displayed the target scope, and exited `0` on `N` without invoking Python or DB work.
+- A nonexistent date argument exited `2`, printed the resolved missing `final_output.csv`, and restored the caller's original code page.
+
 ## AWS RDP verification/recovery command
 
-Run from `C:\samsung_dx_sea\bestbuy\new` while the RDP session is connected. Supply the exact existing failed run root; batch ID is inferred from `final_output.csv` when omitted.
+While the RDP session is connected, double-click `run_bestbuy_promotion_recovery.bat`. Enter the failed run folder name such as `20260815`, or press Enter to choose the newest valid dated run automatically. Verify the displayed full path and press `Y`; batch ID is inferred from `final_output.csv`.
+
+The no-argument command-line form opens the same interactive prompt:
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat
+```
+
+To start immediately without the confirmation prompt, pass a date folder name:
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat 20260815
+```
+
+The exact-path form remains available for automation:
 
 ```powershell
 .\run_bestbuy_promotion_recovery.bat "C:\samsung_dx_sea\bestbuy\new\bestbuy\data\tv\20260813"
@@ -67,6 +88,7 @@ If AWS sets `BESTBUY_URL_SOURCE=db` explicitly, update the TV promotion row in `
 
 ## Files changed
 
+- `.gitattributes`
 - `bestbuy/step00_config.py`
 - `bestbuy/config/bestbuy_initial_urls.csv`
 - `bestbuy/step05_promotion_deals.py`

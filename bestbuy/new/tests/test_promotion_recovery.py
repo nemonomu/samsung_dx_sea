@@ -470,12 +470,49 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertEqual(Path(env["BESTBUY_PROMOTION_RUN_ROOT"]), run_root / "promotion")
         self.assertEqual(Path(env["BESTBUY_TRENDING_RUN_ROOT"]), run_root / "trending")
 
-    def test_recovery_bat_omits_empty_batch_argument(self):
+    def test_recovery_bat_supports_interactive_latest_run_without_batch_argument(self):
         bat_path = Path(__file__).parents[1] / "run_bestbuy_promotion_recovery.bat"
+        raw_source = bat_path.read_bytes()
+        self.assertIn(b"\r\n", raw_source)
+        self.assertNotIn(b"\n", raw_source.replace(b"\r\n", b""))
         source = bat_path.read_text(encoding="utf-8")
+        self.assertIn('set "INTERACTIVE=1"', source)
+        self.assertIn('set "ORIGINAL_CODEPAGE="', source)
+        self.assertIn('if defined ORIGINAL_CODEPAGE chcp %ORIGINAL_CODEPAGE% >nul', source)
+        self.assertLess(
+            source.index('set "RUN_ROOT="'),
+            source.index('if not "%RUN_INPUT%"=="" goto :resolve_input'),
+        )
+        self.assertIn('set /p "RUN_INPUT=', source)
+        self.assertIn('Enter=가장 최근', source)
+        self.assertIn('dir /b /ad /o-n "%~dp0bestbuy\\data\\tv\\20??????*"', source)
+        self.assertIn('if not defined RUN_ROOT if exist ', source)
+        self.assertIn('choice /C YN', source)
+        self.assertIn('if exist "%RUN_INPUT%\\output\\final_output.csv" (', source)
+        self.assertIn('set "RUN_ROOT=%RUN_INPUT%"', source)
+        self.assertIn('set "RUN_ROOT=%~dp0bestbuy\\data\\tv\\%RUN_INPUT%"', source)
+        self.assertIn('if not exist "%RUN_ROOT%\\output\\final_output.csv" (', source)
+        self.assertIn('if not defined RUN_ROOT (', source)
+        self.assertIn('if errorlevel 2 (', source)
         self.assertIn('if "%BATCH_ID%"=="" (', source)
         self.assertIn('set "BESTBUY_BATCH_ID="', source)
+        self.assertEqual(source.count('python -m bestbuy.sos_refill'), 2)
+        self.assertEqual(source.count('--promotion-only'), 2)
         self.assertIn('--run-root "%RUN_ROOT%" --promotion-only', source)
+        self.assertIn('--batch-id "%BATCH_ID%" --promotion-only', source)
+        self.assertNotIn('bestbuy.bestbuy_orchestrator', source)
+        self.assertNotIn('--refresh-join-sources', source)
+        self.assertIn('set "BESTBUY_DB_UPDATE_SIMILAR_ONLY=0"', source)
+        self.assertIn('set "BESTBUY_DB_UPDATE_AVAILABILITY_ONLY=0"', source)
+        self.assertIn('set "BESTBUY_DB_UPDATE_PROMOTION_ONLY=0"', source)
+        self.assertNotIn('set "BESTBUY_DB_UPDATE_PROMOTION_ONLY=1"', source)
+        validate = source.index('if not exist "%RUN_ROOT%\\output\\final_output.csv"')
+        confirm = source.index('choice /C YN')
+        execute = source.index('python -m bestbuy.sos_refill')
+        self.assertLess(validate, confirm)
+        self.assertLess(confirm, execute)
+        self.assertLess(execute, source.index('set "EXIT_CODE=%ERRORLEVEL%"'))
+        self.assertIn('exit /b %EXIT_CODE%', source)
         self.assertNotIn("--batch-id '%BATCH_ID%'", source)
 
     def test_email_uses_recovered_csv_count_and_includes_recovery_command(self):

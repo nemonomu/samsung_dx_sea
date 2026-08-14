@@ -59,13 +59,27 @@ Lowe's dry-run:
 python -m lowes.lowes_orchestrator --dry-run --all
 ```
 
-BestBuy TV promotion만 복구할 때는 기존 실행 폴더를 정확히 지정합니다. 이 명령은 promotion 페이지만 다시 수집하고, 기존 `main` 상품과 겹치는 행의 `promotion_type`, `promotion_position`만 갱신합니다.
+BestBuy TV promotion만 복구할 때는 `run_bestbuy_promotion_recovery.bat`를 더블클릭합니다. 날짜 폴더명(예: `20260815`)을 입력하거나, 가장 최근 수집 폴더를 자동 선택하려면 아무것도 입력하지 않고 Enter를 누른 다음 표시된 경로가 맞으면 `Y`를 누릅니다. `batch_id`는 기존 `final_output.csv`에서 자동으로 확인하므로 입력하지 않습니다.
+
+PowerShell에서는 인자 없이 실행하면 동일한 질문 화면이 열립니다.
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat
+```
+
+확인 질문 없이 날짜를 바로 지정해서 실행하려면 날짜 폴더명만 인자로 전달합니다.
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat 20260815
+```
+
+전체 경로를 넘기는 기존 방식도 계속 지원합니다.
 
 ```powershell
 .\run_bestbuy_promotion_recovery.bat "C:\samsung_dx_sea\bestbuy\new\bestbuy\data\tv\20260813"
 ```
 
-수집 결과가 검증 기준에 미달하면 기존 CSV와 DB는 갱신하지 않습니다. 복구 증거와 기존 파일 백업은 실행 폴더 아래 `promotion_recovery\<timestamp>`에 저장됩니다.
+이 복구는 promotion 페이지만 다시 수집하고, 기존 `main` 상품과 겹치는 행의 `promotion_type`, `promotion_position`만 갱신합니다. 신규 상품은 추가하지 않습니다. 수집 결과가 검증 기준에 미달하면 기존 CSV와 DB는 갱신하지 않습니다. 복구 증거와 기존 파일 백업은 실행 폴더 아래 `promotion_recovery\<timestamp>`에 저장됩니다.
 
 ## 보안/데이터 정책
 
