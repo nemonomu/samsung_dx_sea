@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+set "RUN_INTERRUPTED=0"
 
 cd /d "%~dp0"
 
@@ -134,7 +135,20 @@ echo.
 echo [%CUR%/%TOTAL%] %NAME% started
 echo [%CUR%/%TOTAL%] %NAME% started >> "%LOG_FILE%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m bestbuy.bestbuy_orchestrator --category '%CATEGORY%' '%STEP%' 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append; exit $LASTEXITCODE"
-if errorlevel 1 (
+set "STEP_EXIT=%ERRORLEVEL%"
+if "%STEP_EXIT%"=="130" (
+  set "RUN_INTERRUPTED=1"
+  exit /b 130
+)
+if "%STEP_EXIT%"=="-1073741510" (
+  set "RUN_INTERRUPTED=1"
+  exit /b 130
+)
+if "%STEP_EXIT%"=="3221225786" (
+  set "RUN_INTERRUPTED=1"
+  exit /b 130
+)
+if not "%STEP_EXIT%"=="0" (
   set "FAILED_STEP_NAME=%NAME%"
   set "FAILED_STEP=%STEP%"
   echo [%CUR%/%TOTAL%] %NAME% failed
@@ -146,11 +160,18 @@ echo [%CUR%/%TOTAL%] %NAME% completed >> "%LOG_FILE%"
 exit /b 0
 
 :fail
+if "%RUN_INTERRUPTED%"=="1" goto :interrupted
 echo.
 echo BestBuy %CATEGORY% full run failed. See log: %LOG_FILE%
 echo BestBuy %CATEGORY% full run failed >> "%LOG_FILE%"
 call :notify "failed" "%FAILED_STEP_NAME%" "%FAILED_STEP%"
 exit /b 1
+
+:interrupted
+echo.
+echo [interrupt] BestBuy %CATEGORY% full run stopped by Ctrl+C. Remaining steps skipped.
+echo [interrupt] BestBuy %CATEGORY% full run stopped by Ctrl+C. Remaining steps skipped. >> "%LOG_FILE%"
+exit /b 130
 
 :notify
 set "BESTBUY_NOTIFY_STATUS=%~1"

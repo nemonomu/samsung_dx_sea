@@ -64,6 +64,8 @@ echo ==================================================
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0run_bestbuy_fullrun.bat' '%CATEGORY%' 2>&1 | Tee-Object -FilePath '%TASK_LOG%' -Append; exit $LASTEXITCODE"
 set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="-1073741510" set "EXIT_CODE=130"
+if "%EXIT_CODE%"=="3221225786" set "EXIT_CODE=130"
 
 python -m bestbuy.step00_daily_lock release --lock "%LOCK_FILE%" --category "%CATEGORY%" --log "%TASK_LOG%" --root "%~dp0" >nul 2>nul
 if exist "%LOCK_FILE%" del "%LOCK_FILE%"

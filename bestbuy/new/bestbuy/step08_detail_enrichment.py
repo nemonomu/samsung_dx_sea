@@ -91,12 +91,13 @@ BROWSER_GRAPHQL_WAIT_SECONDS = max(
 BROWSER_GRAPHQL_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT", "120")))
 BROWSER_GRAPHQL_HEADLESS = env_bool("BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS", "1")
 BROWSER_GRAPHQL_LOCAL_PORT = env_int("BESTBUY_DETAIL_BROWSER_GRAPHQL_LOCAL_PORT", "0")
-# A ready browser is recovered at most twice: first restart Chrome while
-# retaining the warmed profile, then retry once with a separate emergency
-# profile. The cap prevents a transport-wide outage from expanding into one
+# A peer-side HTTP/2 stream reset does not necessarily kill the browser session.
+# Retry once in the verified home session before restarting Chrome. A separate
+# emergency profile is available only when operators explicitly raise the cap
+# to three. The cap prevents a transport-wide outage from expanding into one
 # recovery cycle per SKU batch.
 BROWSER_GRAPHQL_MAX_RECOVERIES = min(
-    2,
+    3,
     max(0, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_MAX_RECOVERIES", "2"))),
 )
 BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS = max(
@@ -134,6 +135,15 @@ BROWSER_BOOTSTRAP_HOME_URL = os.getenv(
     "BESTBUY_DETAIL_BROWSER_BOOTSTRAP_HOME_URL",
     "https://www.bestbuy.com/?intl=nosplash",
 ).strip()
+BROWSER_GRAPHQL_PREFLIGHT_SIZE = min(
+    5,
+    max(0, env_int("BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE", "1")),
+)
+BROWSER_GRAPHQL_CANARY_ONLY = env_bool("BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY", "0")
+BROWSER_GRAPHQL_CANARY_MAX_ATTEMPTS = min(
+    2,
+    max(1, env_int("BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_MAX_ATTEMPTS", "2")),
+)
 STAGE = os.getenv("BESTBUY_DETAIL_STAGE", "detail").lower()
 SAVE_HTML_MODE = os.getenv("BESTBUY_SAVE_HTML_MODE", "slim").lower()
 DETAIL_SCROLL = os.getenv("BESTBUY_DETAIL_SCROLL", "1").lower() in {"1", "true", "yes", "y"}
@@ -251,6 +261,7 @@ BROWSER_GRAPHQL_PAGE = None
 BROWSER_GRAPHQL_META = {}
 BROWSER_GRAPHQL_CURRENT_URL = ""
 BROWSER_GRAPHQL_SESSION_READY = False
+BROWSER_GRAPHQL_SESSION_KIND = ""
 BROWSER_GRAPHQL_PROCESS_GENERATION = 0
 BROWSER_GRAPHQL_PROFILE_KIND = "primary"
 BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION = 0
@@ -1726,6 +1737,10 @@ class DetailBrowserUnavailable(RuntimeError):
     """A transport-wide browser failure that must stop the current step."""
 
 
+class DetailBrowserCanaryError(RuntimeError):
+    """The home-origin GraphQL preflight returned an unsafe response."""
+
+
 def detail_browser_base_name():
     return f"detail_{STAGE}_browser_graphql"
 
@@ -1768,10 +1783,12 @@ def open_detail_browser_page():
 
 def close_detail_browser_page():
     global BROWSER_GRAPHQL_PAGE, BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY
+    global BROWSER_GRAPHQL_SESSION_KIND
     close_browser_page(BROWSER_GRAPHQL_PAGE)
     BROWSER_GRAPHQL_PAGE = None
     BROWSER_GRAPHQL_CURRENT_URL = ""
     BROWSER_GRAPHQL_SESSION_READY = False
+    BROWSER_GRAPHQL_SESSION_KIND = ""
 
 
 def recreate_detail_browser_page(*, fresh_profile=False):
@@ -1854,7 +1871,7 @@ def navigate_detail_browser(url, stage, timeout=None):
     )
 
 
-def detail_browser_state_error(state, expected_sku="", require_pdp=False):
+def detail_browser_state_error(state, expected_sku="", require_pdp=False, require_home=False):
     href = str(state.get("href") or "")
     origin = str(state.get("origin") or "")
     body_text = str(state.get("body_text") or "")
@@ -1881,6 +1898,10 @@ def detail_browser_state_error(state, expected_sku="", require_pdp=False):
     marker = next((value for value in error_markers if value in body_lower), "")
     if marker:
         return f"browser_error_document:{marker} href={href}"
+    if require_home:
+        path = urlsplit(href).path.rstrip("/")
+        if path:
+            return f"unexpected_home_url:{href}"
     if require_pdp:
         actual_sku = browser_url_sku(href)
         if not actual_sku:
@@ -1905,6 +1926,7 @@ def wait_for_detail_browser_state(
     stage,
     expected_sku="",
     require_pdp=False,
+    require_home=False,
     expected_search_sku="",
     previous_url="",
     timeout=None,
@@ -1918,7 +1940,12 @@ def wait_for_detail_browser_state(
             remaining = max(0.1, deadline - time.monotonic())
             state = read_detail_browser_state(timeout=remaining)
             last_state = state
-            last_error = detail_browser_state_error(state, expected_sku, require_pdp)
+            last_error = detail_browser_state_error(
+                state,
+                expected_sku,
+                require_pdp,
+                require_home,
+            )
             href_changed = not previous_url or state.get("href") != previous_url
             ready = state.get("ready_state") in {"interactive", "complete"}
             search_matches = not expected_search_sku or bestbuy_search_state_matches_sku(
@@ -2026,19 +2053,65 @@ return JSON.stringify({assigned:true, href:targetUrl});
         return {"assigned": False, "reason": f"invalid_assign_result:{raw!r}"}
 
 
-def bootstrap_detail_browser_session(browser_url, expected_sku=""):
-    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY
+def commit_detail_browser_session(state, session_kind):
+    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY, BROWSER_GRAPHQL_SESSION_KIND
+    if BROWSER_GRAPHQL_WAIT_SECONDS:
+        print(
+            format_log_line(
+                "detail:browser_bootstrap",
+                stage="settle",
+                mode=session_kind,
+                seconds=BROWSER_GRAPHQL_WAIT_SECONDS,
+            ),
+            flush=True,
+        )
+        time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+        settled_state = read_detail_browser_state(timeout=BROWSER_BOOTSTRAP_JS_TIMEOUT_SECONDS)
+        expected_sku = browser_url_sku(state.get("href", "")) if session_kind == "pdp" else ""
+        settled_error = detail_browser_state_error(
+            settled_state,
+            expected_sku=expected_sku,
+            require_pdp=session_kind == "pdp",
+            require_home=session_kind == "home_origin",
+        )
+        if settled_error or settled_state.get("ready_state") not in {"interactive", "complete"}:
+            raise DetailBrowserBootstrapError(
+                f"{session_kind} post-settle verification failed: "
+                f"{settled_error or settled_state.get('ready_state') or 'not_ready'}"
+            )
+        state = settled_state
+    BROWSER_GRAPHQL_CURRENT_URL = str(state.get("href") or "")
+    BROWSER_GRAPHQL_SESSION_READY = True
+    BROWSER_GRAPHQL_SESSION_KIND = str(session_kind or "")
+    print(
+        format_log_line(
+            "detail:browser_bootstrap",
+            stage="session_ready",
+            mode=BROWSER_GRAPHQL_SESSION_KIND,
+            actual_url=BROWSER_GRAPHQL_CURRENT_URL,
+        ),
+        flush=True,
+    )
+    return state
+
+
+def bootstrap_detail_browser_session(browser_url, expected_sku="", *, require_pdp=True):
+    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY, BROWSER_GRAPHQL_SESSION_KIND
     if BROWSER_GRAPHQL_PAGE is None:
         open_detail_browser_page()
     BROWSER_GRAPHQL_CURRENT_URL = ""
     BROWSER_GRAPHQL_SESSION_READY = False
+    BROWSER_GRAPHQL_SESSION_KIND = ""
+
+    navigate_detail_browser(BROWSER_BOOTSTRAP_HOME_URL, "home")
+    home_state = wait_for_detail_browser_state(stage="home", require_home=True)
+    if not require_pdp:
+        return commit_detail_browser_session(home_state, "home_origin")
+
     expected_sku = str(expected_sku or browser_url_sku(browser_url)).strip()
     if not expected_sku:
         raise DetailBrowserBootstrapError(f"bootstrap PDP URL has no SKU: {browser_url}")
     target_browser_url = bootstrap_pdp_url(browser_url, expected_sku)
-
-    navigate_detail_browser(BROWSER_BOOTSTRAP_HOME_URL, "home")
-    home_state = wait_for_detail_browser_state(stage="home")
     search_state = None
     submit_result = submit_bestbuy_search(expected_sku)
     if submit_result.get("submitted"):
@@ -2122,25 +2195,21 @@ def bootstrap_detail_browser_session(browser_url, expected_sku=""):
                 previous_url=search_state.get("href", ""),
             )
 
-    if BROWSER_GRAPHQL_WAIT_SECONDS:
-        print(
-            format_log_line(
-                "detail:browser_bootstrap",
-                stage="settle",
-                seconds=BROWSER_GRAPHQL_WAIT_SECONDS,
-            ),
-            flush=True,
-        )
-        time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
-    BROWSER_GRAPHQL_CURRENT_URL = pdp_state["href"]
-    BROWSER_GRAPHQL_SESSION_READY = True
-    return pdp_state
+    return commit_detail_browser_session(pdp_state, "pdp")
 
 
-def ensure_detail_browser_session(browser_url, expected_sku=""):
-    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY
-    if BROWSER_GRAPHQL_SESSION_READY and BROWSER_GRAPHQL_CURRENT_URL:
+def ensure_detail_browser_session(browser_url, expected_sku="", *, require_pdp=True):
+    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY, BROWSER_GRAPHQL_SESSION_KIND
+    expected_kind = "pdp" if require_pdp else "home_origin"
+    if (
+        BROWSER_GRAPHQL_SESSION_READY
+        and BROWSER_GRAPHQL_CURRENT_URL
+        and BROWSER_GRAPHQL_SESSION_KIND == expected_kind
+    ):
         return False
+    BROWSER_GRAPHQL_CURRENT_URL = ""
+    BROWSER_GRAPHQL_SESSION_READY = False
+    BROWSER_GRAPHQL_SESSION_KIND = ""
     attempts = (
         ("bootstrap", False),
         ("restart", False),
@@ -2160,12 +2229,17 @@ def ensure_detail_browser_session(browser_url, expected_sku=""):
         try:
             if attempt > 1:
                 recreate_detail_browser_page(fresh_profile=fresh_profile)
-            bootstrap_detail_browser_session(browser_url, expected_sku)
+            bootstrap_detail_browser_session(
+                browser_url,
+                expected_sku,
+                require_pdp=require_pdp,
+            )
             return True
         except Exception as exc:  # noqa: BLE001 - browser launch/navigation failures vary by backend
             last_exc = exc
             BROWSER_GRAPHQL_CURRENT_URL = ""
             BROWSER_GRAPHQL_SESSION_READY = False
+            BROWSER_GRAPHQL_SESSION_KIND = ""
             print(
                 format_log_line(
                     "detail:browser_bootstrap",
@@ -2181,9 +2255,19 @@ def ensure_detail_browser_session(browser_url, expected_sku=""):
     raise DetailBrowserUnavailable(f"BestBuy browser bootstrap unavailable: {last_exc}") from last_exc
 
 
-def recover_detail_browser_session(browser_url, expected_sku="", *, fresh_profile=False):
+def recover_detail_browser_session(
+    browser_url,
+    expected_sku="",
+    *,
+    fresh_profile=False,
+    require_pdp=True,
+):
     recreate_detail_browser_page(fresh_profile=fresh_profile)
-    return bootstrap_detail_browser_session(browser_url, expected_sku)
+    return bootstrap_detail_browser_session(
+        browser_url,
+        expected_sku,
+        require_pdp=require_pdp,
+    )
 
 
 def fetch_detail_browser_graphql_envelope(payload):
@@ -2206,10 +2290,15 @@ def fetch_detail_browser_graphql_envelope(payload):
 
 
 def browser_graphql_post(payload, referer_url, expected_sku=""):
-    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY
+    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY, BROWSER_GRAPHQL_SESSION_KIND
     with BROWSER_GRAPHQL_LOCK:
         browser_url = add_intl_nosplash(referer_url or BROWSER_GRAPHQL_CURRENT_URL or "https://www.bestbuy.com/")
-        navigated = ensure_detail_browser_session(browser_url, expected_sku)
+        require_pdp = not DETAIL_DIRECT_GRAPHQL
+        navigated = ensure_detail_browser_session(
+            browser_url,
+            expected_sku,
+            require_pdp=require_pdp,
+        )
         start = time.perf_counter()
         try:
             envelope = fetch_detail_browser_graphql_envelope(payload)
@@ -2217,6 +2306,7 @@ def browser_graphql_post(payload, referer_url, expected_sku=""):
             envelope = None
             last_exc = exc
             recoveries = (
+                ("retry_same_session", None),
                 ("restart", False),
                 ("fresh_profile", True),
             )[:BROWSER_GRAPHQL_MAX_RECOVERIES]
@@ -2230,16 +2320,18 @@ def browser_graphql_post(payload, referer_url, expected_sku=""):
                     ),
                     flush=True,
                 )
-                try:
-                    recover_detail_browser_session(
-                        browser_url,
-                        expected_sku,
-                        fresh_profile=fresh_profile,
-                    )
-                    navigated = True
-                except Exception as recover_exc:  # noqa: BLE001 - browser relaunch can fail many ways
-                    last_exc = recover_exc
-                    continue
+                if action != "retry_same_session":
+                    try:
+                        recover_detail_browser_session(
+                            browser_url,
+                            expected_sku,
+                            fresh_profile=bool(fresh_profile),
+                            require_pdp=require_pdp,
+                        )
+                        navigated = True
+                    except Exception as recover_exc:  # noqa: BLE001 - browser relaunch can fail many ways
+                        last_exc = recover_exc
+                        continue
                 if BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS:
                     time.sleep(BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS * attempt)
                 try:
@@ -2251,6 +2343,7 @@ def browser_graphql_post(payload, referer_url, expected_sku=""):
             if envelope is None:
                 BROWSER_GRAPHQL_CURRENT_URL = ""
                 BROWSER_GRAPHQL_SESSION_READY = False
+                BROWSER_GRAPHQL_SESSION_KIND = ""
                 raise DetailBrowserUnavailable(
                     f"BestBuy browser GraphQL transport unavailable after {len(recoveries)} recoveries: {last_exc}"
                 ) from last_exc
@@ -2261,11 +2354,14 @@ def browser_graphql_post(payload, referer_url, expected_sku=""):
         response_json = json.loads(text)
     except ValueError:
         response_json = {}
+    actual_browser_url = BROWSER_GRAPHQL_CURRENT_URL or browser_url
     headers = {
         "content-type": envelope.get("contentType", ""),
         "transport": "browser_graphql",
-        "browser_url": BROWSER_GRAPHQL_CURRENT_URL or browser_url,
-        "browser_referer_url": browser_url,
+        "browser_url": actual_browser_url,
+        "browser_referer_url": actual_browser_url,
+        "browser_requested_referer_url": browser_url,
+        "browser_session_kind": BROWSER_GRAPHQL_SESSION_KIND,
         "browser_navigated": "1" if navigated else "0",
         "browser_process_generation": str(BROWSER_GRAPHQL_PROCESS_GENERATION),
         "browser_profile_kind": BROWSER_GRAPHQL_PROFILE_KIND,
@@ -3777,6 +3873,182 @@ def detail_batch_success_count(response_json, entries, status_code):
         if isinstance(product, dict) and str(product.get("skuId") or "") == sku:
             count += 1
     return count
+
+
+def detail_browser_canary_request_entries(targets, stage=None):
+    stage = str(stage or STAGE).lower()
+    request_payload = []
+    entries = []
+    for target in targets:
+        sku = str(target.get("sku_id") or "").strip()
+        if not sku:
+            continue
+        payloads = []
+        indices = {}
+        if stage == "review":
+            indices["review"] = len(payloads)
+            payloads.append(fallback_review20_payload(sku))
+        else:
+            indices["detail"] = len(payloads)
+            payloads.append(fallback_review20_payload(sku))
+            indices["review"] = len(payloads)
+            payloads.append(fallback_review20_payload(sku))
+            if FETCH_COMPARE:
+                indices["compare"] = len(payloads)
+                payloads.append(compare_product_payload(sku))
+        base_index = len(request_payload)
+        request_payload.extend(payloads)
+        entries.append(
+            {
+                "target": target,
+                "sku": sku,
+                "pdp_url": target_url(target, sku),
+                "payloads": payloads,
+                "indices": {name: base_index + index for name, index in indices.items()},
+            }
+        )
+    return request_payload, entries
+
+
+def validate_detail_browser_canary_response(response_json, entries, status_code, *, strict=True):
+    failures = []
+    warnings = []
+    checked_operations = 0
+    expected_operations = sum(len(entry.get("indices") or {}) for entry in entries)
+    if detail_status_code_int(status_code) != 200:
+        failures.append(f"http_status={status_code}")
+    if not isinstance(response_json, list) and not (
+        isinstance(response_json, dict) and expected_operations == 1
+    ):
+        failures.append(f"response_type={type(response_json).__name__}")
+
+    for entry in entries:
+        sku = str(entry.get("sku") or "")
+        indices = entry.get("indices") or {}
+        for stage, index in indices.items():
+            checked_operations += 1
+            item = graphql_batch_response_item(response_json, index)
+            if not item:
+                failures.append(f"sku={sku} stage={stage} missing_response")
+                continue
+            if item.get("errors"):
+                failures.append(f"sku={sku} stage={stage} graphql_errors")
+                continue
+            data = item.get("data")
+            if not isinstance(data, dict):
+                failures.append(f"sku={sku} stage={stage} missing_data")
+                continue
+            if stage in {"detail", "review", "compare"}:
+                product = data.get("productBySkuId") or {}
+                actual_sku = str(product.get("skuId") or "") if isinstance(product, dict) else ""
+                if actual_sku and actual_sku != sku:
+                    failures.append(
+                        f"sku={sku} stage={stage} unexpected_product_sku={actual_sku}"
+                    )
+                    continue
+                if not actual_sku:
+                    issue = f"sku={sku} stage={stage} product_missing"
+                    (failures if strict else warnings).append(issue)
+                    continue
+            if stage == "review" and review_result_count_from_json(item) is None:
+                issue = f"sku={sku} stage=review missing_review_list"
+                (failures if strict else warnings).append(issue)
+            if stage == "compare":
+                recommendations = data.get("recommendations")
+                subplacements = (
+                    recommendations.get("subPlacements")
+                    if isinstance(recommendations, dict)
+                    else None
+                )
+                if not isinstance(subplacements, list):
+                    issue = f"sku={sku} stage=compare missing_recommendations_shape"
+                    (failures if strict else warnings).append(issue)
+
+    if failures:
+        raise DetailBrowserCanaryError(
+            "BestBuy home-origin GraphQL canary failed: " + "; ".join(failures[:12])
+        )
+    return {
+        "status_code": detail_status_code_int(status_code),
+        "sku_count": len(entries),
+        "operation_count": checked_operations,
+        "skus": [str(entry.get("sku") or "") for entry in entries],
+        "warning_count": len(warnings),
+        "warnings": warnings[:12],
+    }
+
+
+def run_detail_browser_graphql_canary(targets, size=1, *, canary_only=False):
+    global BROWSER_GRAPHQL_CURRENT_URL, BROWSER_GRAPHQL_SESSION_READY, BROWSER_GRAPHQL_SESSION_KIND
+    selected = [target for target in targets if str(target.get("sku_id") or "").strip()][
+        : max(1, int(size or 1))
+    ]
+    request_payload, entries = detail_browser_canary_request_entries(selected)
+    if not entries:
+        raise DetailBrowserCanaryError("BestBuy home-origin GraphQL canary has no target SKU")
+    report = None
+    headers = {}
+    elapsed = 0.0
+    canary_attempts = 0
+    try:
+        for canary_attempt in range(1, BROWSER_GRAPHQL_CANARY_MAX_ATTEMPTS + 1):
+            canary_attempts = canary_attempt
+            status_code, _, response_json, headers, elapsed = browser_graphql_post(
+                request_payload,
+                entries[0]["pdp_url"],
+                entries[0]["sku"],
+            )
+            try:
+                report = validate_detail_browser_canary_response(
+                    response_json,
+                    entries,
+                    status_code,
+                    strict=canary_only,
+                )
+                break
+            except DetailBrowserCanaryError as exc:
+                if canary_attempt >= BROWSER_GRAPHQL_CANARY_MAX_ATTEMPTS:
+                    raise
+                print(
+                    format_log_line(
+                        "detail:browser_canary",
+                        status="retry",
+                        attempt=canary_attempt,
+                        error=compact_log_value(exc, 180),
+                    ),
+                    flush=True,
+                )
+                if BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS:
+                    time.sleep(BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS * canary_attempt)
+    except Exception:
+        BROWSER_GRAPHQL_CURRENT_URL = ""
+        BROWSER_GRAPHQL_SESSION_READY = False
+        BROWSER_GRAPHQL_SESSION_KIND = ""
+        raise
+    report.update(
+        {
+            "elapsed_seconds": elapsed,
+            "browser_url": headers.get("browser_url", ""),
+            "browser_session_kind": headers.get("browser_session_kind", ""),
+            "mode": "canary_only" if canary_only else "preflight",
+            "attempts": canary_attempts,
+        }
+    )
+    print(
+        format_log_line(
+            "detail:browser_canary",
+            status="ok",
+            mode=report["mode"],
+            session=report["browser_session_kind"],
+            skus=",".join(report["skus"]),
+            operations=report["operation_count"],
+            warnings=report["warning_count"],
+            attempts=report["attempts"],
+            elapsed=report["elapsed_seconds"],
+        ),
+        flush=True,
+    )
+    return report
 
 
 def retryable_detail_batch_result(status_code, response_json, entries, error=""):
@@ -6456,6 +6728,25 @@ def failure_stage_counts(failures):
     return counts
 
 
+def detail_browser_preflight_candidates(targets):
+    if FORCE_REFRESH:
+        return list(targets)
+    candidates = []
+    for target in targets:
+        sku = str(target.get("sku_id") or "").strip()
+        if not sku:
+            continue
+        if STAGE == "detail":
+            needs_network = not detail_success(sku)
+        elif STAGE == "review":
+            needs_network = review_needs_retry(target)
+        else:
+            needs_network = not detail_success(sku) or review_needs_retry(target)
+        if needs_network:
+            candidates.append(target)
+    return candidates
+
+
 def main():
     started_at = now()
     targets = target_rows(apply_filters=True)
@@ -6469,6 +6760,30 @@ def main():
         ("zenrows" in transports and client is not None) or "browser_graphql" in transports
     )
 
+    if STAGE not in {"all", "detail", "review"}:
+        raise RuntimeError("BESTBUY_DETAIL_STAGE must be one of: all, detail, review")
+    browser_direct_graphql = DETAIL_DIRECT_GRAPHQL and "browser_graphql" in transports
+    if BROWSER_GRAPHQL_CANARY_ONLY and not browser_direct_graphql:
+        raise RuntimeError(
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY requires direct browser_graphql mode"
+        )
+    if BROWSER_GRAPHQL_CANARY_ONLY and not targets:
+        raise DetailBrowserCanaryError("BestBuy home-origin GraphQL canary has no selected targets")
+    preflight_size = (
+        max(1, BROWSER_GRAPHQL_PREFLIGHT_SIZE)
+        if BROWSER_GRAPHQL_CANARY_ONLY
+        else BROWSER_GRAPHQL_PREFLIGHT_SIZE
+    )
+    preflight_targets = targets if BROWSER_GRAPHQL_CANARY_ONLY else detail_browser_preflight_candidates(targets)
+    if browser_direct_graphql and preflight_targets and preflight_size:
+        run_detail_browser_graphql_canary(
+            preflight_targets,
+            preflight_size,
+            canary_only=BROWSER_GRAPHQL_CANARY_ONLY,
+        )
+        if BROWSER_GRAPHQL_CANARY_ONLY:
+            return
+
     RAW_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     RAW_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     RAW_COMPARE_DIR.mkdir(parents=True, exist_ok=True)
@@ -6476,9 +6791,6 @@ def main():
     BENCHMARKS_DIR.mkdir(parents=True, exist_ok=True)
     if not REBUILD_ONLY and DETAIL_BENCHMARKS_CSV.exists():
         DETAIL_BENCHMARKS_CSV.unlink()
-
-    if STAGE not in {"all", "detail", "review"}:
-        raise RuntimeError("BESTBUY_DETAIL_STAGE must be one of: all, detail, review")
 
     fetch_mode_label = detail_fetch_mode_label()
     direct_compare = DETAIL_DIRECT_GRAPHQL and FETCH_COMPARE
@@ -6535,6 +6847,8 @@ def main():
             if use_review20_sku_batch
             else ("gateway_graphql_post" if DETAIL_DIRECT_GRAPHQL else "off"),
             compare="batched" if direct_compare else ("pdp_js" if pdp_compare_js else "off"),
+            browser_session="home_origin" if browser_direct_graphql else "pdp_or_http",
+            browser_preflight=BROWSER_GRAPHQL_PREFLIGHT_SIZE if browser_direct_graphql else 0,
             fulfillment="dynamic_batched"
             if FETCH_FULFILLMENT_DYNAMIC
             else ("get_it_fast_batched" if FETCH_GET_IT_FAST else "off"),

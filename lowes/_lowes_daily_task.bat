@@ -55,6 +55,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m lowes.lowes_
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m lowes.lowes_orchestrator --product-type '%CATEGORY%' --all 2>&1 | Tee-Object -FilePath '%TASK_LOG%' -Append; exit $LASTEXITCODE"
 set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="-1073741510" set "EXIT_CODE=130"
+if "%EXIT_CODE%"=="3221225786" set "EXIT_CODE=130"
 
 for /f %%i in ('powershell -NoProfile -Command "[int][double]::Parse((Get-Date -UFormat %%s))"') do set "TASK_END_EPOCH=%%i"
 set /a TASK_ELAPSED_SEC=TASK_END_EPOCH-TASK_START_EPOCH

@@ -18,11 +18,26 @@ from .step00_config import (
 
 PYTHON = sys.executable
 TARGET_SIZE = 300
+INTERRUPT_EXIT_CODE = 130
+INTERRUPT_EXIT_CODES = {INTERRUPT_EXIT_CODE, -1073741510, 3221225786}
+SAFE_FULLRUN_DETAIL_ENV = {
+    "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY": "0",
+    "BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE": "1",
+}
 CATEGORY_SEARCH_TERMS = {
     "HHP": "cellphone",
     "REF": "refrigerator",
     "LDY": "washing machine",
 }
+
+
+def is_interrupt_exit_code(value):
+    try:
+        return int(value) in INTERRUPT_EXIT_CODES
+    except (TypeError, ValueError):
+        return False
+
+
 HHP_TRENDING_PAGE_PAYLOAD_ENV = {
     "BESTBUY_TRENDING_FETCH_MODE": "browser_graphql",
     "BESTBUY_TRENDING_BROWSER_HEADLESS": "0",
@@ -188,6 +203,8 @@ STEPS = [
             "BESTBUY_DETAIL_FETCH_GET_IT_FAST": "0",
             "BESTBUY_DETAIL_FETCH_FULFILLMENT_DYNAMIC": "0",
             "BESTBUY_DETAIL_FETCH_MODE": "browser_graphql",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY": "0",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE": "1",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_WAIT_SECONDS": "8",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT": "120",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS": "0",
@@ -222,6 +239,8 @@ STEPS = [
             "BESTBUY_DETAIL_FETCH_GET_IT_FAST": "0",
             "BESTBUY_DETAIL_FETCH_FULFILLMENT_DYNAMIC": "0",
             "BESTBUY_DETAIL_FETCH_MODE": "browser_graphql",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY": "0",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE": "1",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_WAIT_SECONDS": "8",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT": "120",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS": "0",
@@ -244,6 +263,8 @@ STEPS = [
         {
             "BESTBUY_DETAIL_WORKERS": "1",
             "BESTBUY_DETAIL_FETCH_MODE": "browser_graphql",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY": "0",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE": "1",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_WAIT_SECONDS": "8",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT": "120",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS": "0",
@@ -266,6 +287,8 @@ STEPS = [
             "BESTBUY_DETAIL_RETRY_ONLY": "1",
             "BESTBUY_DETAIL_WORKERS": "1",
             "BESTBUY_DETAIL_FETCH_MODE": "browser_graphql",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_CANARY_ONLY": "0",
+            "BESTBUY_DETAIL_BROWSER_GRAPHQL_PREFLIGHT_SIZE": "1",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_WAIT_SECONDS": "8",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT": "120",
             "BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS": "0",
@@ -604,6 +627,11 @@ def run_step(step, dry_run=False, resume=False):
         else:
             for key, value in step.resume_env.items():
                 env.setdefault(key, value)
+    if step.name in {"detail_html", "review20"}:
+        # A manual canary is intentionally run by invoking step08 directly.
+        # Never let its shell environment turn a full-run step into a
+        # successful canary-only no-op, even when force_step_env is disabled.
+        env.update(SAFE_FULLRUN_DETAIL_ENV)
     category_overrides = {}
     category_key = env.get("BESTBUY_CATEGORY", "").strip().upper()
     if step.name in {"main_list", "bsr_list"} and category_key in CATEGORY_SEARCH_TERMS:
@@ -627,6 +655,8 @@ def run_step(step, dry_run=False, resume=False):
         subprocess.run(command, check=True, env=env)
     except subprocess.CalledProcessError as exc:
         print(f"[fail] step {step.key} {step.name}: exit_code={exc.returncode}")
+        if is_interrupt_exit_code(exc.returncode):
+            raise KeyboardInterrupt from None
         if step.name in {"promotion_deals", "trending_deals"}:
             print(f"[skip] step {step.key} {step.name}: optional listing enrichment failed; continuing pipeline")
             return
@@ -741,4 +771,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[interrupt] Ctrl+C received; stopping Best Buy pipeline.", file=sys.stderr)
+        raise SystemExit(INTERRUPT_EXIT_CODE) from None

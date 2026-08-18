@@ -11,6 +11,15 @@ from .step00_config import DEFAULT_LOWES_RUN_ROOT, lowes_dated_run_root
 
 
 PYTHON = sys.executable
+INTERRUPT_EXIT_CODE = 130
+INTERRUPT_EXIT_CODES = {INTERRUPT_EXIT_CODE, -1073741510, 3221225786}
+
+
+def is_interrupt_exit_code(value):
+    try:
+        return int(value) in INTERRUPT_EXIT_CODES
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -209,9 +218,15 @@ def main():
         return
     for step in steps:
         code = run_step(step, dry_run=args.dry_run)
+        if is_interrupt_exit_code(code):
+            raise KeyboardInterrupt
         if code:
             raise SystemExit(code)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[interrupt] Ctrl+C received; stopping Lowe's pipeline.", file=sys.stderr)
+        raise SystemExit(INTERRUPT_EXIT_CODE) from None

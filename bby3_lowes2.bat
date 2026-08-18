@@ -34,6 +34,9 @@ echo ==================================================
 
 for %%C in (REF LDY TV) do (
   call :run_bestbuy_category %%C
+  if "!CATEGORY_EXIT!"=="130" goto :interrupted
+  if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
+  if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
   call :record_failure BBY_%%C !CATEGORY_EXIT!
 )
 
@@ -41,6 +44,9 @@ call :resolve_lowes_runner
 if defined LOWES_DAILY_TASK_BAT (
   for %%C in (REF LDY) do (
     call :run_lowes_category %%C
+    if "!CATEGORY_EXIT!"=="130" goto :interrupted
+    if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
+    if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
     call :record_failure LOWES_%%C !CATEGORY_EXIT!
   )
 ) else (
@@ -74,6 +80,18 @@ echo ==================================================
 >>"%CHAIN_LOG%" echo chain_log=%CHAIN_LOG%
 >>"%CHAIN_LOG%" echo ==================================================
 exit /b %OVERALL_EXIT_CODE%
+
+:interrupted
+echo.
+echo ==================================================
+echo [interrupt] BBY3+Lowes2 stopped by Ctrl+C. Remaining categories skipped.
+echo chain_log=%CHAIN_LOG%
+echo ==================================================
+>>"%CHAIN_LOG%" echo.
+>>"%CHAIN_LOG%" echo ==================================================
+>>"%CHAIN_LOG%" echo [interrupt] BBY3+Lowes2 stopped by Ctrl+C. Remaining categories skipped.
+>>"%CHAIN_LOG%" echo ==================================================
+exit /b 130
 
 :run_bestbuy_category
 set "CATEGORY=%~1"

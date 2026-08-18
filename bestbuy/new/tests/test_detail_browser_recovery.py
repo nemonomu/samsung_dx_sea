@@ -19,6 +19,7 @@ if "zenrows" not in sys.modules:
         sys.modules["zenrows"] = zenrows_stub
 
 import bestbuy.step08_detail_enrichment as detail
+import bestbuy.step00_browser_session as browser_session
 
 
 SKU = "6673625"
@@ -81,6 +82,7 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         "BROWSER_GRAPHQL_META",
         "BROWSER_GRAPHQL_CURRENT_URL",
         "BROWSER_GRAPHQL_SESSION_READY",
+        "BROWSER_GRAPHQL_SESSION_KIND",
         "BROWSER_GRAPHQL_PROCESS_GENERATION",
         "BROWSER_GRAPHQL_PROFILE_KIND",
         "BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION",
@@ -101,6 +103,7 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         detail.BROWSER_GRAPHQL_META = {}
         detail.BROWSER_GRAPHQL_CURRENT_URL = current_url
         detail.BROWSER_GRAPHQL_SESSION_READY = ready
+        detail.BROWSER_GRAPHQL_SESSION_KIND = "home_origin" if ready and current_url else ""
         detail.BROWSER_GRAPHQL_PROCESS_GENERATION = 0
         detail.BROWSER_GRAPHQL_PROFILE_KIND = "primary"
         detail.BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION = 0
@@ -128,6 +131,45 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         self.assertTrue(detail.BROWSER_GRAPHQL_SESSION_READY)
         script_text = "\n".join(page.script_calls)
         self.assertLess(script_text.index("const selectors"), script_text.index("const anchors"))
+
+    def test_direct_graphql_bootstrap_commits_verified_home_without_search_or_pdp(self):
+        home_url = "https://www.bestbuy.com/?intl=nosplash"
+        page = ScriptedPage([browser_state(home_url), browser_state(home_url)])
+        self.install_page(page)
+
+        state = detail.bootstrap_detail_browser_session(
+            STRIPPED_PDP_URL,
+            SKU,
+            require_pdp=False,
+        )
+
+        self.assertEqual(page.get_calls, [detail.BROWSER_BOOTSTRAP_HOME_URL])
+        self.assertEqual(state["href"], home_url)
+        self.assertEqual(detail.BROWSER_GRAPHQL_CURRENT_URL, home_url)
+        self.assertTrue(detail.BROWSER_GRAPHQL_SESSION_READY)
+        self.assertEqual(detail.BROWSER_GRAPHQL_SESSION_KIND, "home_origin")
+        script_text = "\n".join(page.script_calls)
+        self.assertNotIn("const selectors", script_text)
+        self.assertNotIn("const anchors", script_text)
+        self.assertNotIn("location.assign(targetUrl)", script_text)
+
+    def test_home_bootstrap_rejects_same_origin_non_home_redirect(self):
+        page = ScriptedPage([browser_state(PDP_URL)])
+        self.install_page(page)
+
+        with patch.object(detail, "BROWSER_BOOTSTRAP_POLL_SECONDS", 0.001), patch.object(
+            detail, "BROWSER_BOOTSTRAP_TIMEOUT_SECONDS", 0.003
+        ):
+            with self.assertRaises(detail.DetailBrowserBootstrapError):
+                detail.bootstrap_detail_browser_session(
+                    STRIPPED_PDP_URL,
+                    SKU,
+                    require_pdp=False,
+                )
+
+        self.assertEqual(detail.BROWSER_GRAPHQL_CURRENT_URL, "")
+        self.assertFalse(detail.BROWSER_GRAPHQL_SESSION_READY)
+        self.assertEqual(detail.BROWSER_GRAPHQL_SESSION_KIND, "")
 
     def test_bootstrap_rejects_chrome_error_without_committing_expected_url(self):
         page = ScriptedPage(
@@ -184,6 +226,7 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
                 browser_state(home_url),
                 browser_state(search_url),
                 browser_state(PDP_URL),
+                browser_state(PDP_URL),
             ],
             click_result=False,
         )
@@ -206,6 +249,7 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
                 browser_state(home_url),
                 browser_state(search_url),
                 browser_state(PDP_URL),
+                browser_state(PDP_URL),
             ]
         )
         self.install_page(page)
@@ -214,6 +258,22 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
             detail.time, "sleep"
         ) as sleep_mock:
             detail.bootstrap_detail_browser_session(STRIPPED_PDP_URL, SKU)
+
+        sleep_mock.assert_called_once_with(3)
+
+    def test_verified_home_uses_configured_settle_wait(self):
+        home_url = "https://www.bestbuy.com/?intl=nosplash"
+        page = ScriptedPage([browser_state(home_url), browser_state(home_url)])
+        self.install_page(page)
+
+        with patch.object(detail, "BROWSER_GRAPHQL_WAIT_SECONDS", 3), patch.object(
+            detail.time, "sleep"
+        ) as sleep_mock:
+            detail.bootstrap_detail_browser_session(
+                STRIPPED_PDP_URL,
+                SKU,
+                require_pdp=False,
+            )
 
         sleep_mock.assert_called_once_with(3)
 
@@ -267,7 +327,7 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
             ),
         )
 
-    def test_failed_fetch_restarts_process_then_succeeds(self):
+    def test_failed_fetch_retries_same_home_session_before_restart(self):
         self.install_page(object(), ready=True, current_url=PDP_URL)
         success = {"status": 200, "contentType": "application/json", "body": "{}"}
 
@@ -282,8 +342,75 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(fetch_mock.call_count, 2)
-        recover_mock.assert_called_once_with(STRIPPED_PDP_URL + "?intl=nosplash", SKU, fresh_profile=False)
+        recover_mock.assert_not_called()
         self.assertEqual(headers["browser_profile_kind"], "primary")
+
+    def test_second_failed_fetch_restarts_home_session_then_succeeds(self):
+        self.install_page(object(), ready=True, current_url=PDP_URL)
+        success = {"status": 200, "contentType": "application/json", "body": "{}"}
+
+        with patch.object(
+            detail,
+            "browser_fetch_graphql",
+            side_effect=[
+                RuntimeError("TypeError: Failed to fetch"),
+                RuntimeError("TypeError: Failed to fetch"),
+                success,
+            ],
+        ) as fetch_mock, patch.object(detail, "recover_detail_browser_session") as recover_mock, patch.object(
+            detail, "BROWSER_GRAPHQL_MAX_RECOVERIES", 2
+        ), patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS", 0):
+            status, _, _, _, _ = detail.browser_graphql_post([{"query": "q"}], STRIPPED_PDP_URL, SKU)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(fetch_mock.call_count, 3)
+        recover_mock.assert_called_once_with(
+            STRIPPED_PDP_URL + "?intl=nosplash",
+            SKU,
+            fresh_profile=False,
+            require_pdp=False,
+        )
+
+    def test_real_recovery_path_restarts_into_home_without_pdp_navigation(self):
+        home_url = "https://www.bestbuy.com/?intl=nosplash"
+        restarted_page = ScriptedPage([browser_state(home_url)])
+        restart_calls = []
+        self.install_page(object(), ready=True, current_url=home_url)
+        success = {"status": 200, "contentType": "application/json", "body": "{}"}
+
+        def recreate(*, fresh_profile=False):
+            restart_calls.append(fresh_profile)
+            detail.BROWSER_GRAPHQL_PAGE = restarted_page
+            detail.BROWSER_GRAPHQL_CURRENT_URL = ""
+            detail.BROWSER_GRAPHQL_SESSION_READY = False
+            detail.BROWSER_GRAPHQL_SESSION_KIND = ""
+            return restarted_page
+
+        with patch.object(
+            detail,
+            "browser_fetch_graphql",
+            side_effect=[
+                RuntimeError("TypeError: Failed to fetch"),
+                RuntimeError("TypeError: Failed to fetch"),
+                success,
+            ],
+        ), patch.object(detail, "recreate_detail_browser_page", side_effect=recreate), patch.object(
+            detail, "BROWSER_GRAPHQL_MAX_RECOVERIES", 2
+        ), patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS", 0):
+            status, _, _, headers, _ = detail.browser_graphql_post(
+                [{"query": "q"}],
+                STRIPPED_PDP_URL,
+                SKU,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(restart_calls, [False])
+        self.assertEqual(restarted_page.get_calls, [detail.BROWSER_BOOTSTRAP_HOME_URL])
+        scripts = "\n".join(restarted_page.script_calls)
+        self.assertNotIn("const selectors", scripts)
+        self.assertNotIn("const anchors", scripts)
+        self.assertEqual(headers["browser_url"], home_url)
+        self.assertEqual(headers["browser_session_kind"], "home_origin")
 
     def test_recovery_recreates_process_before_full_bootstrap(self):
         events = []
@@ -291,8 +418,8 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         def recreate(*, fresh_profile=False):
             events.append(("recreate", fresh_profile))
 
-        def bootstrap(browser_url, expected_sku=""):
-            events.append(("bootstrap", browser_url, expected_sku))
+        def bootstrap(browser_url, expected_sku="", *, require_pdp=True):
+            events.append(("bootstrap", browser_url, expected_sku, require_pdp))
             return {"href": PDP_URL}
 
         with patch.object(detail, "recreate_detail_browser_page", side_effect=recreate), patch.object(
@@ -308,10 +435,219 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
             events,
             [
                 ("recreate", False),
-                ("bootstrap", STRIPPED_PDP_URL, SKU),
+                ("bootstrap", STRIPPED_PDP_URL, SKU, True),
             ],
         )
         self.assertEqual(state["href"], PDP_URL)
+
+    def test_ready_home_session_is_reused_and_reported_as_actual_referer(self):
+        home_url = "https://www.bestbuy.com/?intl=nosplash"
+        self.install_page(object(), ready=True, current_url=home_url)
+        response = {"status": 200, "contentType": "application/json", "body": "{}"}
+
+        with patch.object(detail, "browser_fetch_graphql", return_value=response) as fetch_mock:
+            first = detail.browser_graphql_post([{"query": "first"}], STRIPPED_PDP_URL, SKU)
+            second = detail.browser_graphql_post(
+                [{"query": "second"}],
+                STRIPPED_PDP_URL.replace(SKU, "1234567"),
+                "1234567",
+            )
+
+        self.assertEqual(fetch_mock.call_count, 2)
+        for result in (first, second):
+            headers = result[3]
+            self.assertEqual(headers["browser_url"], home_url)
+            self.assertEqual(headers["browser_referer_url"], home_url)
+            self.assertEqual(headers["browser_session_kind"], "home_origin")
+        self.assertEqual(detail.BROWSER_GRAPHQL_CURRENT_URL, home_url)
+
+    def test_canary_accepts_zero_reviews_and_zero_recommendations(self):
+        target = {"sku_id": SKU, "product_url": PDP_URL}
+        with patch.object(detail, "FETCH_COMPARE", True):
+            _, entries = detail.detail_browser_canary_request_entries([target], stage="detail")
+        indices = entries[0]["indices"]
+        response_json = [{} for _ in range(max(indices.values()) + 1)]
+        response_json[indices["detail"]] = {
+            "data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}
+        }
+        response_json[indices["review"]] = {
+            "data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}
+        }
+        response_json[indices["compare"]] = {
+            "data": {
+                "productBySkuId": {"skuId": SKU},
+                "recommendations": {"subPlacements": []},
+            }
+        }
+
+        report = detail.validate_detail_browser_canary_response(response_json, entries, 200)
+
+        self.assertEqual(report["sku_count"], 1)
+        self.assertEqual(report["operation_count"], 3)
+
+    def test_canary_rejects_wrong_sku_and_graphql_errors(self):
+        entries = [
+            {
+                "sku": SKU,
+                "indices": {"detail": 0, "review": 1},
+            }
+        ]
+        wrong_sku = [
+            {"data": {"productBySkuId": {"skuId": "1234567"}}},
+            {"data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}},
+        ]
+        graphql_error = [
+            {"errors": [{"message": "blocked"}]},
+            {"data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}},
+        ]
+
+        for response_json in (wrong_sku, graphql_error):
+            with self.subTest(response_json=response_json):
+                with self.assertRaises(detail.DetailBrowserCanaryError):
+                    detail.validate_detail_browser_canary_response(response_json, entries, 200)
+
+    def test_canary_requires_compare_shape_but_allows_empty_recommendations(self):
+        entries = [{"sku": SKU, "indices": {"compare": 0}}]
+        missing_shape = [{"data": {"productBySkuId": {"skuId": SKU}}}]
+        empty_shape = [
+            {
+                "data": {
+                    "productBySkuId": {"skuId": SKU},
+                    "recommendations": {"subPlacements": []},
+                }
+            }
+        ]
+
+        with self.assertRaises(detail.DetailBrowserCanaryError):
+            detail.validate_detail_browser_canary_response(missing_shape, entries, 200)
+        report = detail.validate_detail_browser_canary_response(empty_shape, entries, 200)
+        self.assertEqual(report["warning_count"], 0)
+
+    def test_non_strict_preflight_treats_missing_product_as_item_warning(self):
+        entries = [{"sku": SKU, "indices": {"detail": 0}}]
+        response_json = [{"data": {"productBySkuId": None}}]
+
+        report = detail.validate_detail_browser_canary_response(
+            response_json,
+            entries,
+            200,
+            strict=False,
+        )
+
+        self.assertEqual(report["warning_count"], 1)
+        self.assertIn("product_missing", report["warnings"][0])
+
+    def test_review_canary_does_not_include_detail_or_compare_operations(self):
+        target = {"sku_id": SKU, "product_url": PDP_URL}
+        with patch.object(detail, "FETCH_COMPARE", True):
+            payloads, entries = detail.detail_browser_canary_request_entries([target], stage="review")
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(set(entries[0]["indices"]), {"review"})
+
+        singleton_response = {
+            "data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}
+        }
+        report = detail.validate_detail_browser_canary_response(
+            singleton_response,
+            entries,
+            200,
+        )
+        self.assertEqual(report["operation_count"], 1)
+
+    def test_preflight_skips_cache_complete_stage(self):
+        target = {"sku_id": SKU, "product_url": PDP_URL}
+        with patch.object(detail, "FORCE_REFRESH", False), patch.object(
+            detail, "STAGE", "detail"
+        ), patch.object(detail, "detail_success", return_value=True):
+            self.assertEqual(detail.detail_browser_preflight_candidates([target]), [])
+        with patch.object(detail, "FORCE_REFRESH", False), patch.object(
+            detail, "STAGE", "review"
+        ), patch.object(detail, "review_needs_retry", return_value=False):
+            self.assertEqual(detail.detail_browser_preflight_candidates([target]), [])
+
+    def test_canary_supports_five_sku_batch_without_writing_outputs(self):
+        skus = [str(6673600 + index) for index in range(5)]
+        targets = [
+            {
+                "sku_id": sku,
+                "product_url": PDP_URL.replace(SKU, sku),
+            }
+            for sku in skus
+        ]
+        response_json = []
+        for sku in skus:
+            item = {"data": {"productBySkuId": {"skuId": sku, "reviews": {"results": []}}}}
+            response_json.extend([item, item])
+        post_result = (
+            200,
+            json.dumps(response_json),
+            response_json,
+            {
+                "browser_url": "https://www.bestbuy.com/?intl=nosplash",
+                "browser_session_kind": "home_origin",
+            },
+            0.25,
+        )
+
+        with patch.object(detail, "FETCH_COMPARE", False), patch.object(
+            detail, "browser_graphql_post", return_value=post_result
+        ) as post_mock:
+            report = detail.run_detail_browser_graphql_canary(targets, 5, canary_only=True)
+
+        self.assertEqual(report["sku_count"], 5)
+        self.assertEqual(report["operation_count"], 10)
+        self.assertEqual(report["mode"], "canary_only")
+        self.assertEqual(len(post_mock.call_args.args[0]), 10)
+
+    def test_semantic_canary_failure_retries_once_in_same_session(self):
+        target = {"sku_id": SKU, "product_url": PDP_URL}
+        wrong = [
+            {"data": {"productBySkuId": {"skuId": "1234567"}}},
+            {"data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}},
+        ]
+        good_item = {"data": {"productBySkuId": {"skuId": SKU, "reviews": {"results": []}}}}
+        good = [good_item, good_item]
+
+        def post_result(response_json):
+            return (
+                200,
+                json.dumps(response_json),
+                response_json,
+                {
+                    "browser_url": "https://www.bestbuy.com/?intl=nosplash",
+                    "browser_session_kind": "home_origin",
+                },
+                0.1,
+            )
+
+        with patch.object(detail, "FETCH_COMPARE", False), patch.object(
+            detail,
+            "browser_graphql_post",
+            side_effect=[post_result(wrong), post_result(good)],
+        ) as post_mock, patch.object(detail, "BROWSER_GRAPHQL_CANARY_MAX_ATTEMPTS", 2), patch.object(
+            detail, "BROWSER_GRAPHQL_RECOVERY_BACKOFF_SECONDS", 0
+        ):
+            report = detail.run_detail_browser_graphql_canary([target], 1, canary_only=True)
+
+        self.assertEqual(post_mock.call_count, 2)
+        self.assertEqual(report["attempts"], 2)
+
+    def test_browser_fetch_keeps_relative_gateway_and_includes_credentials(self):
+        class FetchPage:
+            def __init__(self):
+                self.script = ""
+
+            def run_js(self, script, timeout=None):
+                self.script = script
+                return json.dumps({"status": 200, "contentType": "application/json", "body": "{}"})
+
+        page = FetchPage()
+        browser_session.browser_fetch_graphql(page, [{"query": "q"}])
+
+        self.assertIn("fetch('/gateway/graphql'", page.script)
+        self.assertIn("credentials:'include'", page.script)
+        self.assertNotIn("referer", page.script.lower())
 
     def test_exhausted_transport_recovery_raises_fatal_and_clears_session(self):
         self.install_page(object(), ready=True, current_url=PDP_URL)
