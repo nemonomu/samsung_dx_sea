@@ -1,0 +1,41 @@
+# 2026-08-18 BestBuy REF detail browser session recovery
+
+## 2026-08-18 10:22:05 KST - implementation and local tests
+
+- Target: BestBuy REF, step08 detail and step09 review20 browser GraphQL transport.
+- Branch: `fix/bestbuy-detail-session-bootstrap` based on merged promotion recovery commit `df8a7cc`.
+- Runtime evidence reviewed:
+  - Attached 2026-08-17 daily-task logs showed listing success followed by `304/304` detail failures with `TypeError: Failed to fetch`.
+  - The failed Chrome PDP document showed `ERR_HTTP2_PROTOCOL_ERROR`, no response headers, and zero transferred bytes.
+  - In the RDP incognito browser, a cold PDP deep link failed while `https://www.bestbuy.com/?intl=nosplash` -> search -> product-result click succeeded.
+- Request conditions:
+  - Existing runtime mode is `browser_graphql`, visible Chrome, same-origin `fetch('/gateway/graphql')`, no ZenRows proxy for this path.
+  - No live BestBuy request, proxy request, DB operation, S3 operation, or runtime artifact mutation was performed from the development workspace. The ChatGPT/local browser is not equivalent to the RDP crawler because its IP, cookies, profile, proxy, Chrome process, and HTTP/2 connection state differ.
+- Code changes:
+  - `bestbuy/step08_detail_enrichment.py`
+    - Bootstrap a new browser through BestBuy home -> SKU search -> matching result click before GraphQL.
+    - Verify actual document URL, `location.origin`, ready state, matching SKU, and known Chrome/challenge error text before committing session state.
+    - Restore the configured post-PDP settle wait before the first GraphQL call.
+    - Restart Chrome on transport failure while retaining the warmed profile, then use one generation-specific recovery profile as the final fallback.
+    - Treat browser runtime errors, invalid/zero status, and systemic HTTP statuses (`401,403,408,425,429,500,502,503,504`) as transport-wide failures after bounded recovery.
+    - Propagate exhausted browser failures out of detail/review batch handlers so review single-SKU fallback cannot multiply a system outage.
+    - Record actual successful SKU count instead of output row count in the detail manifest.
+  - `bestbuy/step00_browser_session.py`
+    - Decouple Chrome process/port identity from profile/cache identity so a restarted process can reuse cookies without reconnecting to a stale debugging port.
+  - `run_bestbuy_fullrun.bat`
+    - Preserve the Python exit code through the PowerShell `Tee-Object` pipeline so step08/09 failure stops before DB steps.
+  - `tests/test_detail_browser_recovery.py`
+    - Added fake-browser regression coverage; no Chrome or network is used.
+- Local validation from `bestbuy/new`:
+  - `python -m py_compile bestbuy/step00_browser_session.py bestbuy/step08_detail_enrichment.py tests/test_detail_browser_recovery.py` -> pass.
+  - `python -m unittest discover -s tests -p "test_*.py" -v` -> `Ran 27 tests`, `OK`.
+  - Covered cold bootstrap order, stripped referer URL plus explicit SKU, HTTP/2 navigation failure, same-origin PDP fallback, actual-origin/SKU/challenge validation, settle wait, process/profile recovery order, empty fetch, HTTP 0/403/429/500, fatal propagation, review fallback suppression, and BAT exit-code propagation.
+  - `git diff --check` -> pass.
+- Raw artifacts/manifests: none created. Unit tests used in-memory browser/path fakes.
+- Interpretation:
+  - The merged `fix/bestbuy-promotion-recovery` changes were unrelated to this failure; they target TV step05 promotion recovery.
+  - The prior July detail recovery repeated a cold PDP deep link and did not verify the actual Chrome document. The new flow implements the navigation sequence proven on the RDP and prevents all-SKU retry amplification.
+- Next action:
+  - Run a one-SKU visible-browser canary on the RDP host using its real Chrome/network/profile environment.
+  - Confirm `detail:browser_bootstrap` logs show `home`, `search`, `pdp_click` (or `pdp_same_origin_assign`), `settle`, then a real GraphQL HTTP response.
+  - Only after that canary succeeds, run a five-SKU batch and then the full REF chain.

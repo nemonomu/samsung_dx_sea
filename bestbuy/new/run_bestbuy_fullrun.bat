@@ -133,7 +133,7 @@ set "STEP=%~4"
 echo.
 echo [%CUR%/%TOTAL%] %NAME% started
 echo [%CUR%/%TOTAL%] %NAME% started >> "%LOG_FILE%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m bestbuy.bestbuy_orchestrator --category '%CATEGORY%' '%STEP%' 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& python -m bestbuy.bestbuy_orchestrator --category '%CATEGORY%' '%STEP%' 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append; exit $LASTEXITCODE"
 if errorlevel 1 (
   set "FAILED_STEP_NAME=%NAME%"
   set "FAILED_STEP=%STEP%"

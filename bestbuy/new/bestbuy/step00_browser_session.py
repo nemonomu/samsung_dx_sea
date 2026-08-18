@@ -35,6 +35,8 @@ def create_browser_page(
     name,
     headless=False,
     local_port=0,
+    profile_name="",
+    port_seed="",
 ):
     try:
         from DrissionPage import ChromiumOptions, ChromiumPage
@@ -42,9 +44,11 @@ def create_browser_page(
         raise RuntimeError("DrissionPage is required for BestBuy browser session collection") from exc
 
     run_root = Path(run_root)
-    port = stable_browser_port(f"{name}:{run_root}", local_port)
-    profile_dir = run_root / "raw" / f"{name}_profile"
-    cache_dir = run_root / "raw" / f"{name}_cache"
+    profile_key = str(profile_name or name)
+    port_key = str(port_seed or name)
+    port = stable_browser_port(f"{port_key}:{run_root}", local_port)
+    profile_dir = run_root / "raw" / f"{profile_key}_profile"
+    cache_dir = run_root / "raw" / f"{profile_key}_cache"
     profile_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +79,7 @@ def create_browser_page(
             ) from second_exc
 
     return page, {
+        "browser_name": str(name),
         "browser_port": port,
         "browser_profile_dir": str(profile_dir),
         "browser_cache_dir": str(cache_dir),
