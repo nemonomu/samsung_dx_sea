@@ -85,6 +85,11 @@ PROMOTION_ARTIFACT_PATHS = (
     ("product_list", Path("output/bestbuy_product_list.csv")),
     ("detail_rows", Path("detail/parsed/detail_enriched_rows.csv")),
 )
+PROMOTION_PUBLISH_PATHS = (
+    Path("summary.json"),
+    Path("parsed"),
+    Path("raw/browser_dom"),
+)
 
 
 class StepFailure(RuntimeError):
@@ -548,16 +553,26 @@ def backup_promotion_recovery_inputs(run_root, recovery_root, plans):
         shutil.copy2(source, destination)
     canonical_promotion = run_root / "promotion"
     target_manifest = run_root / "output" / "bestbuy_final_targets.manifest.json"
+    promotion_paths = {}
+    for relative_path in PROMOTION_PUBLISH_PATHS:
+        source = canonical_promotion / relative_path
+        promotion_paths[relative_path.as_posix()] = source.exists()
+        if not source.exists():
+            continue
+        destination = before_root / "promotion" / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, destination)
     state = {
-        "promotion_existed": canonical_promotion.exists(),
+        "promotion_paths": promotion_paths,
         "target_manifest_existed": target_manifest.exists(),
     }
     (before_root / "rollback_state.json").write_text(
         json.dumps(state, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    if canonical_promotion.exists():
-        shutil.copytree(canonical_promotion, before_root / "promotion", dirs_exist_ok=True)
     if target_manifest.exists():
         destination = before_root / "output" / target_manifest.name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -624,7 +639,25 @@ def restore_promotion_recovery_inputs(run_root, recovery_root, plans):
     state = read_json(before_root / "rollback_state.json")
     canonical_promotion = run_root / "promotion"
     promotion_backup = before_root / "promotion"
-    if state:
+    promotion_paths = state.get("promotion_paths") if state else None
+    if isinstance(promotion_paths, dict):
+        for relative_text, existed in promotion_paths.items():
+            relative_path = Path(relative_text)
+            destination = canonical_promotion / relative_path
+            backup = promotion_backup / relative_path
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            elif destination.exists():
+                destination.unlink()
+            if not existed or not backup.exists():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if backup.is_dir():
+                shutil.copytree(backup, destination)
+            else:
+                shutil.copy2(backup, destination)
+    elif state:
+        # Compatibility with recovery folders created before managed-path backups.
         if canonical_promotion.exists():
             shutil.rmtree(canonical_promotion)
         if state.get("promotion_existed") and promotion_backup.exists():

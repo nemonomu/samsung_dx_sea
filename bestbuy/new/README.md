@@ -59,12 +59,18 @@ Lowe's dry-run:
 python -m lowes.lowes_orchestrator --dry-run --all
 ```
 
-BestBuy TV promotion만 복구할 때는 `run_bestbuy_promotion_recovery.bat`를 더블클릭합니다. 날짜 폴더명(예: `20260815`)을 입력하거나, 가장 최근 수집 폴더를 자동 선택하려면 아무것도 입력하지 않고 Enter를 누른 다음 표시된 경로가 맞으면 `Y`를 누릅니다. `batch_id`는 기존 `final_output.csv`에서 자동으로 확인하므로 입력하지 않습니다.
+BestBuy TV promotion만 복구할 때는 `run_bestbuy_promotion_recovery.bat`를 더블클릭합니다. 배치 ID 또는 날짜 폴더명(예: `b_20260831_215613`, `20260831_3`)을 입력하거나, 가장 최근 수집 폴더를 자동 선택하려면 아무것도 입력하지 않고 Enter를 누른 다음 표시된 경로가 맞으면 `Y`를 누릅니다. 배치 ID를 입력하면 `bestbuy\data\tv` 아래 `final_output.csv`를 검색해 일치하는 수집 폴더를 자동 선택합니다.
 
 PowerShell에서는 인자 없이 실행하면 동일한 질문 화면이 열립니다.
 
 ```powershell
 .\run_bestbuy_promotion_recovery.bat
+```
+
+배치 ID만 알고 있다면 해당 배치를 포함하는 수집 폴더를 자동으로 찾아 확인 후 실행합니다.
+
+```powershell
+.\run_bestbuy_promotion_recovery.bat b_20260831_215613
 ```
 
 확인 질문 없이 날짜를 바로 지정해서 실행하려면 날짜 폴더명만 인자로 전달합니다.

@@ -13,6 +13,7 @@ os.environ["BESTBUY_URL_SOURCE"] = "default"
 from bestbuy.bestbuy_orchestrator import apply_run_path_env
 from bestbuy.sos_refill import (
     apply_prepared_promotion_updates,
+    backup_promotion_recovery_inputs,
     build_promotion_overlay_rows,
     preserve_existing_artifacts_and_append_new_rows,
     prepare_promotion_artifact_updates,
@@ -271,6 +272,43 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertEqual(result[0]["new_rows_appended"], 1)
         self.assertEqual(writes[0][1][0], plan["original_rows"][0])
         self.assertEqual(writes[0][1][1], rebuilt_by_pipeline[1])
+
+    def test_promotion_backup_only_copies_published_artifacts_not_browser_profile(self):
+        run_root = Path("C:/bestbuy/run")
+        recovery_root = run_root / "promotion_recovery" / "test"
+        promotion_root = run_root / "promotion"
+        summary_path = promotion_root / "summary.json"
+        parsed_path = promotion_root / "parsed"
+        browser_dom_path = promotion_root / "raw" / "browser_dom"
+        target_manifest_path = run_root / "output" / "bestbuy_final_targets.manifest.json"
+        existing = {
+            str(summary_path),
+            str(parsed_path),
+            str(browser_dom_path),
+            str(target_manifest_path),
+        }
+        with patch.object(Path, "mkdir"), patch.object(
+            Path,
+            "exists",
+            autospec=True,
+            side_effect=lambda path: str(path) in existing,
+        ), patch.object(
+            Path,
+            "is_dir",
+            autospec=True,
+            side_effect=lambda path: str(path) in {str(parsed_path), str(browser_dom_path)},
+        ), patch.object(Path, "write_text"), patch(
+            "bestbuy.sos_refill.shutil.copytree"
+        ) as copytree, patch(
+            "bestbuy.sos_refill.shutil.copy2"
+        ) as copy2:
+            backup_promotion_recovery_inputs(run_root, recovery_root, [])
+
+        copied_tree_sources = {str(item.args[0]) for item in copytree.call_args_list}
+        copied_file_sources = {str(item.args[0]) for item in copy2.call_args_list}
+        self.assertEqual(copied_tree_sources, {str(parsed_path), str(browser_dom_path)})
+        self.assertEqual(copied_file_sources, {str(summary_path), str(target_manifest_path)})
+        self.assertFalse(any("promotion_dom_profile" in value for value in copied_tree_sources))
 
     def test_overlay_rejects_duplicate_db_item_identity(self):
         final_rows = [
@@ -636,14 +674,15 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertIn('set "INTERACTIVE=1"', source)
         self.assertIn('set "ORIGINAL_CODEPAGE="', source)
         self.assertIn('if defined ORIGINAL_CODEPAGE chcp %ORIGINAL_CODEPAGE% >nul', source)
-        self.assertLess(
-            source.index('set "RUN_ROOT="'),
-            source.index('if not "%RUN_INPUT%"=="" goto :resolve_input'),
-        )
+        self.assertLess(source.index('set "RUN_ROOT="'), source.index(':classify_input'))
         self.assertIn('set /p "RUN_INPUT=', source)
         self.assertIn('Enter=가장 최근', source)
         self.assertIn('dir /b /ad /o-n "%~dp0bestbuy\\data\\tv\\20??????*"', source)
         self.assertIn('if not defined RUN_ROOT if exist ', source)
+        self.assertIn('if /I "%RUN_INPUT:~0,2%"=="b_"', source)
+        self.assertIn('goto :find_by_batch', source)
+        self.assertIn('findstr /L /C:"%BATCH_ID%"', source)
+        self.assertIn('batch_id=%BATCH_ID%가 있는 final_output.csv', source)
         self.assertIn('choice /C YN', source)
         self.assertIn('if exist "%RUN_INPUT%\\output\\final_output.csv" (', source)
         self.assertIn('set "RUN_ROOT=%RUN_INPUT%"', source)
