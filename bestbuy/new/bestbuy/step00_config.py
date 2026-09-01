@@ -94,9 +94,11 @@ PROMOTION_TV_HOME_THEATER_URL = (
     "https://www.bestbuy.com/site/all-electronics-on-sale/all-tv-home-theater-on-sale/"
     "pcmcat1690836748285.c?id=pcmcat1690836748285"
 )
-PROMOTION_TV_HEADLINE = "Don’t-miss deals on TVs"
-PROMOTION_TV_SUBHEADLINE = "Big savings for a limited time"
-PROMOTION_TV_EXPECTED_MIN_ROWS = 16
+PROMOTION_TV_PLACEMENT_ID = "pcmcat1690836748285"
+# Best Buy rotates both the promotion headline and the number of product cards.
+# Zero means "discover and validate the live card set"; operators may still set
+# BESTBUY_PROMOTION_EXPECTED_MIN_ROWS to enforce an incident-specific floor.
+PROMOTION_TV_EXPECTED_MIN_ROWS = 0
 
 
 BESTBUY_URLS = {
@@ -110,7 +112,7 @@ BESTBUY_URLS = {
 }
 
 PROMOTION_LABELS = {
-    "pcmcat1690836748285-1": PROMOTION_TV_HEADLINE,
+    "pcmcat1690836748285-1": "TV promotion",
     "pcmcat1690836748285-2": "Featured deals",
     "pcmcat1690836748285-3": "On-sale lifestyle TVs as low as $799.99",
     "pcmcat1690836748285-5": "Save up to $1,500 on select OLED TVs",

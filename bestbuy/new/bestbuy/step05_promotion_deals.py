@@ -21,8 +21,7 @@ from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
     PROMOTION_LABELS,
     PROMOTION_TV_EXPECTED_MIN_ROWS,
-    PROMOTION_TV_HEADLINE,
-    PROMOTION_TV_SUBHEADLINE,
+    PROMOTION_TV_PLACEMENT_ID,
     bestbuy_category,
     load_initial_urls,
     rel_path,
@@ -66,10 +65,17 @@ PROMOTION_RETRY_STATUS_CODES = {
     .split()
     if value.strip().isdigit()
 }
-PROMOTION_DOM_HEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_HEADLINE", PROMOTION_TV_HEADLINE)
-PROMOTION_DOM_TYPE = os.getenv("BESTBUY_PROMOTION_DOM_TYPE", PROMOTION_DOM_HEADLINE)
-PROMOTION_DOM_SUBHEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_SUBHEADLINE", PROMOTION_TV_SUBHEADLINE)
+PROMOTION_DOM_HEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_HEADLINE", "").strip()
+PROMOTION_DOM_TYPE = os.getenv("BESTBUY_PROMOTION_DOM_TYPE", "").strip()
+PROMOTION_DOM_SUBHEADLINE = os.getenv("BESTBUY_PROMOTION_DOM_SUBHEADLINE", "").strip()
 PROMOTION_DOM_SELECTOR = os.getenv("BESTBUY_PROMOTION_DOM_SELECTOR", ".pl-flex-carousel")
+PROMOTION_DOM_PLACEMENT = os.getenv("BESTBUY_PROMOTION_DOM_PLACEMENT", PROMOTION_TV_PLACEMENT_ID).strip()
+PROMOTION_STABILITY_POLLS = max(2, int(os.getenv("BESTBUY_PROMOTION_STABILITY_POLLS", "6")))
+PROMOTION_STABILITY_REQUIRED = max(2, int(os.getenv("BESTBUY_PROMOTION_STABILITY_REQUIRED", "3")))
+PROMOTION_STABILITY_INTERVAL_SECONDS = max(
+    0.1,
+    float(os.getenv("BESTBUY_PROMOTION_STABILITY_INTERVAL_SECONDS", "0.75")),
+)
 ENDPOINT = os.getenv("BESTBUY_GRAPHQL_ENDPOINT", "https://www.bestbuy.com/gateway/graphql")
 PLACEMENT = os.getenv("BESTBUY_PROMOTION_PLACEMENT", "all")
 REFERER = os.getenv("BESTBUY_PROMOTION_REFERER", load_initial_urls().get("promotion_tv_home_theater", ""))
@@ -581,13 +587,18 @@ def clean_dom_name(link_text, card_text, image_alt):
     return ""
 
 
-def parse_dom_items(raw_items):
+def parse_dom_items(raw_items, promotion_type=""):
+    resolved_promotion_type = compact_spaces(promotion_type or PROMOTION_DOM_TYPE)
     grouped = {}
     for item in raw_items or []:
         href = str(item.get("href") or "").split("#", 1)[0]
         sku_id = sku_from_product_url(href)
         if not sku_id:
             continue
+        try:
+            position = int(str(item.get("position") or "").strip())
+        except ValueError:
+            position = 0
         entry = grouped.setdefault(
             sku_id,
             {
@@ -597,6 +608,7 @@ def parse_dom_items(raw_items):
                 "link_text": "",
                 "image_alt": "",
                 "card_text": "",
+                "promotion_position": position or len(grouped) + 1,
             },
         )
         link_text = compact_spaces(item.get("linkText"))
@@ -610,15 +622,18 @@ def parse_dom_items(raw_items):
             entry["card_text"] = card_text
         if not entry["bsin"]:
             entry["bsin"] = bsin_from_product_url(href)
+        if position and position < entry["promotion_position"]:
+            entry["promotion_position"] = position
 
     rows = []
-    for position, entry in enumerate(grouped.values(), 1):
+    entries = sorted(grouped.values(), key=lambda value: value["promotion_position"])
+    for entry in entries:
         customer_price, regular_price, total_savings = parse_dom_prices(entry["card_text"])
         rows.append(
             {
-                "promotion_type": PROMOTION_DOM_TYPE,
+                "promotion_type": resolved_promotion_type,
                 "promotion_placement": "browser_dom_carousel",
-                "promotion_position": position,
+                "promotion_position": entry["promotion_position"],
                 "sku_id": entry["sku_id"],
                 "retailer_sku_name": clean_dom_name(entry["link_text"], entry["card_text"], entry["image_alt"]),
                 "product_url": entry["product_url"],
@@ -649,92 +664,98 @@ const absolute = href => {
 const productLinkSelector = 'a[href*="/product/"][href*="/sku/"]';
 const targetHeadline = norm('%PROMOTION_DOM_HEADLINE%');
 const targetSubheadline = norm('%PROMOTION_DOM_SUBHEADLINE%');
-const carouselSelectors = new Set([
-  '%PROMOTION_DOM_SELECTOR%',
-  '.pl-flex-carousel',
-  '.pl-flex-carousel-slider',
-  '.pl-flex-carousel-container'
-]);
+const targetPlacement = clean('%PROMOTION_DOM_PLACEMENT%');
+const configuredType = clean('%PROMOTION_DOM_TYPE%');
+const heroSelector = '[data-testid="hero-banner"]';
+const productCardSelector = '[data-testid="product-card"]';
+const heroCandidates = Array.from(document.querySelectorAll(heroSelector))
+  .filter(hero => hero.querySelectorAll(productCardSelector).length > 0)
+  .map(hero => ({
+    hero,
+    placement: clean(hero.getAttribute('data-hero-placement')),
+    variant: clean(hero.getAttribute('data-hero-variant')),
+    cards: hero.querySelectorAll(productCardSelector).length
+  }));
 
-const carouselContainers = Array.from(carouselSelectors)
-  .flatMap(selector => Array.from(document.querySelectorAll(selector)));
-const uniqueContainers = Array.from(new Set(carouselContainers));
-const scoreContainer = el => {
-  const text = clean(el.innerText);
-  const links = Array.from(el.querySelectorAll(productLinkSelector));
-  const className = String(el.className || '');
-  const dealHits = (text.match(/Tech Fest Deal/g) || []).length;
-  let score = links.length + dealHits * 10;
-  if (className.includes('pl-flex-carousel-slider')) score += 30;
-  if (className.includes('pl-flex-carousel')) score += 20;
-  return {el, text, links, score};
-};
-
-const allElements = Array.from(document.querySelectorAll('body *'));
-const headingMatches = allElements
-  .map((el, index) => ({el, index, text: norm(el.innerText)}))
-  .filter(item =>
-    item.text.includes(targetHeadline)
-    && item.text.includes(targetSubheadline)
-    && item.text.length <= 300
-    && item.el.querySelectorAll(productLinkSelector).length === 0
-  );
-
-const sectionCandidates = [];
-for (const heading of headingMatches) {
-  for (const item of uniqueContainers.map(scoreContainer)) {
-    const index = allElements.indexOf(item.el);
-    if (index > heading.index && item.links.length >= 4) {
-      sectionCandidates.push({...item, headingIndex: heading.index, containerIndex: index});
-    }
-  }
+let candidatePool = heroCandidates.filter(item =>
+  item.placement === targetPlacement && item.variant === 'offer-and-product'
+);
+let detectionMethod = 'placement_and_variant';
+if (candidatePool.length === 0) {
+  candidatePool = heroCandidates.filter(item => item.placement === targetPlacement);
+  detectionMethod = 'placement_with_product_cards';
 }
-const chosen = sectionCandidates
-  .sort((a, b) => a.headingIndex - b.headingIndex || a.containerIndex - b.containerIndex || b.links.length - a.links.length)[0];
+if (candidatePool.length === 0) {
+  candidatePool = heroCandidates.filter(item => item.variant === 'offer-and-product');
+  detectionMethod = 'unique_offer_and_product_hero';
+}
 
-// Legacy behavior scored every carousel on the page and picked the strongest one.
-// It is intentionally disabled because the current TV deals page has multiple
-// carousel-like sections; promotion rows must come from the target headline block.
-if (!chosen) {
+// A configured headline is an operator override, not the normal discovery path.
+if (candidatePool.length > 1 && targetHeadline) {
+  candidatePool = candidatePool.filter(item => {
+    const text = norm(item.hero.innerText);
+    return text.includes(targetHeadline) && (!targetSubheadline || text.includes(targetSubheadline));
+  });
+  detectionMethod = 'configured_headline_tiebreaker';
+}
+
+if (candidatePool.length !== 1) {
   return JSON.stringify({
     containerFound: false,
     items: [],
     containerText: '',
-    targetHeadline: '%PROMOTION_DOM_HEADLINE%',
-    targetSubheadline: '%PROMOTION_DOM_SUBHEADLINE%',
-    headingMatches: headingMatches.length
+    targetPlacement,
+    heroCandidateCount: heroCandidates.length,
+    qualifiedCandidateCount: candidatePool.length,
+    detectionMethod,
+    error: candidatePool.length ? 'ambiguous_promotion_hero' : 'promotion_hero_not_found'
   });
 }
+
+const chosenHero = candidatePool[0].hero;
+const carouselCandidates = Array.from(chosenHero.querySelectorAll('%PROMOTION_DOM_SELECTOR%, .pl-flex-carousel'))
+  .filter(el => el.querySelectorAll(productCardSelector).length > 0);
+const chosenCarousel = carouselCandidates[0] || chosenHero;
+const heading = chosenHero.querySelector('h1, h2, h3, h4, [role="heading"]');
+const headlineNode = heading && heading.children.length ? heading.children[0] : heading;
+const subheadlineNode = heading && heading.children.length > 1 ? heading.children[1] : null;
+const promotionType = configuredType || clean(headlineNode ? headlineNode.textContent : '');
+const promotionSubheadline = clean(subheadlineNode ? subheadlineNode.textContent : '');
+
+const productCards = Array.from(chosenCarousel.querySelectorAll(productCardSelector));
+const cardRoots = Array.from(new Set(productCards.map(card => card.closest('li.c-carousel-item, li[data-order]') || card)));
 const items = [];
-for (const link of chosen.links) {
-  let card = link;
-  for (let i = 0; i < 8 && card && card.parentElement; i++) {
-    const parent = card.parentElement;
-    const parentText = clean(parent.innerText);
-    const parentLinks = parent.querySelectorAll(productLinkSelector).length;
-    if (parentText && (parentText.includes('Tech Fest Deal') || parentText.includes('$')) && parentLinks <= 4) {
-      card = parent;
-      break;
-    }
-    card = parent;
-  }
-  const img = card ? card.querySelector('img[alt]') : null;
+for (const [index, card] of cardRoots.entries()) {
+  const link = card.querySelector(productLinkSelector);
+  if (!link) continue;
+  const productCard = link.closest(productCardSelector) || card.querySelector(productCardSelector) || card;
+  const img = productCard.querySelector('img[alt]');
+  const rawOrder = card.getAttribute('data-order');
+  const parsedOrder = rawOrder !== null && /^\d+$/.test(rawOrder) ? Number(rawOrder) + 1 : index + 1;
   items.push({
     href: absolute(link.getAttribute('href') || link.href),
     linkText: clean(link.innerText),
     imageAlt: clean(img ? img.getAttribute('alt') : ''),
-    cardText: clean(card ? card.innerText : link.innerText)
+    cardText: clean(productCard.innerText || link.innerText),
+    position: parsedOrder,
+    dataOrder: rawOrder
   });
 }
 return JSON.stringify({
   containerFound: true,
-  containerClass: String(chosen.el.className || ''),
-  linkCount: chosen.links.length,
+  containerClass: String(chosenCarousel.className || ''),
+  targetPlacement,
+  heroPlacement: clean(chosenHero.getAttribute('data-hero-placement')),
+  heroVariant: clean(chosenHero.getAttribute('data-hero-variant')),
+  heroCandidateCount: heroCandidates.length,
+  qualifiedCandidateCount: candidatePool.length,
+  detectionMethod,
+  promotionType,
+  promotionSubheadline,
+  cardCount: cardRoots.length,
+  linkCount: chosenCarousel.querySelectorAll(productLinkSelector).length,
   itemCount: items.length,
-  headingMatches: headingMatches.length,
-  headingIndex: chosen.headingIndex,
-  containerIndex: chosen.containerIndex,
-  containerText: chosen.text.slice(0, 2000),
+  containerText: clean(chosenCarousel.innerText).slice(0, 2000),
   items
 });
 """
@@ -742,6 +763,8 @@ return JSON.stringify({
         js.replace("%PROMOTION_DOM_SELECTOR%", PROMOTION_DOM_SELECTOR.replace("\\", "\\\\").replace("'", "\\'"))
         .replace("%PROMOTION_DOM_HEADLINE%", PROMOTION_DOM_HEADLINE.replace("\\", "\\\\").replace("'", "\\'"))
         .replace("%PROMOTION_DOM_SUBHEADLINE%", PROMOTION_DOM_SUBHEADLINE.replace("\\", "\\\\").replace("'", "\\'"))
+        .replace("%PROMOTION_DOM_PLACEMENT%", PROMOTION_DOM_PLACEMENT.replace("\\", "\\\\").replace("'", "\\'"))
+        .replace("%PROMOTION_DOM_TYPE%", PROMOTION_DOM_TYPE.replace("\\", "\\\\").replace("'", "\\'"))
     )
     raw = page.run_js(js, timeout=BROWSER_JS_TIMEOUT)
     if raw is None:
@@ -750,6 +773,86 @@ return JSON.stringify({
         return json.loads(raw)
     except ValueError as exc:
         raise RuntimeError(f"Promotion browser DOM extraction returned non-JSON: {exc}") from exc
+
+
+def browser_dom_signature(payload):
+    return tuple(
+        (
+            sku_from_product_url(item.get("href")),
+            str(item.get("position") or ""),
+        )
+        for item in payload.get("items") or []
+    )
+
+
+def collect_stable_browser_dom(page):
+    best_payload = {}
+    best_count = -1
+    previous_signature = None
+    stable_checks = 0
+    polls = 0
+    for poll in range(1, PROMOTION_STABILITY_POLLS + 1):
+        polls = poll
+        payload = extract_browser_dom_items(page)
+        item_count = len(payload.get("items") or [])
+        if item_count > best_count:
+            best_payload = payload
+            best_count = item_count
+        signature = browser_dom_signature(payload)
+        if payload.get("containerFound") and signature and signature == previous_signature:
+            stable_checks += 1
+        else:
+            stable_checks = 1 if payload.get("containerFound") and signature else 0
+        previous_signature = signature
+        if stable_checks >= PROMOTION_STABILITY_REQUIRED:
+            payload["stable"] = True
+            payload["stabilityPolls"] = polls
+            payload["stableChecks"] = stable_checks
+            return payload
+        if poll < PROMOTION_STABILITY_POLLS:
+            time.sleep(PROMOTION_STABILITY_INTERVAL_SECONDS)
+    best_payload["stable"] = False
+    best_payload["stabilityPolls"] = polls
+    best_payload["stableChecks"] = stable_checks
+    return best_payload
+
+
+def validate_browser_dom_payload(payload, rows):
+    issues = []
+    raw_items = payload.get("items") or []
+    if not payload.get("containerFound"):
+        issues.append(payload.get("error") or "promotion_hero_not_found")
+    if not compact_spaces(payload.get("promotionType")):
+        issues.append("promotion_headline_missing")
+    if not payload.get("stable"):
+        issues.append("promotion_card_set_not_stable")
+    if not raw_items:
+        issues.append("promotion_cards_empty")
+    card_count = int(payload.get("cardCount") or 0)
+    if card_count != len(raw_items):
+        issues.append(f"card_item_count_mismatch:{card_count}/{len(raw_items)}")
+    raw_skus = [sku_from_product_url(item.get("href")) for item in raw_items]
+    if any(not sku for sku in raw_skus):
+        issues.append("promotion_card_missing_sku")
+    if len(set(raw_skus)) != len(raw_skus):
+        issues.append("promotion_card_duplicate_sku")
+    raw_orders = []
+    for item in raw_items:
+        raw_order = str(item.get("dataOrder") if item.get("dataOrder") is not None else "").strip()
+        if not raw_order.isdigit():
+            issues.append("promotion_card_data_order_missing")
+            raw_orders = []
+            break
+        raw_orders.append(int(raw_order))
+    if raw_orders and raw_orders != list(range(len(raw_items))):
+        issues.append("promotion_card_data_order_not_contiguous")
+    if len(rows) != len(raw_items):
+        issues.append(f"parsed_row_count_mismatch:{len(rows)}/{len(raw_items)}")
+    positions = sorted(int(row.get("promotion_position") or 0) for row in rows)
+    expected_positions = list(range(1, len(rows) + 1))
+    if positions != expected_positions:
+        issues.append("promotion_positions_not_contiguous")
+    return issues
 
 
 def run_browser_dom():
@@ -793,7 +896,7 @@ def run_browser_dom():
                     )
                     break
                 time.sleep(0.4)
-            payload = extract_browser_dom_items(page)
+            payload = collect_stable_browser_dom(page)
             html_text = browser_outer_html(page, timeout=BROWSER_JS_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - retry a hung/blocked page with a fresh session
             error = f"{type(exc).__name__}: {exc}"
@@ -803,7 +906,15 @@ def run_browser_dom():
             close_browser_page(page)
 
         elapsed = round(time.perf_counter() - start, 3)
-        rows = parse_dom_items(payload.get("items") or [])
+        rows = parse_dom_items(
+            payload.get("items") or [],
+            promotion_type=payload.get("promotionType"),
+        )
+        validation_errors = validate_browser_dom_payload(payload, rows)
+        if PROMOTION_EXPECTED_MIN_ROWS and len(rows) < PROMOTION_EXPECTED_MIN_ROWS:
+            validation_errors.append(
+                f"promotion_rows_below_operator_floor:{len(rows)}/{PROMOTION_EXPECTED_MIN_ROWS}"
+            )
         html_path.write_text(html_text, encoding="utf-8", errors="replace")
         payload_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         summary = {
@@ -817,14 +928,26 @@ def run_browser_dom():
             "attempts": attempts,
             "error": error,
             "container_found": bool(payload.get("containerFound")),
+            "detection_method": payload.get("detectionMethod", ""),
+            "hero_placement": payload.get("heroPlacement", ""),
+            "hero_variant": payload.get("heroVariant", ""),
+            "promotion_type": payload.get("promotionType", ""),
+            "promotion_subheadline": payload.get("promotionSubheadline", ""),
+            "hero_candidate_count": payload.get("heroCandidateCount", 0),
+            "qualified_candidate_count": payload.get("qualifiedCandidateCount", 0),
+            "card_count": payload.get("cardCount", 0),
             "raw_link_count": payload.get("linkCount", 0),
             "raw_item_count": payload.get("itemCount", 0),
+            "stable": bool(payload.get("stable")),
+            "stability_polls": payload.get("stabilityPolls", 0),
+            "stable_checks": payload.get("stableChecks", 0),
+            "validation_errors": validation_errors,
             "row_count": len(rows),
             "html": rel_path(html_path),
             "dom_items": rel_path(payload_path),
             "browser": browser_meta,
         }
-        enough = bool(rows) and (not PROMOTION_EXPECTED_MIN_ROWS or len(rows) >= PROMOTION_EXPECTED_MIN_ROWS)
+        enough = bool(rows) and not validation_errors
         if enough:
             return rows, summary
         if best is None or len(rows) > len(best[0]):
@@ -832,10 +955,13 @@ def run_browser_dom():
         if attempt < attempts and PROMOTION_RETRY_SLEEP_SECONDS > 0:
             time.sleep(PROMOTION_RETRY_SLEEP_SECONDS)
 
-    # Return the best partial result if any attempt scraped rows; only surface the
-    # exception (-> collection_failed summary) when every attempt errored with none.
-    if best is not None and (best[0] or last_exc is None):
-        return best
+    if best is not None:
+        best_summary = best[1] or {}
+        errors = ", ".join(best_summary.get("validation_errors") or []) or "no valid promotion rows"
+        raise RuntimeError(
+            "Promotion browser DOM validation failed after "
+            f"{attempts} attempts: rows={len(best[0])}; {errors}"
+        )
     if last_exc is not None:
         raise last_exc
     return best if best is not None else ([], summary)
@@ -926,7 +1052,7 @@ def write_failure_skip_summary(exc):
         "started_at": now(),
         "skipped": True,
         "collection_failed": True,
-        "reason": "promotion collection failed; continuing pipeline with empty promotion rows",
+        "reason": "promotion collection failed; downstream pipeline must stop",
         "error_type": type(exc).__name__,
         "error": str(exc),
         "placements": [],
@@ -981,7 +1107,7 @@ def main():
             "call_count": 1,
             "row_count": len(rows),
             "total_x_request_cost": 0,
-            "max_attempts": 1,
+            "max_attempts": PROMOTION_MAX_ATTEMPTS,
             "expected_min_rows": PROMOTION_EXPECTED_MIN_ROWS,
             "fallback_to_single": False,
             "attempts": [],
@@ -1117,3 +1243,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         write_failure_skip_summary(exc)
+        raise

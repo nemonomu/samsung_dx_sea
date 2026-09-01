@@ -14,6 +14,7 @@ from bestbuy.bestbuy_orchestrator import apply_run_path_env
 from bestbuy.sos_refill import (
     apply_prepared_promotion_updates,
     build_promotion_overlay_rows,
+    preserve_existing_artifacts_and_append_new_rows,
     prepare_promotion_artifact_updates,
     validate_promotion_recovery,
 )
@@ -21,19 +22,28 @@ from bestbuy.step00_config import (
     BESTBUY_URLS,
     PROMOTION_LABELS,
     PROMOTION_TV_EXPECTED_MIN_ROWS,
-    PROMOTION_TV_HEADLINE,
     PROMOTION_TV_HOME_THEATER_URL,
+    PROMOTION_TV_PLACEMENT_ID,
 )
-from bestbuy.step05_promotion_deals import PROMOTION_DOM_TYPE, parse_dom_items
+from bestbuy.step05_promotion_deals import (
+    PROMOTION_DOM_TYPE,
+    parse_dom_items,
+    validate_browser_dom_payload,
+)
 from bestbuy.step14_db_load import (
     normalize_value,
+    promotion_new_rows,
     product_list_promotion_update_candidates,
     promotion_update_candidates,
+    upsert_promotion_new_rows,
     update_product_list_promotion_only,
     update_promotion_only,
 )
 from bestbuy.step16_email_notify import listing_count_issues
 import bestbuy.step14_db_load as db_load_module
+
+
+DYNAMIC_PROMOTION_TYPE = "Go all in on big-screen action"
 
 
 class FakeCursor:
@@ -87,17 +97,17 @@ class FakeConnection:
 
 
 class PromotionRecoveryTests(unittest.TestCase):
-    def test_verified_url_label_and_expected_count(self):
+    def test_verified_url_placement_and_dynamic_count(self):
         self.assertEqual(
             PROMOTION_TV_HOME_THEATER_URL,
             "https://www.bestbuy.com/site/all-electronics-on-sale/all-tv-home-theater-on-sale/"
             "pcmcat1690836748285.c?id=pcmcat1690836748285",
         )
         self.assertEqual(BESTBUY_URLS["promotion_tv_home_theater"], PROMOTION_TV_HOME_THEATER_URL)
-        self.assertEqual(PROMOTION_TV_EXPECTED_MIN_ROWS, 16)
-        self.assertEqual(PROMOTION_TV_HEADLINE, "Don’t-miss deals on TVs")
-        self.assertEqual(PROMOTION_LABELS["pcmcat1690836748285-1"], PROMOTION_TV_HEADLINE)
-        self.assertEqual(PROMOTION_DOM_TYPE, PROMOTION_TV_HEADLINE)
+        self.assertEqual(PROMOTION_TV_PLACEMENT_ID, "pcmcat1690836748285")
+        self.assertEqual(PROMOTION_TV_EXPECTED_MIN_ROWS, 0)
+        self.assertEqual(PROMOTION_LABELS["pcmcat1690836748285-1"], "TV promotion")
+        self.assertEqual(PROMOTION_DOM_TYPE, "")
         config_source = Path(__file__).parents[1] / "bestbuy" / "step00_config.py"
         self.assertNotIn("pcmcat1720647543741", config_source.read_text(encoding="utf-8"))
 
@@ -107,13 +117,14 @@ class PromotionRecoveryTests(unittest.TestCase):
             [
                 {"href": url, "linkText": "Sample TV with a sufficiently long name"},
                 {"href": url, "imageAlt": "Sample TV duplicate product link"},
-            ]
+            ],
+            promotion_type=DYNAMIC_PROMOTION_TYPE,
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["promotion_position"], 1)
-        self.assertEqual(rows[0]["promotion_type"], PROMOTION_TV_HEADLINE)
+        self.assertEqual(rows[0]["promotion_type"], DYNAMIC_PROMOTION_TYPE)
 
-    def test_overlay_updates_only_existing_main_overlap(self):
+    def test_overlay_updates_all_existing_overlaps_and_preserves_page_type(self):
         final_rows = [
             {
                 "batch_id": "b_test",
@@ -153,19 +164,19 @@ class PromotionRecoveryTests(unittest.TestCase):
         promotion_rows = [
             {
                 "sku_id": "100",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "7",
                 "retailer_sku_name": "Wrong promotion-side name",
                 "product_url": "https://www.bestbuy.com/product/wrong/wrong-item/sku/100",
             },
             {
                 "sku_id": "300",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "8",
             },
             {
                 "sku_id": "400",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "9",
             },
         ]
@@ -176,13 +187,16 @@ class PromotionRecoveryTests(unittest.TestCase):
             target_rows,
             "b_test",
         )
-        self.assertEqual(len(overlay), 1)
-        self.assertEqual(overlay[0]["sku_id"], "100")
+        self.assertEqual(len(overlay), 2)
+        self.assertEqual([row["sku_id"] for row in overlay], ["100", "300"])
         self.assertEqual(overlay[0]["item"], "main-a")
-        self.assertEqual(overlay[0]["promotion_type"], PROMOTION_TV_HEADLINE)
+        self.assertEqual(overlay[0]["page_type"], "main")
+        self.assertEqual(overlay[1]["item"], "bsr-c")
+        self.assertEqual(overlay[1]["page_type"], "bsr")
+        self.assertEqual(overlay[0]["promotion_type"], DYNAMIC_PROMOTION_TYPE)
         self.assertEqual(overlay[0]["promotion_position"], "7")
-        self.assertEqual(stats["matched_main_skus"], 1)
-        self.assertEqual(stats["unmatched_promotion_skus"], ["300", "400"])
+        self.assertEqual(stats["matched_existing_skus"], 2)
+        self.assertEqual(stats["unmatched_promotion_skus"], ["400"])
 
         run_root = Path("C:/bestbuy/test-promotion-recovery")
         before = copy.deepcopy(final_rows)
@@ -198,13 +212,65 @@ class PromotionRecoveryTests(unittest.TestCase):
         after = final_plan["rows"]
         self.assertEqual(len(after), len(before))
         for index, (old, new) in enumerate(zip(before, after)):
-            if index == 0:
-                self.assertEqual(new["promotion_type"], PROMOTION_TV_HEADLINE)
-                self.assertEqual(new["promotion_position"], "7")
+            if index in {0, 2}:
+                self.assertEqual(new["promotion_type"], DYNAMIC_PROMOTION_TYPE)
+                self.assertEqual(new["promotion_position"], "7" if index == 0 else "8")
                 for field in set(old) - {"promotion_type", "promotion_position"}:
                     self.assertEqual(new[field], old[field])
             else:
                 self.assertEqual(new, old)
+
+    def test_new_pipeline_output_keeps_existing_rows_exact_and_appends_only_new_skus(self):
+        plan = {
+            "label": "final_output",
+            "path": Path("C:/bestbuy/final_output.csv"),
+            "original_rows": [
+                {
+                    "sku_id": "100",
+                    "batch_id": "b_test",
+                    "page_type": "main",
+                    "retailer_sku_name": "Original exact value",
+                    "promotion_type": "",
+                }
+            ],
+            "original_fieldnames": [
+                "sku_id",
+                "batch_id",
+                "page_type",
+                "retailer_sku_name",
+                "promotion_type",
+            ],
+        }
+        rebuilt_by_pipeline = [
+            {
+                "sku_id": "100",
+                "batch_id": "b_test",
+                "page_type": "main",
+                "retailer_sku_name": "Unexpected rebuilt value",
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
+            },
+            {
+                "sku_id": "400",
+                "batch_id": "b_test",
+                "page_type": "promotion",
+                "retailer_sku_name": "Promotion-only product",
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
+            },
+        ]
+        writes = []
+        with patch(
+            "bestbuy.sos_refill.read_csv_table",
+            return_value=(rebuilt_by_pipeline, list(rebuilt_by_pipeline[0])),
+        ), patch(
+            "bestbuy.sos_refill.write_csv_rows_atomic",
+            side_effect=lambda path, rows, fields: writes.append((path, copy.deepcopy(rows), list(fields))),
+        ):
+            result = preserve_existing_artifacts_and_append_new_rows([plan], ["400"])
+
+        self.assertEqual(result[0]["existing_rows_preserved"], 1)
+        self.assertEqual(result[0]["new_rows_appended"], 1)
+        self.assertEqual(writes[0][1][0], plan["original_rows"][0])
+        self.assertEqual(writes[0][1][1], rebuilt_by_pipeline[1])
 
     def test_overlay_rejects_duplicate_db_item_identity(self):
         final_rows = [
@@ -224,7 +290,7 @@ class PromotionRecoveryTests(unittest.TestCase):
         promotion_rows = [
             {
                 "sku_id": "100",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "1",
             }
         ]
@@ -238,7 +304,7 @@ class PromotionRecoveryTests(unittest.TestCase):
                 "page_type": "main",
                 "sku_id": "100",
                 "item": "same-item",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "1",
             }
         ]
@@ -272,7 +338,7 @@ class PromotionRecoveryTests(unittest.TestCase):
             {
                 "label": "final_output",
                 "path": Path("C:/bestbuy/final_output.csv"),
-                "rows": [{"promotion_type": PROMOTION_TV_HEADLINE}],
+                "rows": [{"promotion_type": DYNAMIC_PROMOTION_TYPE}],
                 "fieldnames": ["promotion_type"],
                 "original_rows": [{"promotion_type": ""}],
                 "original_fieldnames": ["promotion_type"],
@@ -282,7 +348,7 @@ class PromotionRecoveryTests(unittest.TestCase):
             {
                 "label": "final_targets",
                 "path": Path("C:/bestbuy/final_targets.csv"),
-                "rows": [{"promotion_type": PROMOTION_TV_HEADLINE}],
+                "rows": [{"promotion_type": DYNAMIC_PROMOTION_TYPE}],
                 "fieldnames": ["promotion_type"],
                 "original_rows": [{"promotion_type": ""}],
                 "original_fieldnames": ["promotion_type"],
@@ -305,32 +371,32 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertEqual(calls[-1][0].name, "final_output.csv")
         self.assertEqual(calls[-1][1], plans[0]["original_rows"])
 
-    def test_db_update_is_main_batch_scoped_and_two_columns_only(self):
+    def test_db_update_is_existing_page_type_and_batch_scoped_and_two_columns_only(self):
         rows = [
             {
                 "batch_id": "b_test",
                 "item": "main-a",
                 "page_type": "main",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "7",
             },
             {
                 "batch_id": "b_test",
                 "item": "promotion-only",
                 "page_type": "promotion",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "8",
             },
             {
                 "batch_id": "b_other",
                 "item": "other-batch",
                 "page_type": "main",
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": "9",
             },
         ]
         candidates = promotion_update_candidates(rows, "b_test")
-        self.assertEqual([row["item"] for row in candidates], ["main-a"])
+        self.assertEqual([row["item"] for row in candidates], ["main-a", "promotion-only"])
 
         csv_path = Path("C:/bestbuy/test-promotion-overlay.csv")
         with patch("bestbuy.step14_db_load.read_csv", return_value=copy.deepcopy(rows)), patch(
@@ -338,14 +404,18 @@ class PromotionRecoveryTests(unittest.TestCase):
         ):
             cursor = FakeCursor()
             result = update_promotion_only(cursor, csv_path, "tv_table", batch_id="b_test")
-        self.assertEqual(result["candidate_rows"], 1)
-        self.assertEqual(result["updated"], 1)
-        self.assertEqual(len(cursor.updates), 1)
+        self.assertEqual(result["candidate_rows"], 2)
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(len(cursor.updates), 2)
         sql, params = cursor.updates[0]
         self.assertIn("SET promotion_type = %s, promotion_position = %s", sql)
         self.assertIn("WHERE batch_id = %s AND item = %s AND page_type = %s", sql)
         self.assertNotIn("retailer_sku_name", sql)
-        self.assertEqual(params, (PROMOTION_TV_HEADLINE, 7, "b_test", "main-a", "main"))
+        self.assertEqual(params, (DYNAMIC_PROMOTION_TYPE, 7, "b_test", "main-a", "main"))
+        self.assertEqual(
+            cursor.updates[1][1],
+            (DYNAMIC_PROMOTION_TYPE, 8, "b_test", "promotion-only", "promotion"),
+        )
         self.assertEqual(normalize_value("2 ||| 5", "integer", "promotion_position"), 2)
 
         missing_page_type = FakeCursor(
@@ -365,7 +435,7 @@ class PromotionRecoveryTests(unittest.TestCase):
             "item": "main-a",
             "sku_id": "100",
             "page_type": "main",
-            "promotion_type": PROMOTION_TV_HEADLINE,
+            "promotion_type": DYNAMIC_PROMOTION_TYPE,
             "promotion_position": "2 ||| 5",
         }
         self.assertEqual(product_list_promotion_update_candidates([row], "b_test"), [row])
@@ -391,14 +461,14 @@ class PromotionRecoveryTests(unittest.TestCase):
         sql, params = cursor.updates[0]
         self.assertIn("SET promotion_type = %s, promotion_position = %s", sql)
         self.assertIn("WHERE batch_id = %s AND sku_id = %s AND page_type = %s", sql)
-        self.assertEqual(params, (PROMOTION_TV_HEADLINE, 2, "b_test", "100", "main"))
+        self.assertEqual(params, (DYNAMIC_PROMOTION_TYPE, 2, "b_test", "100", "main"))
 
     def test_db_update_count_mismatch_fails_inside_update(self):
         row = {
             "batch_id": "b_test",
             "item": "main-a",
             "page_type": "main",
-            "promotion_type": PROMOTION_TV_HEADLINE,
+            "promotion_type": DYNAMIC_PROMOTION_TYPE,
             "promotion_position": "7",
         }
         cursor = FakeCursor(rowcounts=[0])
@@ -444,13 +514,17 @@ class PromotionRecoveryTests(unittest.TestCase):
                 {
                     "container_found": True,
                     "url": PROMOTION_TV_HOME_THEATER_URL,
+                    "promotion_type": DYNAMIC_PROMOTION_TYPE,
+                    "stable": True,
+                    "validation_errors": [],
+                    "card_count": 16,
                 }
             ],
         }
         rows = [
             {
                 "sku_id": str(index),
-                "promotion_type": PROMOTION_TV_HEADLINE,
+                "promotion_type": DYNAMIC_PROMOTION_TYPE,
                 "promotion_position": str(index),
             }
             for index in range(1, 17)
@@ -462,6 +536,89 @@ class PromotionRecoveryTests(unittest.TestCase):
         wrong_page["summaries"][0]["url"] = "https://www.bestbuy.com/pcmcat1720647543741"
         with self.assertRaises(RuntimeError):
             validate_promotion_recovery(wrong_page, rows, 16)
+
+    def test_dom_validation_accepts_dynamic_10_or_16_cards_and_rejects_bad_order(self):
+        for count in (10, 16):
+            items = [
+                {
+                    "href": f"https://www.bestbuy.com/product/tv-{index}/item-{index}/sku/{6600000 + index}",
+                    "position": index,
+                    "dataOrder": str(index - 1),
+                }
+                for index in range(1, count + 1)
+            ]
+            payload = {
+                "containerFound": True,
+                "promotionType": DYNAMIC_PROMOTION_TYPE,
+                "stable": True,
+                "cardCount": count,
+                "items": items,
+            }
+            rows = parse_dom_items(items, promotion_type=DYNAMIC_PROMOTION_TYPE)
+            self.assertEqual(validate_browser_dom_payload(payload, rows), [])
+            self.assertEqual(len(rows), count)
+
+        bad_order = copy.deepcopy(payload)
+        bad_order["items"][-1]["dataOrder"] = str(count)
+        self.assertIn(
+            "promotion_card_data_order_not_contiguous",
+            validate_browser_dom_payload(
+                bad_order,
+                parse_dom_items(bad_order["items"], promotion_type=DYNAMIC_PROMOTION_TYPE),
+            ),
+        )
+        missing_order = copy.deepcopy(payload)
+        missing_order["items"][0].pop("dataOrder")
+        self.assertIn(
+            "promotion_card_data_order_missing",
+            validate_browser_dom_payload(
+                missing_order,
+                parse_dom_items(missing_order["items"], promotion_type=DYNAMIC_PROMOTION_TYPE),
+            ),
+        )
+
+    def test_promotion_new_rows_require_same_batch_and_promotion_page_type(self):
+        valid = [{"sku_id": "400", "batch_id": "b_test", "page_type": "promotion"}]
+        with patch("bestbuy.step14_db_load.read_csv", return_value=valid):
+            self.assertEqual(promotion_new_rows("new.csv", batch_id="b_test"), valid)
+        with patch(
+            "bestbuy.step14_db_load.read_csv",
+            return_value=[{"sku_id": "400", "batch_id": "b_other", "page_type": "promotion"}],
+        ), self.assertRaises(RuntimeError):
+            promotion_new_rows("new.csv", batch_id="b_test")
+        with patch(
+            "bestbuy.step14_db_load.read_csv",
+            return_value=[{"sku_id": "400", "batch_id": "b_test", "page_type": "main"}],
+        ), self.assertRaises(RuntimeError):
+            promotion_new_rows("new.csv", batch_id="b_test")
+
+    def test_promotion_new_upsert_matches_page_type_and_inserts_exactly_one_row(self):
+        row = {
+            "batch_id": "b_test",
+            "item": "promotion-only",
+            "page_type": "promotion",
+            "promotion_type": DYNAMIC_PROMOTION_TYPE,
+            "promotion_position": "4",
+        }
+        cursor = FakeCursor(rowcounts=[0, 1])
+        with patch("bestbuy.step14_db_load.read_csv", return_value=[row]), patch(
+            "bestbuy.step14_db_load.rel_path", return_value="new.csv"
+        ):
+            result = upsert_promotion_new_rows(
+                cursor,
+                "new.csv",
+                "tv_table",
+                batch_id="b_test",
+            )
+        self.assertEqual(result["candidate_rows"], 1)
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(result["updated"], 0)
+        update_sql, update_params = cursor.updates[0]
+        self.assertIn(
+            'WHERE "batch_id" = %s AND "item" = %s AND "page_type" = %s',
+            update_sql,
+        )
+        self.assertEqual(update_params[-3:], ("b_test", "promotion-only", "promotion"))
 
     def test_apply_run_path_env_scopes_promotion_to_existing_run(self):
         run_root = Path("C:/bestbuy/test-run")
@@ -506,6 +663,8 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertIn('set "BESTBUY_DB_UPDATE_AVAILABILITY_ONLY=0"', source)
         self.assertIn('set "BESTBUY_DB_UPDATE_PROMOTION_ONLY=0"', source)
         self.assertNotIn('set "BESTBUY_DB_UPDATE_PROMOTION_ONLY=1"', source)
+        self.assertIn("page_type=promotion", source)
+        self.assertIn("상세/리뷰/재고 수집 후 추가", source)
         validate = source.index('if not exist "%RUN_ROOT%\\output\\final_output.csv"')
         confirm = source.index('choice /C YN')
         execute = source.index('python -m bestbuy.sos_refill')

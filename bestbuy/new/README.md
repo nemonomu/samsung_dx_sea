@@ -79,7 +79,7 @@ PowerShell에서는 인자 없이 실행하면 동일한 질문 화면이 열립
 .\run_bestbuy_promotion_recovery.bat "C:\samsung_dx_sea\bestbuy\new\bestbuy\data\tv\20260813"
 ```
 
-이 복구는 promotion 페이지만 다시 수집하고, 기존 `main` 상품과 겹치는 행의 `promotion_type`, `promotion_position`만 갱신합니다. 신규 상품은 추가하지 않습니다. 수집 결과가 검증 기준에 미달하면 기존 CSV와 DB는 갱신하지 않습니다. 복구 증거와 기존 파일 백업은 실행 폴더 아래 `promotion_recovery\<timestamp>`에 저장됩니다.
+이 복구는 promotion 페이지만 다시 수집합니다. 같은 배치에 이미 존재하는 `main`/`bsr`/`promotion` 상품은 기존 `page_type`과 다른 값을 그대로 유지하고 `promotion_type`, `promotion_position`만 갱신합니다. promotion에서만 발견된 신규 SKU는 기존 `batch_id`를 재사용하고 `page_type=promotion`으로 상세·리뷰·재고를 수집한 뒤 최종 결과와 DB에 추가합니다. 프로모션 문구와 카드 수는 고정하지 않고 현재 페이지의 Hero 문구와 연속된 `data-order` 카드 집합이 안정화됐는지 검증합니다. 검증이나 신규 SKU 수집이 실패하면 기존 CSV는 백업본으로 복원하고 DB 갱신은 진행하지 않습니다. 복구 증거와 기존 파일 백업은 실행 폴더 아래 `promotion_recovery\<timestamp>`에 저장됩니다.
 
 ## 보안/데이터 정책
 

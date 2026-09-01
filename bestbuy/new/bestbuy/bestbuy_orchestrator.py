@@ -657,7 +657,7 @@ def run_step(step, dry_run=False, resume=False):
         print(f"[fail] step {step.key} {step.name}: exit_code={exc.returncode}")
         if is_interrupt_exit_code(exc.returncode):
             raise KeyboardInterrupt from None
-        if step.name in {"promotion_deals", "trending_deals"}:
+        if step.name == "trending_deals":
             print(f"[skip] step {step.key} {step.name}: optional listing enrichment failed; continuing pipeline")
             return
         raise

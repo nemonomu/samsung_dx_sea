@@ -59,8 +59,8 @@ if not exist "%RUN_ROOT%\output\final_output.csv" (
 echo.
 echo 선택된 수집 폴더: "%RUN_ROOT%"
 echo batch_id: final_output.csv에서 자동 확인
-echo 갱신 컬럼: promotion_type, promotion_position
-echo 신규 상품 추가: 안 함
+echo 기존 상품: page_type 유지, promotion_type/promotion_position만 갱신
+echo 신규 상품: 같은 batch_id, page_type=promotion으로 상세/리뷰/재고 수집 후 추가
 
 if "%INTERACTIVE%"=="1" (
   choice /C YN /N /M "이 폴더의 promotion만 재수집할까요? [Y/N] "
