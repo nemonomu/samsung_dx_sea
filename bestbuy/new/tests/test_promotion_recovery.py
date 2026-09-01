@@ -17,6 +17,10 @@ from bestbuy.sos_refill import (
     build_promotion_overlay_rows,
     preserve_existing_artifacts_and_append_new_rows,
     prepare_promotion_artifact_updates,
+    rows_for_skus,
+    step_by_name,
+    step_env,
+    validate_new_promotion_rows,
     validate_promotion_recovery,
 )
 from bestbuy.step00_config import (
@@ -272,6 +276,39 @@ class PromotionRecoveryTests(unittest.TestCase):
         self.assertEqual(result[0]["new_rows_appended"], 1)
         self.assertEqual(writes[0][1][0], plan["original_rows"][0])
         self.assertEqual(writes[0][1][1], rebuilt_by_pipeline[1])
+
+    def test_final_output_without_sku_id_is_scoped_by_product_url(self):
+        rows = [
+            {
+                "item": "promotion-only",
+                "product_url": "https://www.bestbuy.com/product/promotion-only/ABC123/sku/6673119?intl=nosplash",
+                "batch_id": "b_test",
+                "page_type": "promotion",
+            },
+            {
+                "item": "existing",
+                "product_url": "https://www.bestbuy.com/product/existing/XYZ789/sku/6000000",
+                "batch_id": "b_test",
+                "page_type": "main",
+            },
+        ]
+
+        selected = rows_for_skus(rows, ["6673119"])
+
+        self.assertEqual(selected, [rows[0]])
+        validate_new_promotion_rows(selected, ["6673119"], "b_test", "final_output")
+
+    def test_review20_keeps_new_promotion_sku_scope(self):
+        env = step_env(
+            step_by_name("review20"),
+            "TV",
+            {
+                "BESTBUY_BATCH_ID": "b_test",
+                "BESTBUY_DETAIL_SKUS": "6673119,6673143",
+            },
+        )
+
+        self.assertEqual(env["BESTBUY_DETAIL_SKUS"], "6673119,6673143")
 
     def test_promotion_backup_only_copies_published_artifacts_not_browser_profile(self):
         run_root = Path("C:/bestbuy/run")

@@ -332,6 +332,11 @@ def row_sku(row, lookup):
     sku = compact(row.get("sku_id"))
     if sku:
         return sku
+    product_url = canonical_url(row.get("product_url") or row.get("detail_url"))
+    if "/sku/" in product_url:
+        sku = product_url.rsplit("/sku/", 1)[-1].split("/", 1)[0].strip()
+        if sku:
+            return sku
     for key in row_match_keys(row):
         sku = lookup.get(key)
         if sku:
@@ -676,9 +681,10 @@ def restore_promotion_recovery_inputs(run_root, recovery_root, plans):
         )
 
 
-def rows_for_skus(rows, skus):
+def rows_for_skus(rows, skus, sku_lookup=None):
     wanted = {compact(sku) for sku in skus if compact(sku)}
-    return [row for row in rows if compact(row.get("sku_id")) in wanted]
+    lookup = sku_lookup or {}
+    return [row for row in rows if row_sku(row, lookup) in wanted]
 
 
 def write_recovery_subset(path, rows, source_rows):
@@ -688,13 +694,19 @@ def write_recovery_subset(path, rows, source_rows):
     write_csv_rows_atomic(path, rows, fieldnames)
 
 
-def preserve_existing_artifacts_and_append_new_rows(plans, missing_skus, log_handle=None):
+def preserve_existing_artifacts_and_append_new_rows(
+    plans,
+    missing_skus,
+    log_handle=None,
+    sku_lookup=None,
+):
     expected = {compact(sku) for sku in missing_skus if compact(sku)}
+    lookup = sku_lookup or {}
     results = []
     for plan in plans:
         current_rows, current_fieldnames = read_csv_table(plan["path"])
-        new_rows = rows_for_skus(current_rows, expected)
-        actual = {compact(row.get("sku_id")) for row in new_rows if compact(row.get("sku_id"))}
+        new_rows = rows_for_skus(current_rows, expected, lookup)
+        actual = {row_sku(row, lookup) for row in new_rows if row_sku(row, lookup)}
         if actual != expected:
             raise RuntimeError(
                 f"promotion {plan['label']} new-row preservation mismatch: "
@@ -702,9 +714,9 @@ def preserve_existing_artifacts_and_append_new_rows(plans, missing_skus, log_han
             )
 
         original_skus = {
-            compact(row.get("sku_id"))
+            row_sku(row, lookup)
             for row in plan["original_rows"]
-            if compact(row.get("sku_id"))
+            if row_sku(row, lookup)
         }
         duplicate_skus = sorted(expected & original_skus)
         if duplicate_skus:
@@ -735,9 +747,10 @@ def preserve_existing_artifacts_and_append_new_rows(plans, missing_skus, log_han
     return results
 
 
-def validate_new_promotion_rows(rows, missing_skus, batch_id, label):
+def validate_new_promotion_rows(rows, missing_skus, batch_id, label, sku_lookup=None):
     expected = {compact(sku) for sku in missing_skus if compact(sku)}
-    actual = {compact(row.get("sku_id")) for row in rows if compact(row.get("sku_id"))}
+    lookup = sku_lookup or {}
+    actual = {row_sku(row, lookup) for row in rows if row_sku(row, lookup)}
     if actual != expected:
         raise RuntimeError(
             f"promotion {label} new-row SKU mismatch: actual={sorted(actual)} expected={sorted(expected)}"
@@ -777,7 +790,8 @@ def run_new_promotion_sku_pipeline(
     scoped_base["BESTBUY_DETAIL_SKUS"] = sku_filter
     run_step(step_by_name("final_targets"), category, scoped_base, log_handle)
     target_rows = read_csv_rows(run_root / "output" / "bestbuy_final_targets.csv")
-    target_subset = rows_for_skus(target_rows, missing_skus)
+    sku_lookup = build_target_sku_lookup(run_root)
+    target_subset = rows_for_skus(target_rows, missing_skus, sku_lookup)
     target_skus = {compact(row.get("sku_id")) for row in target_subset}
     if target_skus != set(missing_skus):
         raise RuntimeError(
@@ -809,10 +823,10 @@ def run_new_promotion_sku_pipeline(
 
     final_source = read_csv_rows(run_root / "output" / "final_output.csv")
     product_source = read_csv_rows(run_root / "output" / "bestbuy_product_list.csv")
-    final_rows = rows_for_skus(final_source, missing_skus)
-    product_rows = rows_for_skus(product_source, missing_skus)
-    validate_new_promotion_rows(final_rows, missing_skus, batch_id, "final_output")
-    validate_new_promotion_rows(product_rows, missing_skus, batch_id, "product_list")
+    final_rows = rows_for_skus(final_source, missing_skus, sku_lookup)
+    product_rows = rows_for_skus(product_source, missing_skus, sku_lookup)
+    validate_new_promotion_rows(final_rows, missing_skus, batch_id, "final_output", sku_lookup)
+    validate_new_promotion_rows(product_rows, missing_skus, batch_id, "product_list", sku_lookup)
 
     new_root = recovery_root / "new_rows"
     final_csv = new_root / "final_output.csv"
@@ -1123,6 +1137,8 @@ def step_env(step, category, base, refresh_all_availability=False):
                 "BESTBUY_DETAIL_RETRY_SLEEP_SECONDS": "0",
             }
         )
+        if compact(base.get("BESTBUY_DETAIL_SKUS")):
+            env["BESTBUY_DETAIL_SKUS"] = compact(base.get("BESTBUY_DETAIL_SKUS"))
     if step.name == "availability_backfill":
         candidate_mode = "all_rows" if refresh_all_availability else "blank_all"
         env.update(
@@ -1384,6 +1400,7 @@ def run_promotion_only_recovery(category, run_root, batch_id, base, args, log_ha
                 rollback_plans,
                 missing_skus,
                 log_handle,
+                sku_lookup=build_target_sku_lookup(run_root),
             )
 
         plans = prepare_promotion_artifact_updates(run_root, overlay_rows, batch_id)
