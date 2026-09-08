@@ -58,6 +58,8 @@ if _project_root not in sys.path:
 from common.setup import setup_environment
 setup_environment(__file__)
 
+from amazon.savings import build_amazon_extracted_data
+
 from common.base_crawler import BaseCrawler
 from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
 
@@ -225,7 +227,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                 }
             else:
                 update_data = {
-                    **{key: product.get(key) for key in self.EXTRACTED_FIELDS},
+                    **build_amazon_extracted_data(product, self.EXTRACTED_FIELDS),
                     **update_meta,
                 }
 

@@ -43,6 +43,8 @@ if _project_root not in sys.path:
 from common.setup import setup_environment
 setup_environment(__file__)
 
+from amazon.savings import build_amazon_extracted_data
+
 from common.amazon_base import AmazonBaseCrawler
 from amazon.tv.amazon_login import (
     ensure_amazon_login_dp,
@@ -156,6 +158,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
         'count_of_star_ratings',
         'final_sku_price',
         'original_sku_price',
+        'savings',
         'discount_type',
         'sku_popularity',
         'number_of_units_purchased_past_month',
@@ -1457,7 +1460,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 for field, source in self.SAVE_META_FIELDS.items()
             }
             insert_data = {
-                **{field: product.get(field) for field in self.EXTRACTED_FIELDS},
+                **build_amazon_extracted_data(product, self.EXTRACTED_FIELDS),
                 **{field: product.get(field) for field in self.PASSTHROUGH_FIELDS},
                 **save_meta,
             }
