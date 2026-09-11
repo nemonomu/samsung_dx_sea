@@ -185,6 +185,8 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
         try:
             cursor = self.db_conn.cursor()
 
+            self.apply_master_model_year(cursor, product)
+
             # 크롤링으로 추출한 필드는 이번 결과로 덮어쓴다.
             # 단, 리뷰 본문을 이번 실행에서 얻지 못한 경우(None)에는
             # 기존 detailed_review_content를 유지해 정상 데이터를 지우지 않는다.
@@ -202,7 +204,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
             updates = [
                 (
                     f"{key} = COALESCE(%s, {key})"
-                    if key == 'detailed_review_content'
+                    if key in {'detailed_review_content', 'model_year'}
                     else f"{key} = %s"
                 )
                 for key in update_data

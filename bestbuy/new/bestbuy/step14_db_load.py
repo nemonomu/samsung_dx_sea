@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from .step15_item_mst_load import hydrate_tv_model_years
 from .step00_availability_policy import active_availability_fields
 from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
@@ -447,6 +448,15 @@ def load_one(cur, csv_path, table_name, dry_run=False):
     columns = table_columns(cur, table_name) if cur else fallback_csv_columns(rows)
     if not columns:
         raise RuntimeError(f"DB table not found or has no columns: {TARGET_SCHEMA}.{table_name}")
+    model_year_result = None
+    if CATEGORY == "TV" and table_name == bestbuy_output_table(CATEGORY) and rows:
+        if dry_run:
+            model_year_result = {"skipped": "dry_run"}
+        else:
+            if "model_year" not in {name for name, _ in columns}:
+                raise RuntimeError("TV output table is missing model_year")
+            candidates = row_upsert_candidates(rows) if ROW_UPSERT_ONLY else rows
+            model_year_result = hydrate_tv_model_years(cur, candidates) if candidates else {"matched_rows": 0}
     if ROW_UPSERT_ONLY:
         result = row_upsert_rows(cur, table_name, columns, rows, dry_run)
     else:
@@ -459,6 +469,8 @@ def load_one(cur, csv_path, table_name, dry_run=False):
             "dry_run": dry_run,
         }
     )
+    if model_year_result is not None:
+        result["model_year_master"] = model_year_result
     return result
 
 
