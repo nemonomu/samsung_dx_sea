@@ -41,6 +41,7 @@ CATEGORY_COLUMNS = {
     "TV": [
         ("screen_size", "text"),
         ("estimated_annual_electricity_use", "text"),
+        ("model_year", "text"),
     ],
     "HHP": [
         ("hhp_carrier", "text"),
@@ -121,7 +122,8 @@ def table_columns(category):
 
 
 def output_fields(category):
-    return [name for name, _ in table_columns(category)]
+    # Keep the schema column for manual entry, outside crawler master output.
+    return [name for name, _ in table_columns(category) if name != "model_year"]
 
 
 def target_sku_lookup(rows):
@@ -303,9 +305,60 @@ def is_missing_master_value(value):
     return compact_text(value).lower() in {"", "no sku", "none", "null", "[null]"}
 
 
+def model_year_value(value):
+    text = compact_text(value)
+    return text if re.fullmatch(r"[0-9]{4}", text) else None
+
+
+def hydrate_tv_model_years(cur, rows):
+    """On collection misses, use the newest valid active master by id.
+
+    The master schema preparation retains a column for manual year entry.
+    If unavailable, preserve collection results and report the skipped lookup.
+    """
+    result = {"filled_rows": 0, "matched_rows": 0, "selection": "newest_id"}
+    missing_rows = [row for row in rows
+                    if compact_text(row.get("account_name")) == "Bestbuy"
+                    and model_year_value(row.get("model_year")) is None
+                    and compact_text(row.get("item"))]
+    if not missing_rows:
+        return result
+    table_name = ITEM_MST_TABLES["TV"]
+    existing = existing_column_names(cur, table_name)
+    if not {"id", "item", "account_name", "is_product", "model_year"}.issubset(existing):
+        result["skipped"] = "master_table_or_columns_missing"
+        return result
+    items = sorted({
+        compact_text(row.get("item")) for row in missing_rows
+    })
+    by_item = {}
+    for start in range(0, len(items), 500):
+        cur.execute(
+            f"SELECT item, model_year FROM {quote_ident(TARGET_SCHEMA)}.{quote_ident(table_name)} "
+            "WHERE account_name = %s AND item = ANY(%s) AND is_product = TRUE "
+            "ORDER BY id DESC",
+            ("Bestbuy", items[start:start + 500]),
+        )
+        for item, raw_year in cur.fetchall():
+            year = model_year_value(raw_year)
+            if year is not None:
+                by_item.setdefault(compact_text(item), year)
+    for row in missing_rows:
+        item = compact_text(row.get("item"))
+        master_year = by_item.get(item)
+        if master_year is None:
+            continue
+        result["matched_rows"] += 1
+        result["filled_rows"] += 1
+        row["model_year"] = master_year
+    return result
+
+
 def value_for_insert(row, name, data_type):
     value = row.get(name)
-    if name == "account_name" and is_missing_master_value(value):
+    if name == "model_year":
+        return None  # Manual-only master field; never copy collected years.
+    elif name == "account_name" and is_missing_master_value(value):
         value = "Bestbuy"
     elif name == "sku" and is_missing_master_value(value):
         value = "no sku"
@@ -314,7 +367,7 @@ def value_for_insert(row, name, data_type):
 
 def missing_only_updates(row, existing_values, columns):
     updates = []
-    protected = {"id", "item", "account_name", "created_at", "updated_at", "is_product", "is_checked"}
+    protected = {"id", "item", "account_name", "created_at", "updated_at", "is_product", "is_checked", "model_year"}
     for name, data_type in columns:
         if name in protected:
             continue
@@ -334,7 +387,8 @@ def load_rows(cur, table_name, columns, rows, dry_run=False):
     if dry_run:
         return {"inserted": len(rows), "updated": 0, "skipped_existing": 0, "dry_run": True}
 
-    data_columns = [(name, data_type) for name, data_type in columns if name != "id"]
+    # Exclude at the SQL boundary too, including replay of older CSV files.
+    data_columns = [(name, data_type) for name, data_type in columns if name not in {"id", "model_year"}]
     insert_columns = data_columns
     select_columns = [
         (name, data_type)

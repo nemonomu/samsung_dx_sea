@@ -1932,6 +1932,37 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         )
         return None
 
+    @staticmethod
+    def model_year_value(value):
+        """Only a four-digit model year is eligible for automatic reuse."""
+        text = str(value).strip() if value is not None else ''
+        return text if re.fullmatch(r'[0-9]{4}', text) else None
+
+    def apply_master_model_year(self, cursor, product):
+        """Keep collected years; on a miss use the newest valid master by id.
+
+        The worker cache's existing (screen_size, sku) contract is unchanged.
+        updated_at is deliberately not used: unrelated edits must not change
+        which duplicate row was inserted most recently.
+        """
+        incoming = self.model_year_value(product.get('model_year'))
+        product['model_year'] = incoming
+        if incoming is not None:
+            return
+        item = str(product.get('item') or '').strip()
+        if not item:
+            return
+        cursor.execute("""
+            SELECT model_year FROM tv_item_mst
+            WHERE item = %s AND account_name = %s AND is_product = TRUE
+            ORDER BY id DESC
+        """, (item, self.account_name))
+        for row in cursor.fetchall():
+            master_year = self.model_year_value(row[0])
+            if master_year is not None:
+                product['model_year'] = master_year
+                break
+
     def save_to_retail_com(self, product):
         """DB 저장: 1개씩 INSERT.
 
@@ -1946,6 +1977,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 return False
 
             cursor = self.db_conn.cursor()
+
+            self.apply_master_model_year(cursor, product)
 
             # 테스트 모드면 test_tv_retail_com, 통합 크롤러면 tv_retail_com
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
@@ -2009,7 +2042,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
     def upsert_item_mst(self, product):
         """tv_item_mst 테이블에 INSERT 또는 UPDATE
         - 조회 결과 없음 → INSERT (sku, screen_size)
-        - 조회 결과 있음 → 기존 값이 NULL/빈값인 필드만 UPDATE
+        - 조회 결과 있음 → SKU/화면 크기는 빈값만 보완
+        - model_year는 수동 관리하므로 INSERT/UPDATE에서 제외
         """
         item = product.get('item')
         if not item:
@@ -2035,8 +2069,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if row is None:
                 # 조회 결과 없음 → INSERT
                 cursor.execute("""
-                    INSERT INTO tv_item_mst (item, account_name, sku, product_url, screen_size)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO tv_item_mst (item, account_name, sku, product_url, screen_size, is_product)
+                    VALUES (%s, %s, %s, %s, %s, TRUE)
                 """, (item, self.account_name, new_sku, product_url, new_screen_size))
                 self.db_conn.commit()
                 print(f"  → DB: ITEM_MST INSERT")
