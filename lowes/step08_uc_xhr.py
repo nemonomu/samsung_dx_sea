@@ -375,22 +375,40 @@ def _category_fallback_ref_type(categories):
 
 
 def _format_lead_date(itm_ld_tm):
-    """Parse '06-04-2026-05:00 UTC' → 'Thu, Jun 4'. Returns '' on failure."""
+    """Format a lead date or ISO appointment in its local timezone."""
     if not itm_ld_tm:
         return ''
     text = str(itm_ld_tm).split(' ')[0]  # 06-04-2026-05:00
     try:
         dt = datetime.strptime(text, '%m-%d-%Y-%H:%M')
     except Exception:
-        return ''
+        try:
+            dt = datetime.fromisoformat(str(itm_ld_tm).replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            return ''
     return dt.strftime('%a, %b ') + str(dt.day)
 
 
-def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Shipping'):
+def _fulfillment_slot(node, analytics, key, fulfillment_type):
+    """Overlay the page fulfillment fields omitted from analyticsData."""
+    fallback = analytics.get(key)
+    slot = dict(fallback) if isinstance(fallback, dict) else {}
+    location = node.get('location') or {}
+    inventory = location.get('itemInventory') if isinstance(location, dict) else None
+    items = inventory.get('itemAvailList') if isinstance(inventory, dict) else None
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and str(item.get('fulfillmentType') or '').lower() == fulfillment_type.lower():
+                slot.update(item)
+                break
+    return slot
+
+
+def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Delivery'):
     """Build human-readable availability text or '' when unavailable/missing."""
     if not isinstance(slot, dict) or not slot:
         return ''
-    if not slot.get('isAvlSts'):
+    if not slot.get('isAvlSts') or slot.get('displayStatus') is False:
         return ''
     ftype = (slot.get('fulfillmentType') or '').upper().replace('_', '').replace(' ', '')
     days = slot.get('itmLdTmDays')
@@ -420,14 +438,18 @@ def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Shipping'):
         if date:
             return f'{when_pickup} {date}'
         return ''
-    if ftype == 'DELIVERY':
+    if ftype in {'DELIVERY', 'PARCEL'}:
+        label = when_delivery if ftype == 'DELIVERY' else 'Shipping'
+        appointment = _format_lead_date(slot.get('itmConsolidationApptDate')) if ftype == 'DELIVERY' else ''
+        if appointment:
+            return f'{label} {appointment}'
         if isinstance(days, (int, float)):
             if days <= 0:
-                return 'Shipping Today'
+                return f'{label} Today'
             if days == 1:
-                return 'Shipping Tomorrow'
+                return f'{label} Tomorrow'
         if date:
-            return f'{when_delivery} {date}'
+            return f'{label} {date}'
         return ''
     if date:
         return date
@@ -438,7 +460,7 @@ def _slot_qty(slot):
     """Return availableQuantity if > 0 (page would render it), else '' -> NULL in DB."""
     if not isinstance(slot, dict) or not slot:
         return ''
-    if not slot.get('isAvlSts'):
+    if not slot.get('isAvlSts') or slot.get('displayStatus') is False:
         return ''
     qty = slot.get('availableQuantity')
     if qty is None:
@@ -482,7 +504,8 @@ def parse_productdetail(sku, body):
 
     inv = (node.get('itemInventory', {}) or {}).get('analyticsData', {}) or {}
     pickup = inv.get('pickup', {}) or {}
-    truck = inv.get('truck', {}) or {}
+    truck = _fulfillment_slot(node, inv, 'truck', 'Delivery')
+    parcel = _fulfillment_slot(node, inv, 'parcel', 'Parcel')
     expedited = inv.get('expeditedDelivery', {}) or {}
     fast_truck = inv.get('fastTruck', {}) or {}
     if expedited.get('isAvlSts'):
@@ -493,18 +516,20 @@ def parse_productdetail(sku, body):
         fast = expedited or fast_truck or {}
 
     out['available_quantity_for_purchase_pickup'] = _slot_qty(pickup)
-    out['available_quantity_for_purchase_delivery'] = _slot_qty(truck)
+    out['available_quantity_for_purchase_delivery'] = _slot_qty(truck) or _slot_qty(parcel)
     # fastdelivery quantity is NOT shown on the page -> always null
     out['available_quantity_for_purchase_fastdelivery'] = ''
 
     major_appliance = bool(product.get('majorAppliance'))
 
     out['pick_up_availability'] = _slot_text(pickup)
-    # Delivery: if no shipping date, fall back to "w/FREE Installation" for major appliances
+    # Delivery: if no delivery date, fall back to "w/FREE Installation" for major appliances
     delivery_text = _slot_text(truck)
-    if not delivery_text and truck.get('isAvlSts') and major_appliance:
+    if not delivery_text and truck.get('isAvlSts') and truck.get('displayStatus') is not False and major_appliance:
         delivery_text = 'w/FREE Installation'
-    out['delivery_availability'] = delivery_text
+    # Keep each available, displayed method; a parcel date must not inherit
+    # the truck's Delivery label or its installation fallback.
+    out['delivery_availability'] = ' / '.join(text for text in (delivery_text, _slot_text(parcel)) if text)
     out['fastest_delivery'] = _slot_text(fast)
 
     specs = product.get('specs', []) or []
