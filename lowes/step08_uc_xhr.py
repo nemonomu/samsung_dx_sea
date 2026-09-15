@@ -7,6 +7,9 @@ then iterates final_targets SKUs doing same-origin XHRs:
   - GET  /rnr/r/get-by-product/{sku}?sortBy=newestFirst&offset=N (covers 51,52, 53 reviews)
   - POST /pythia-recs-svc/v2/compare                            (covers 54)
 
+Display flags use one HTML XHR per store. Ambiguous delivery methods additionally
+read the rendered PDP cards in the same region, with a bounded wait.
+
 Zero ZenRows cost. Spec 41~54 fully covered (43/44/45 saved as raw labels).
 """
 import csv
@@ -23,6 +26,10 @@ import undetected_chromedriver as uc
 from .step00_config import DEFAULT_LOWES_RUN_ROOT, load_env, redact_sensitive, lowes_product_type
 from .step00_erd_schema import retailer_sku_name_text
 from .step00_uc import launch_chrome
+from .step08_fulfillment import (
+    api_display, date_label, display_flags, empty_display, fulfillment_slot,
+    promise_date, read_display,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -143,6 +150,8 @@ def category_codes():
 
 def launch_driver():
     options = uc.ChromeOptions()
+    # Card checks wait for their own data; unrelated ads must not hold navigation.
+    options.page_load_strategy = 'eager'
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--lang=en-US')
     print(f'[uc] launch headless={HEADLESS}')
@@ -317,11 +326,50 @@ def fetch_reviews_until_target(driver, sku):
     return responses
 
 
-def fetch_sku(driver, sku, category_id, parent_category, store=None):
+def collect_fulfillment_display(driver, sku, response, store, flag_cache):
+    context = {'store': store, 'zip': ZIP, 'state': STATE, 'nearby_store': NEARBY_STORE}
+    try:
+        node = json.loads(response.get('body') or '{}').get('productDetails', {}).get(str(sku)) or {}
+    except (TypeError, ValueError):
+        node = {}
+    path = (node.get('product') or {}).get('pdURL') or ''
+    if store not in flag_cache:
+        # One HTML XHR per serving-store context, without rendering the PDP.
+        # Keep only the allowlisted display flags, never the document itself.
+        if path.startswith('/pd/') and path.endswith('/' + str(sku)):
+            html = run_xhr_get(driver, path)
+            flags = display_flags(html.get('body', '')) if html.get('status') == 200 else {}
+        else:
+            flags = {}
+        flag_cache[store] = {'flags': flags, 'screen_blocked': False,
+                             'screen_checks': 0, 'unresolved': 0, 'screen_seconds': 0}
+    state = flag_cache[store]
+    flags = state['flags']
+    values, reason = api_display(node, flags)
+    evidence = {'status': 'ok', 'source': 'api', 'values': values, 'context': context, 'flags': flags}
+    if reason:
+        if state['screen_blocked']:
+            evidence = {'status': 'unresolved', 'source': 'screen_skipped', 'values': empty_display(),
+                        'context': context, 'reason': 'screen_blocked_in_this_context'}
+        else:
+            evidence = read_display(driver, sku, path, context)
+            state['screen_checks'] += 1
+            state['screen_seconds'] += evidence.get('elapsed_seconds', 0)
+            if evidence.get('reason') == 'page_blocked':
+                state['screen_blocked'] = True
+        evidence.update(flags=flags, trigger=reason)
+        if evidence['status'] != 'ok':
+            state['unresolved'] += 1
+            print(f'[fulfillment] sku={sku} {evidence["status"]}: {evidence.get("reason", "unknown")}')
+    return {'status': evidence['status'], 'body': json.dumps(evidence, ensure_ascii=False)}
+
+
+def fetch_sku(driver, sku, category_id, parent_category, store=None, flag_cache=None):
     """Run 4 XHRs for a SKU. `store` overrides STORE_FMT for productdetail URL + compare body."""
     store = store or STORE_FMT
     out = {}
     out['productdetail'] = run_xhr_get(driver, f'/wpd/{sku}/productdetail/{store}/Guest/{ZIP}?nearByStore={NEARBY_STORE}&zipState={STATE}')
+    out['productdetail']['request_context'] = {'store': store, 'zip': ZIP, 'state': STATE, 'nearby_store': NEARBY_STORE}
     out.update(fetch_reviews_until_target(driver, sku))
     body = {
         "anchors": [{
@@ -339,6 +387,10 @@ def fetch_sku(driver, sku, category_id, parent_category, store=None):
         "version": "default_fabrik",
     }
     out['compare'] = run_xhr_post(driver, '/pythia-recs-svc/v2/compare?version=default_fabrik&source=product-display', body)
+    if out['productdetail'].get('status') == 200:
+        out['fulfillment_display'] = collect_fulfillment_display(
+            driver, sku, out['productdetail'], store, flag_cache if flag_cache is not None else {},
+        )
     return out
 
 
@@ -391,17 +443,7 @@ def _format_lead_date(itm_ld_tm):
 
 def _fulfillment_slot(node, analytics, key, fulfillment_type):
     """Overlay the page fulfillment fields omitted from analyticsData."""
-    fallback = analytics.get(key)
-    slot = dict(fallback) if isinstance(fallback, dict) else {}
-    location = node.get('location') or {}
-    inventory = location.get('itemInventory') if isinstance(location, dict) else None
-    items = inventory.get('itemAvailList') if isinstance(inventory, dict) else None
-    if isinstance(items, list):
-        for item in items:
-            if isinstance(item, dict) and str(item.get('fulfillmentType') or '').lower() == fulfillment_type.lower():
-                slot.update(item)
-                break
-    return slot
+    return fulfillment_slot(node, analytics, key, fulfillment_type)
 
 
 def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Delivery'):
@@ -416,6 +458,9 @@ def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Delivery'):
     is_fast = ftype in {'EXPEDITEDDELIVERY', 'FASTTRUCK', 'FAST'}
 
     if is_fast:
+        promised = date_label(promise_date(slot), relative=True)
+        if promised:
+            return f'Get it {promised}' if promised in ('Today', 'Tomorrow') else f'Get it by {promised}'
         if isinstance(days, (int, float)):
             if days <= 0:
                 return 'Get it Today'
@@ -427,7 +472,7 @@ def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Delivery'):
             return 'Get it Today'
         if date:
             return f'Get it by {date}'
-        return 'Get it Today'
+        return ''
 
     if ftype == 'PICKUP':
         if isinstance(days, (int, float)):
@@ -440,7 +485,7 @@ def _slot_text(slot, when_pickup='Pickup Ready by', when_delivery='Delivery'):
         return ''
     if ftype in {'DELIVERY', 'PARCEL'}:
         label = when_delivery if ftype == 'DELIVERY' else 'Shipping'
-        appointment = _format_lead_date(slot.get('itmConsolidationApptDate')) if ftype == 'DELIVERY' else ''
+        appointment = _format_lead_date(promise_date(slot, parcel=ftype == 'PARCEL'))
         if appointment:
             return f'{label} {appointment}'
         if isinstance(days, (int, float)):
@@ -484,7 +529,7 @@ def _fastest_slot(pickup, truck, fast):
     return min(candidates, key=lambda s: s.get('itmLdTmDays') or 999)
 
 
-def parse_productdetail(sku, body):
+def parse_productdetail(sku, body, display_configuration=None):
     out = {}
     try:
         obj = json.loads(body)
@@ -504,33 +549,10 @@ def parse_productdetail(sku, body):
 
     inv = (node.get('itemInventory', {}) or {}).get('analyticsData', {}) or {}
     pickup = inv.get('pickup', {}) or {}
-    truck = _fulfillment_slot(node, inv, 'truck', 'Delivery')
-    parcel = _fulfillment_slot(node, inv, 'parcel', 'Parcel')
-    expedited = inv.get('expeditedDelivery', {}) or {}
-    fast_truck = inv.get('fastTruck', {}) or {}
-    if expedited.get('isAvlSts'):
-        fast = expedited
-    elif fast_truck.get('isAvlSts'):
-        fast = fast_truck
-    else:
-        fast = expedited or fast_truck or {}
-
     out['available_quantity_for_purchase_pickup'] = _slot_qty(pickup)
-    out['available_quantity_for_purchase_delivery'] = _slot_qty(truck) or _slot_qty(parcel)
-    # fastdelivery quantity is NOT shown on the page -> always null
-    out['available_quantity_for_purchase_fastdelivery'] = ''
-
-    major_appliance = bool(product.get('majorAppliance'))
-
     out['pick_up_availability'] = _slot_text(pickup)
-    # Delivery: if no delivery date, fall back to "w/FREE Installation" for major appliances
-    delivery_text = _slot_text(truck)
-    if not delivery_text and truck.get('isAvlSts') and truck.get('displayStatus') is not False and major_appliance:
-        delivery_text = 'w/FREE Installation'
-    # Keep each available, displayed method; a parcel date must not inherit
-    # the truck's Delivery label or its installation fallback.
-    out['delivery_availability'] = ' / '.join(text for text in (delivery_text, _slot_text(parcel)) if text)
-    out['fastest_delivery'] = _slot_text(fast)
+    display, _ = api_display(node, display_configuration)
+    out.update(display)
 
     specs = product.get('specs', []) or []
     appliance_type = ''
@@ -750,7 +772,18 @@ def build_row(src, sku, responses, serving_store=None):
     row = dict(src)
     row['omni_item_id'] = sku
     if has_body(responses.get('productdetail')):
-        row.update(parse_productdetail(sku, responses['productdetail']['body']))
+        evidence = json.loads((responses.get('fulfillment_display') or {}).get('body') or '{}')
+        row.update(parse_productdetail(sku, responses['productdetail']['body'], evidence.get('flags')))
+        if evidence:
+            # Explicit blanks prevent an unverified API guess or old list value
+            # from leaking into final_output when the screen check fails.
+            row.update(empty_display())
+            if evidence.get('status') in ('ok', 'partial'):
+                row.update({key: evidence.get('values', {}).get(key, '') for key in empty_display()})
+            row['fulfillment_display_source'] = evidence.get('source', '')
+            row['fulfillment_display_status'] = evidence.get('status', '')
+            row['fulfillment_display_reason'] = evidence.get('reason', '')
+            row['fulfillment_display_elapsed_seconds'] = evidence.get('elapsed_seconds', 0)
     review_bodies = [
         responses.get(label, {}).get('body', '') if has_body(responses.get(label)) else ''
         for label in review_response_labels(responses)
@@ -806,6 +839,7 @@ def main():
     alt_pending = []  # productdetail-failed candidates for alt-store retry: (rank, src, sku)
     alt_recovered_count = 0
     alt_still_failed_count = 0
+    display_flag_cache = {}
     try:
         seed_elapsed = seed_session(driver)
         for i, src in enumerate(targets, 1):
@@ -813,7 +847,7 @@ def main():
             if not sku:
                 continue
             t0 = time.time()
-            responses = fetch_sku(driver, sku, category_id, parent_category)
+            responses = fetch_sku(driver, sku, category_id, parent_category, flag_cache=display_flag_cache)
             elapsed = round(time.time() - t0, 2)
             statuses = {k: v.get('status') for k, v in responses.items()}
             success = (
@@ -846,7 +880,7 @@ def main():
             reseed_for_alt(driver)
             for ai, (orig_rank, src, sku) in enumerate(alt_pending, 1):
                 t0 = time.time()
-                responses = fetch_sku(driver, sku, category_id, parent_category, store=ALT_STORE_FMT)
+                responses = fetch_sku(driver, sku, category_id, parent_category, store=ALT_STORE_FMT, flag_cache=display_flag_cache)
                 elapsed = round(time.time() - t0, 2)
                 statuses = {k: v.get('status') for k, v in responses.items()}
                 success = (
@@ -921,6 +955,13 @@ def main():
         'product_type': (lowes_product_type() or 'ref').upper(),
         'category_id': category_id,
         'store_id': STORE_FMT,
+        'request_delivery_zip': ZIP,
+        'request_delivery_state': STATE,
+        'request_nearby_store': NEARBY_STORE,
+        'fulfillment_display_contexts': display_flag_cache,
+        'fulfillment_screen_checks': sum(state['screen_checks'] for state in display_flag_cache.values()),
+        'fulfillment_unresolved': sum(state['unresolved'] for state in display_flag_cache.values()),
+        'fulfillment_screen_seconds': round(sum(state['screen_seconds'] for state in display_flag_cache.values()), 2),
         'alt_store_enabled': ALT_STORE_ENABLED,
         'alt_store_id': ALT_STORE_FMT if ALT_STORE_ENABLED else '',
         'alt_pending_count': len(alt_pending),
