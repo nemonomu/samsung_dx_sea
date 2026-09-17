@@ -62,3 +62,48 @@
   live GraphQL compatibility remain unverified. Per the user's explicit order,
   report the completed branch rebuild first, then wait before running AWS live
   offer acceptance tests or investigating collection totals below 300.
+
+## 11:28 KST (Asia/Seoul): readable RDP acceptance-test runner
+
+- User switched the RDP checkout to the clean branch and requested live testing
+  with human-readable output, explicitly limited to the test presentation.
+- Added `diagnose_graphql_offers.py`; production crawler files are unchanged.
+  Run from repository root:
+  `python bestbuy/new/diagnose_graphql_offers.py --category REF --pages 2 --open-report`.
+  LDY uses the same command with `--category LDY` after REF results are reviewed.
+- Uses orchestrator step-01 environment settings and the real listing payload,
+  session initialization, page collector/retry and GraphQL offer collector.
+  Initial listing navigation prepares the session; no DOM offer reads or added
+  per-page navigation. No new collection formula is embedded in the runner.
+- Real CSV files pass through step-02 normalization, step-07 enrichment, and
+  step-08 `output_row` (only its offer output is retained). Detail fetching is
+  not run. DB selectors, DB writes, S3 and notification stages are not invoked.
+- Isolation: unique `bestbuy/new/offer_diagnostics/<category>_<timestamp>_<id>`
+  output/profile root, explicit detail/output subdirectories, zero fixed browser
+  port, CSV URL source, orchestrator category search term. ZIP/store and saved
+  request settings otherwise come from runner configuration. These differences
+  from a full production run are recorded in summary metadata. No paid proxy
+  path is used; production transport is reused unchanged.
+- Each completed page saves `collected_rows.csv`, `final_targets.csv`,
+  `final_offer_values.csv`, `pages.json`, `offer_results.csv`, `summary.json`,
+  `summary.txt`, and standalone `report.html`. Raw requests/responses/evidence
+  remain under `main/raw/browser_graphql`; detailed runtime output is in
+  `run.log`. Reports remain available on interruption/error. No ZIP is created.
+  `.gitignore` excludes this local results/profile directory.
+- Report distinguishes verified absence (blank CSV; displayed as zero),
+  unverified data, CSV/final-output mismatch and missing 1/2/3 samples.
+  A passing API/storage check explicitly does not certify agreement with the
+  live screen. SKU links are optional manual inspection links only.
+- Local checks: `python -m unittest discover -s tests -p
+  'test_graphql_offer_diagnostic.py'` from `bestbuy/new`: 7 tests passed in
+  0.082s. Windows temporary-directory tests used sandbox escalation. An earlier
+  six-test run passed in 0.120s before adding the final-CSV zero-evidence-loss
+  check. `--help` was checked from repo root; UTF-8 console setup fixes garbled
+  Korean output under redirected PowerShell output. `git diff --check` passed.
+- Local fixtures exercise real CSV and final-output functions for REF/LDY,
+  corrupted/missing values, unknown versus zero, insufficient samples, HTML
+  escaping and error-report generation. No live network/HTTP status or real
+  collected product count is claimed from these checks. AWS/RDP live execution
+  is the next step; collection totals below 300 have not been investigated.
+- Changed files: the diagnostic runner, its seven offline tests, this log, and
+  the test-output ignore rule. Production source diff is empty.
