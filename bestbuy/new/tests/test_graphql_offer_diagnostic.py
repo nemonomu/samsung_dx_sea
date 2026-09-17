@@ -32,6 +32,17 @@ def page(complete=True):
 
 
 class LiveDiagnosticTests(unittest.TestCase):
+    def test_absent_content_response_is_explained_without_hiding_other_errors(self):
+        error = {"message": "Error - Not Found", "path": ["o0", "rows"], "extensions": {"code": "NOT_FOUND"}}
+        report = {"absent_offer_content": {"664995": {"alias": "o0", "count": 0}},
+                  "requests": [{"operation": "OfferCountContent", "attempt": 1,
+                                "response": {"data": {"o0": {"rows": None}}, "errors": [error]}}]}
+        result = diagnostic.request_errors(report)[0]
+        self.assertFalse(result["affects_offer"])
+        self.assertEqual(result["handling"], "no_displayed_offer_content")
+        error["extensions"]["code"] = "INTERNAL_SERVER_ERROR"
+        self.assertTrue(diagnostic.request_errors(report)[0]["affects_offer"])
+
     def test_unrelated_errors_are_recorded_as_non_offer_warnings(self):
         errors = diagnostic.request_errors({"ignored_listing_errors": [
             {"message": "Error - Not Found", "path": ["product", "arModels"],

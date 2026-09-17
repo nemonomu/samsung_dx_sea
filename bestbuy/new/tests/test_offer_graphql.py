@@ -105,6 +105,36 @@ def collect(replay, skus=None):
 
 
 class GraphqlOfferTests(unittest.TestCase):
+    def test_captured_rdp_responses_preserve_one_two_three_with_absent_content(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/offer_ref_rdp_20260917.json").read_text(encoding="utf-8"))
+        replay = Replay(fixture["products"], fixture["config"])
+        replay.support = fixture["support"]["data"]
+        replay.errors = fixture["support"]["errors"]
+        rows = [{"sku_id": p["skuId"], "category_key": "REF", "raw_product_json": json.dumps(p)} for p in fixture["products"]]
+        report = api.collect_graphql_offers(rows, fixture["payload"], None, fetch=replay)
+        self.assertTrue(report["complete"])
+        self.assertEqual([r["offer"] for r in rows], fixture["expected_counts"])
+        self.assertEqual(report["absent_offer_content"]["664995"]["count"], 0)
+        self.assertEqual([final_offer(r, []) for r in rows], ["1", "2", "3"])
+
+    def test_not_found_exception_is_limited_to_explicit_content_rows(self):
+        for code, path, timeline in (
+            ("INTERNAL_SERVER_ERROR", ["o0", "rows"], {"rows": None}),
+            ("401", ["o0", "rows"], {"rows": None}),
+            ("NOT_FOUND", None, {"rows": None}),
+            ("NOT_FOUND", ["o0"], {"rows": None}),
+            ("NOT_FOUND", ["o0", "rows"], None),
+            ("NOT_FOUND", ["o0", "rows"], {}),
+            ("NOT_FOUND", ["o0", "rows", 0, "columns"], {"rows": None}),
+        ):
+            with self.subTest(code=code, path=path, timeline=timeline):
+                replay = Replay()
+                replay.support["o0"] = timeline
+                replay.errors = [{"message": "failed", "path": path, "extensions": {"code": code}}]
+                rows, report = collect(replay)
+                self.assertFalse(report["complete"])
+                self.assertEqual(rows[0]["offer"], "")
+
     def test_projected_live_one_two_three_survive_final_detail(self):
         replay = Replay([product(), product("6486389", tier=True), product("6506246", tier=True, member=True)])
         rows, report = collect(replay)

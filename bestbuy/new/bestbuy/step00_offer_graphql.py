@@ -214,6 +214,24 @@ def content_count(timeline):
     return count
 
 
+def missing_offer_content(response, key):
+    """Recognize SiteControl's explicit absent-content result, not any failure.
+
+    PLP useOfferList uses errorPolicy='ignore', then getSiteControlOfferContent
+    maps rows:null to []. Only NOT_FOUND at this exact rows field is accepted;
+    global errors, auth/service failures and absent response keys stay unknown.
+    """
+    data = response.get("data") or {}
+    timeline = data.get(key)
+    if not isinstance(timeline, dict) or "rows" not in timeline or timeline["rows"] is not None:
+        return False
+    errors = [error for error in response.get("errors") or []
+              if not error.get("path") or error["path"][0] == key]
+    return bool(errors) and all(error.get("path") == [key, "rows"]
+                               and (error.get("extensions") or {}).get("code") == "NOT_FOUND"
+                               for error in errors)
+
+
 def rebate_count(eco, zip_code):
     if eco is None:
         return 0
@@ -421,7 +439,12 @@ def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None, listi
         content, rebates = {}, {}
         for offer_id, key in offer_aliases.items():
             try:
-                content[offer_id] = content_count(alias(support, key))
+                if missing_offer_content(support, key):
+                    content[offer_id] = 0
+                    report.setdefault("absent_offer_content", {})[offer_id] = {
+                        "alias": key, "reason": "site_control_rows_not_found", "count": 0}
+                else:
+                    content[offer_id] = content_count(alias(support, key))
             except (ValueError, TypeError, AttributeError):
                 pass  # Missing proof is detected per SKU, below.
         for sku in rebate_skus:

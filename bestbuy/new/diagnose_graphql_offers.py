@@ -49,6 +49,7 @@ def console(text):
 
 def request_errors(report):
     errors = []
+    absent_aliases = {item["alias"] for item in report.get("absent_offer_content", {}).values()}
     requests = list(report.get("requests", []))
     if report.get("listing_errors"):
         requests.append({"operation": "Listing", "response": {"errors": report["listing_errors"]}})
@@ -58,10 +59,16 @@ def request_errors(report):
     for request in requests:
         response = request.get("response") or {}
         for error in response.get("errors", []) if isinstance(response, dict) else []:
+            path = error.get("path") or []
+            absent = (request.get("operation") == "OfferCountContent" and len(path) == 2
+                      and path[0] in absent_aliases and path[1] == "rows"
+                      and (error.get("extensions") or {}).get("code") == "NOT_FOUND"
+                      and (response.get("data") or {}).get(path[0]) == {"rows": None})
             errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
                            "message": error.get("message"), "path": error.get("path"),
                            "code": (error.get("extensions") or {}).get("code"),
-                           "affects_offer": request.get("affects_offer", True)})
+                           "affects_offer": False if absent else request.get("affects_offer", True),
+                           "handling": "no_displayed_offer_content" if absent else ""})
         if request.get("error"):
             errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
                            "message": request["error"]})
@@ -167,6 +174,8 @@ th{background:#213b64;color:white;text-align:left;white-space:nowrap}th,td{paddi
 td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr.failed{background:#fff0ef}a{color:#1959aa}
 </style><main>'''
     document += f'<div class="muted">BEST BUY · {esc(summary["category"])} · {esc(summary["started_at"])}</div><h1>offer 실수집 테스트</h1>'
+    if summary.get("mode") == "saved_response_replay":
+        document += '<div class="notice">저장된 응답으로 수정 코드를 재검사한 결과입니다. 새로운 실수집 결과가 아닙니다.</div>'
     document += '<p>운영 GraphQL 수집 → 정규화 → 최종 대상 CSV → 운영 최종 출력 함수의 offer 값 비교</p>'
     document += '<div class="notice">이 보고서의 통과는 API 근거와 저장값의 일치를 뜻합니다. 실제 화면의 “N offers for you”와는 아직 대조하지 않았습니다. 숫자 2·3 표본이 없으면 표본 부족으로 표시합니다.</div>'
     document += f'<pre>{esc(report_text(summary))}</pre><h2>상품별 결과</h2><p class="muted">미확인 상품이 먼저 나옵니다. SKU 링크는 수동 확인용입니다. 0 · 표시 없음은 실제 CSV에서는 빈 칸으로 저장됩니다.</p>'
@@ -175,7 +184,7 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
     document += '<h2>실행 기록</h2><p><a href="run.log">상세 로그</a> · <a href="summary.json">요약 JSON</a> · <a href="offer_results.csv">검사 결과 CSV</a></p>'
     errors = [{"page": p["page"], **error} for p in summary.get("pages", []) for error in p.get("api_errors", [])]
     if errors:
-        document += '<h2>서버 오류 원문</h2><p>affects_offer: false는 offer 계산에 사용하지 않는 항목의 오류입니다. 배송·AR·별도 오픈박스 항목 오류는 기록하되 정상 offer 데이터는 검사합니다.</p><pre>' + esc(json.dumps(errors, ensure_ascii=False, indent=2)) + '</pre>'
+        document += '<h2>서버 응답 참고 사항</h2><p>affects_offer: false는 offer와 무관한 항목 오류 또는 사이트 규칙상 표시할 프로모션 콘텐츠가 없는 응답입니다. 원문과 처리 이유를 함께 기록합니다.</p><pre>' + esc(json.dumps(errors, ensure_ascii=False, indent=2)) + '</pre>'
     document += '<p class="muted">별도 테스트 폴더와 브라우저 프로필을 사용합니다. 상세 페이지 수집·DB 저장·S3 업로드는 실행하지 않습니다. 초기 목록 페이지는 세션 준비를 위해 한 번 열며, offer 숫자는 GraphQL 응답으로 계산합니다.</p></main></html>'
     (output / "report.html").write_text(document, encoding="utf-8")
     (output / "summary.txt").write_text(report_text(summary) + "\n", encoding="utf-8")

@@ -193,3 +193,52 @@
   Existing collected rows/requests/reports are untouched. Next: REF one-page live
   rerun to inspect actual config/content/rebate behavior and remaining sponsored
   gaps. Under-300 investigation remains deferred.
+
+## 13:02 KST (Asia/Seoul): explicit missing SiteControl content
+
+- Inspected `REF_20260916_235429_c9cb89.zip` directly without extracting the
+  browser profile. Actual REF run: 2026-09-16 23:54:29–23:54:57 -04:00,
+  27.5 seconds, listing HTTP 200, 24 occurrences / 21 unique SKUs.
+  Config succeeded; support requested twice. Both support responses contain
+  `o0: {rows: null}` and `NOT_FOUND` at `[o0, rows]` for offer 664995.
+  Rebate responses succeeded (including empty program lists). Original result:
+  zero passed, 21 rows unknown due to missing content proof, 3 due to missing price.
+- Rechecked previously downloaded official PLP chunks in the local audit cache:
+  `plp-2577.js` module 82577 `M` uses module 82656 `iQ`; `iQ` uses
+  `errorPolicy: ignore` then `getSiteControlOfferContent`. The offer query builder
+  `er` in module 90435 (`plp-90ff1eb4-2fac64fe7b289606.js`) requests the same
+  `page: <offer ID>, view: native` shape. The content mapper maps null rows to
+  an empty array. Thus this exact absent-content response contributes no top
+  offer to the displayed count. An initial cache-file lookup used an incorrect
+  filename; locating the actual `plp-` files resolved it without network access.
+- Narrow fix: accept only an existing alias object with explicit `rows: null`
+  and relevant errors exclusively `NOT_FOUND` at exactly `[alias, rows]`.
+  Authentication, generic service/transport errors, global errors, absent alias
+  data and child-field failures remain unknown. Record `absent_offer_content`
+  and keep the original errors; diagnostic marks the explicit absent-content
+  response with `handling: no_displayed_offer_content`.
+- Replayed **all actual saved responses**, including live config, products and
+  rebates, through the revised collector. No new HTTP request or synthetic
+  successful auxiliary response was used. Result: offer 1 on 7 rows, 2 on 12,
+  3 on 2, unknown on 3. Examples: 6472693=1; 6486389=2; 6506246=3; 6511564=3.
+  Missing-price sponsored SKUs remain 6477390, 6634588, 6470555.
+- Also passed these 24 replayed rows through the real step-02 normalization,
+  step-07 final CSV and step-08 output_row functions. Actual CSV readback gives
+  21 passed / 3 unknown. Saved an explicitly labeled replay report in ignored
+  `offer_diagnostics/replay_REF_20260916_235429_c9cb89/report.html`, with summary,
+  result CSVs and run.log. The optional ZenRows import was stubbed with a client
+  that raises on construction to prevent paid-client execution; no fake network
+  data was introduced. DB URL lookup/selectors were disabled; no DB/S3 writes.
+- Added a small fixture projected from the captured public fields for three
+  SKUs, config and actual support errors/rebates. No visitor/customer identifiers,
+  cookies, headers or private browser-profile data are included. Fixtures record
+  the source run and observation time and do not claim a current screen comparison.
+- Command: `python -m unittest discover -s tests -p 'test_*.py'` from
+  `bestbuy/new`, with escalation for Windows temp directories. **101 tests pass**
+  in 1.973 seconds. Tests cover actual-response 1/2/3 replay, narrow NOT_FOUND
+  acceptance and rejection of unrelated failure shapes. `git diff --check` passes.
+- Changed: collector, diagnostic, two test files, public-field JSON fixture and
+  this log. Formula and non-offer collection unchanged. This is a saved-response
+  replay result, not a fresh live crawl or a screen comparison. Overall collection
+  is still incomplete because the three sponsored rows have no price inputs.
+  Under-300 investigation remains deferred.

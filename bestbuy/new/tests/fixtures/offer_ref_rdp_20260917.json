@@ -1,0 +1,505 @@
+{
+  "source_run": "REF_20260916_235429_c9cb89",
+  "observed_at": "2026-09-17T03:54:53.386016+00:00",
+  "note": "Public offer fields projected from captured RDP responses. No cookies, IDs for visitors/customers, or request headers. Screen counts not rechecked.",
+  "payload": {
+    "variables": {
+      "productPriceInput": {
+        "salesChannel": "LargeView",
+        "planPaidMemberType": null,
+        "usePriceWithCart": true,
+        "context": "plp",
+        "displayLocation": "medium-plp"
+      },
+      "skuOffersInput": {
+        "salesChannel": "LargeView",
+        "effectivePlanPaidMemberType": null,
+        "checkmarkMessagingRequired": true,
+        "maxOffers": 10,
+        "filterFinanceMinPurchaseAmount": false
+      },
+      "destinationZipCode": "10010",
+      "isBestbuyMember": false
+    }
+  },
+  "config": {
+    "plusX.activatedTopOffers.enabled": false,
+    "plusX.caboSuco.enabled": true,
+    "plusX.rebates.countByContent.enabled": true,
+    "plusX.rebates.enabled": true,
+    "plusX.rebates.excludeFromCount.enabled": false,
+    "plusX.spendAndGet.enabled": true,
+    "plusX.spendAndGetCarousel.enabled": true,
+    "plusX.topOffers.countByContent.countTotal": false,
+    "plusX.topOffers.countByContent.enabled": true,
+    "plusX.topOffers.enabled": true,
+    "plusX.topOffers.hotOfferOnly.enabled": true,
+    "specialOffersList": {
+      "checkmarkMessagingRequired": true,
+      "filterFinanceMinPurchaseAmount": false,
+      "maxOffers": 10,
+      "viewableOfferLimit": 3
+    },
+    "specialOffersList.activatedTopOffers.enabled": false,
+    "specialOffersList.offerTypes.allowed": [
+      "PWP Global"
+    ],
+    "specialOffersList.topOffers.enabled": true,
+    "specialOffersList.topOffers.hotOfferOnly.enabled": false
+  },
+  "products": [
+    {
+      "skuId": "6472693",
+      "__typename": "Product",
+      "price": {
+        "__typename": "ItemPrice",
+        "showPlusOffers": true,
+        "openBoxCondition": null,
+        "mobileContracts": null,
+        "whatIfPrice": null,
+        "isEcoRebateEligible": true,
+        "spendAndGetCabosAvailable": null,
+        "tieredOffersTracking": null,
+        "customerSelectedDiscountsAvailable": null,
+        "giftSkus": [
+          {
+            "__typename": "ItemPriceGiftSku",
+            "brand": null,
+            "isGiftCard": null,
+            "isRequiredWithOffer": false,
+            "offerId": "759064",
+            "parentSkus": null,
+            "quantity": 1,
+            "savings": 0,
+            "skuId": "6597154"
+          }
+        ],
+        "priceWithCart": null
+      },
+      "offers": {
+        "__typename": "SkuOffersConnection",
+        "offers": [
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": true,
+            "offerId": "664995",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          }
+        ]
+      }
+    },
+    {
+      "skuId": "6486389",
+      "__typename": "Product",
+      "price": {
+        "__typename": "ItemPrice",
+        "showPlusOffers": true,
+        "openBoxCondition": null,
+        "mobileContracts": null,
+        "whatIfPrice": null,
+        "isEcoRebateEligible": true,
+        "spendAndGetCabosAvailable": null,
+        "tieredOffersTracking": [
+          {
+            "amountConsideredToNextTier": null,
+            "amountRemainingToNextTier": null,
+            "nextTierId": 1,
+            "quantityConsideredToNextTier": 0,
+            "quantityRemainingToNextTier": 2,
+            "savings": 0,
+            "savingsType": "AmountOff",
+            "tieredOffersGroupName": "Tiered Offer - Electrolux",
+            "trackingBy": "quantity",
+            "tiers": [
+              {
+                "discountValue": 100,
+                "minPurchaseAmount": 0,
+                "minQuantity": 2,
+                "offerId": "56933315",
+                "qualified": false,
+                "tierId": 1
+              },
+              {
+                "discountValue": 200,
+                "minPurchaseAmount": 0,
+                "minQuantity": 3,
+                "offerId": "56933525",
+                "qualified": false,
+                "tierId": 2
+              },
+              {
+                "discountValue": 300,
+                "minPurchaseAmount": 0,
+                "minQuantity": 4,
+                "offerId": "56933579",
+                "qualified": false,
+                "tierId": 3
+              },
+              {
+                "discountValue": 500,
+                "minPurchaseAmount": 0,
+                "minQuantity": 5,
+                "offerId": "56933807",
+                "qualified": false,
+                "tierId": 4
+              },
+              {
+                "discountValue": 700,
+                "minPurchaseAmount": 0,
+                "minQuantity": 6,
+                "offerId": "56933808",
+                "qualified": false,
+                "tierId": 5
+              },
+              {
+                "discountValue": 800,
+                "minPurchaseAmount": 0,
+                "minQuantity": 7,
+                "offerId": "56933816",
+                "qualified": false,
+                "tierId": 6
+              },
+              {
+                "discountValue": 1000,
+                "minPurchaseAmount": 0,
+                "minQuantity": 8,
+                "offerId": "56934150",
+                "qualified": false,
+                "tierId": 7
+              }
+            ]
+          }
+        ],
+        "customerSelectedDiscountsAvailable": null,
+        "giftSkus": [
+          {
+            "__typename": "ItemPriceGiftSku",
+            "brand": null,
+            "isGiftCard": null,
+            "isRequiredWithOffer": false,
+            "offerId": "759064",
+            "parentSkus": null,
+            "quantity": 1,
+            "savings": 0,
+            "skuId": "6597154"
+          }
+        ],
+        "priceWithCart": null
+      },
+      "offers": {
+        "__typename": "SkuOffersConnection",
+        "offers": [
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": true,
+            "offerId": "664995",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933315",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933525",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933579",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933807",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933808",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933816",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56934150",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "799849",
+            "offerType": "Financing",
+            "complexMemberOffer": false
+          }
+        ]
+      }
+    },
+    {
+      "skuId": "6506246",
+      "__typename": "Product",
+      "price": {
+        "__typename": "ItemPrice",
+        "showPlusOffers": true,
+        "openBoxCondition": null,
+        "mobileContracts": null,
+        "whatIfPrice": {
+          "planPaidMember2": {
+            "price": 1140.99,
+            "savings": 109,
+            "savingsPercent": 8
+          },
+          "planPaidMember3": {
+            "price": 1140.99,
+            "savings": 109,
+            "savingsPercent": 8
+          }
+        },
+        "isEcoRebateEligible": true,
+        "spendAndGetCabosAvailable": null,
+        "tieredOffersTracking": [
+          {
+            "amountConsideredToNextTier": null,
+            "amountRemainingToNextTier": null,
+            "nextTierId": 1,
+            "quantityConsideredToNextTier": 0,
+            "quantityRemainingToNextTier": 2,
+            "savings": 0,
+            "savingsType": "AmountOff",
+            "tieredOffersGroupName": "Tiered Offer - Electrolux",
+            "trackingBy": "quantity",
+            "tiers": [
+              {
+                "discountValue": 100,
+                "minPurchaseAmount": 0,
+                "minQuantity": 2,
+                "offerId": "56933315",
+                "qualified": false,
+                "tierId": 1
+              },
+              {
+                "discountValue": 200,
+                "minPurchaseAmount": 0,
+                "minQuantity": 3,
+                "offerId": "56933525",
+                "qualified": false,
+                "tierId": 2
+              },
+              {
+                "discountValue": 300,
+                "minPurchaseAmount": 0,
+                "minQuantity": 4,
+                "offerId": "56933579",
+                "qualified": false,
+                "tierId": 3
+              },
+              {
+                "discountValue": 500,
+                "minPurchaseAmount": 0,
+                "minQuantity": 5,
+                "offerId": "56933807",
+                "qualified": false,
+                "tierId": 4
+              },
+              {
+                "discountValue": 700,
+                "minPurchaseAmount": 0,
+                "minQuantity": 6,
+                "offerId": "56933808",
+                "qualified": false,
+                "tierId": 5
+              },
+              {
+                "discountValue": 800,
+                "minPurchaseAmount": 0,
+                "minQuantity": 7,
+                "offerId": "56933816",
+                "qualified": false,
+                "tierId": 6
+              },
+              {
+                "discountValue": 1000,
+                "minPurchaseAmount": 0,
+                "minQuantity": 8,
+                "offerId": "56934150",
+                "qualified": false,
+                "tierId": 7
+              }
+            ]
+          }
+        ],
+        "customerSelectedDiscountsAvailable": null,
+        "giftSkus": [
+          {
+            "__typename": "ItemPriceGiftSku",
+            "brand": null,
+            "isGiftCard": null,
+            "isRequiredWithOffer": false,
+            "offerId": "759064",
+            "parentSkus": null,
+            "quantity": 1,
+            "savings": 0,
+            "skuId": "6597154"
+          }
+        ],
+        "priceWithCart": null
+      },
+      "offers": {
+        "__typename": "SkuOffersConnection",
+        "offers": [
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": true,
+            "offerId": "664995",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933315",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933525",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933579",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933807",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933808",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56933816",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "56934150",
+            "offerType": "PWP Global",
+            "complexMemberOffer": false
+          },
+          {
+            "__typename": "SkuOffer",
+            "hotOffer": false,
+            "offerId": "799849",
+            "offerType": "Financing",
+            "complexMemberOffer": false
+          }
+        ]
+      }
+    }
+  ],
+  "support": {
+    "data": {
+      "o0": {
+        "rows": null
+      },
+      "r6472693": {
+        "skuId": "6472693",
+        "ecoRebates": {
+          "area": {
+            "zipCode": "10010"
+          },
+          "productRebateDetails": [
+            {
+              "rebatePrograms": []
+            }
+          ]
+        }
+      },
+      "r6486389": {
+        "skuId": "6486389",
+        "ecoRebates": {
+          "area": {
+            "zipCode": "10010"
+          },
+          "productRebateDetails": [
+            {
+              "rebatePrograms": []
+            }
+          ]
+        }
+      },
+      "r6506246": {
+        "skuId": "6506246",
+        "ecoRebates": {
+          "area": {
+            "zipCode": "10010"
+          },
+          "productRebateDetails": [
+            {
+              "rebatePrograms": []
+            },
+            {
+              "rebatePrograms": []
+            }
+          ]
+        }
+      }
+    },
+    "errors": [
+      {
+        "message": "Error - Not Found",
+        "locations": [],
+        "path": [
+          "o0",
+          "rows"
+        ],
+        "extensions": {
+          "code": "NOT_FOUND"
+        }
+      }
+    ]
+  },
+  "expected_counts": [
+    "1",
+    "2",
+    "3"
+  ]
+}
