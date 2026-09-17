@@ -53,7 +53,9 @@ CONFIG = {
 PAYLOAD = {"variables": {"productPriceInput": {
     "salesChannel": "LargeView", "customerId": "", "planPaidMemberType": None,
     "usePriceWithCart": True, "context": "plp", "displayLocation": "medium-plp"},
-    "destinationZipCode": "10010", "isBestbuyMember": False}}
+    "destinationZipCode": "10010", "isBestbuyMember": False,
+    "skuOffersInput": {"salesChannel": "LargeView", "effectivePlanPaidMemberType": None,
+                       "maxOffers": 10, "checkmarkMessagingRequired": True, "filterFinanceMinPurchaseAmount": False}}}
 
 
 def product(sku="6472693", tier=False, member=False):
@@ -88,15 +90,15 @@ class Replay:
         operation = request["operationName"]
         if operation == "PlatmanQuery":
             return {"data": {"versionedJsonByKey": {"versionedJsonId": "fixture", "json": self.config}}}
-        if operation == "OfferCountProducts":
-            return {"data": {"productsBySkuIds": self.products}}
         if operation == "OfferCountContent":
             return {"data": self.support, "errors": self.errors}
         raise AssertionError(operation)
 
 
 def collect(replay, skus=None):
-    rows = [{"category_key": "REF", "sku_id": sku, "offer": "99"}
+    products = {p["skuId"]: p for p in replay.products}
+    rows = [{"category_key": "REF", "sku_id": sku, "offer": "99",
+             "raw_product_json": json.dumps(products.get(sku))}
             for sku in (skus or [p["skuId"] for p in replay.products])]
     report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=replay)
     return rows, report
@@ -108,16 +110,15 @@ class GraphqlOfferTests(unittest.TestCase):
         rows, report = collect(replay)
         self.assertTrue(report["complete"])
         self.assertEqual([r["offer"] for r in rows], ["1", "2", "3"])
-        self.assertEqual(len(replay.calls), 3)
+        self.assertEqual(len(replay.calls), 2)
+        self.assertEqual(report["product_source"], "listing_graphql_raw_product_json")
+        self.assertEqual([c["operationName"] for c in replay.calls], ["PlatmanQuery", "OfferCountContent"])
         for category in ("REF", "LDY"):
             for row, expected in zip(rows, ("1", "2", "3")):
                 target = {**row, "category_key": category}
                 self.assertEqual(final_offer(target, [{"price": {"giftSkus": [{}]}}]), expected)
                 merged = api.normalize_graphql_offer({"sku_id": row["sku_id"], "category_key": category}, [target])
                 self.assertEqual(merged["offer_count"], expected)
-        request = replay.calls[1]
-        self.assertEqual(request["variables"]["priceInput"], PAYLOAD["variables"]["productPriceInput"])
-        self.assertEqual(request["variables"]["offersInput"]["maxOffers"], 10)
 
     def test_hot_offer_requires_visible_content(self):
         replay = Replay()
@@ -209,7 +210,7 @@ class GraphqlOfferTests(unittest.TestCase):
         rows, report = collect(replay)
         self.assertEqual([r["offer"] for r in rows], ["", "2"])
         self.assertFalse(report["complete"])
-        self.assertEqual(len(replay.calls), 4)  # One bounded support retry.
+        self.assertEqual(len(replay.calls), 3)  # One bounded support retry.
 
     def test_failed_graphql_and_config_fail_closed(self):
         rows = [{"sku_id": "6472693", "offer": "1"}]
@@ -233,10 +234,39 @@ class GraphqlOfferTests(unittest.TestCase):
             if count == 1:
                 raise TimeoutError("request timed out")
             return replay(request)
-        rows = [{"sku_id": "6472693"}]
+        rows = [{"sku_id": "6472693", "raw_product_json": json.dumps(product())}]
         report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=flaky)
         self.assertTrue(report["complete"])
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 3)
+
+    def test_real_listing_nullable_fields_are_valid(self):
+        p = product("6467055")
+        p["price"].update(mobileContracts=None, tieredOffersTracking=None, spendAndGetCabosAvailable=None)
+        rows, report = collect(Replay([p]))
+        self.assertTrue(report["complete"])
+        self.assertEqual(rows[0]["offer"], "1")
+
+    def test_listing_partial_errors_never_turn_null_into_zero(self):
+        replay = Replay()
+        rows = [{"sku_id": "6472693", "raw_product_json": json.dumps(product())}]
+        report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=replay,
+                   listing_errors=[{"message": "failed", "path": ["search", "product", "price"]}])
+        self.assertFalse(report["complete"])
+        self.assertEqual(rows[0]["offer"], "")
+        self.assertEqual(replay.calls, [])
+
+    def test_listing_context_missing_fields_and_wrong_sku_fail_closed(self):
+        for raw in (None, "invalid JSON", json.dumps(product("6506246")), json.dumps({"skuId": "6472693"})):
+            rows = [{"sku_id": "6472693", "raw_product_json": raw}]
+            report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=Replay())
+            self.assertFalse(report["complete"])
+            self.assertEqual(rows[0]["offer"], "")
+        payload = copy.deepcopy(PAYLOAD)
+        payload["variables"]["skuOffersInput"]["maxOffers"] = 1
+        rows = [{"sku_id": "6472693", "raw_product_json": json.dumps(product())}]
+        report = api.collect_graphql_offers(rows, payload, None, fetch=Replay())
+        self.assertFalse(report["complete"])
+        self.assertIn("listing_offer_context_mismatch", rows[0]["offer_graphql_json"])
 
     def test_product_missing_and_wrong_sku_are_never_guessed(self):
         rows, report = collect(Replay(), ["6506246"])

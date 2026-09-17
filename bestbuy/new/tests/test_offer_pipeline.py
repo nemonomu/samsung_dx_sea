@@ -46,6 +46,7 @@ class ApiBrowser:
 class OfferPipelineTests(unittest.TestCase):
     def listing_page(self, category, replay):
         rows = [{"sku_id": p["skuId"], "category_key": category, "offer_count": "1",
+                 "raw_product_json": json.dumps(p),
                  "container_type": "organic_product", "global_organic_rank": i,
                  "customer_price": "123.45", "product_name": "sample"}
                 for i, p in enumerate(replay.products, 1)]
@@ -64,9 +65,9 @@ class OfferPipelineTests(unittest.TestCase):
                 replay = Replay([product(), product("6486389", tier=True), product("6506246", tier=True, member=True)])
                 rows, meta, report, browser = self.listing_page(category, replay)
                 self.assertEqual(meta["offer_graphql_verified_rows"], 3)
-                self.assertEqual(meta["offer_graphql_request_count"], 3)
+                self.assertEqual(meta["offer_graphql_request_count"], 2)
                 self.assertTrue(report["complete"])
-                self.assertEqual(len(browser.calls), 4)
+                self.assertEqual(len(browser.calls), 3)
                 normalized = [targets.normalize_existing_listing_row(row) for row in rows]
                 self.assertEqual([row["offer"] for row in normalized], ["1", "2", "3"])
                 self.assertEqual([row["customer_price"] for row in normalized], ["123.45"] * 3)
@@ -130,7 +131,9 @@ class OfferPipelineTests(unittest.TestCase):
         self.assertEqual(api.offer_evidence(unknown)["status"], "unverified")
 
     def test_collector_keeps_duplicates_order_and_all_non_offer_fields(self):
-        rows = [{"sku_id": sku, "customer_price": "10", "page": "2", "offer": "9"}
+        products = [product(), product("6486389", tier=True)]
+        rows = [{"sku_id": sku, "customer_price": "10", "page": "2", "offer": "9",
+                 "raw_product_json": json.dumps(next(p for p in products if p["skuId"] == sku))}
                 for sku in ("6486389", "6472693", "6486389")]
         before = copy.deepcopy(rows)
         api.collect_graphql_offers(rows, PAYLOAD, None, fetch=Replay([product(), product("6486389", tier=True)]))

@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import traceback
+import unicodedata
 from collections import Counter
 from contextlib import redirect_stdout
 from datetime import datetime
@@ -38,6 +39,29 @@ def save_json(path, value):
 def load_csv(path):
     with path.open(encoding="utf-8-sig", newline="") as stream:
         return list(csv.DictReader(stream))
+
+
+def console(text):
+    # ASCII survives legacy RDP/PowerShell code-page mismatches. The HTML/CSV
+    # report retains full Korean and product text in UTF-8.
+    print(unicodedata.normalize("NFKD", str(text)).encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+def request_errors(report):
+    errors = []
+    requests = list(report.get("requests", []))
+    if report.get("listing_errors"):
+        requests.append({"operation": "Listing", "response": {"errors": report["listing_errors"]}})
+    for request in requests:
+        response = request.get("response") or {}
+        for error in response.get("errors", []) if isinstance(response, dict) else []:
+            errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
+                           "message": error.get("message"), "path": error.get("path"),
+                           "code": (error.get("extensions") or {}).get("code")})
+        if request.get("error"):
+            errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
+                           "message": request["error"]})
+    return errors
 
 
 def audit_rows(collected, saved, final_rows, proof_reader, final_targets=None):
@@ -145,6 +169,9 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
     document += '<div class="scroll"><table><thead><tr><th>페이지</th><th>SKU / 상품</th><th>수집 offer</th><th>CSV offer</th><th>최종 offer</th><th>혜택 구성</th><th>검사 결과 / 사유</th></tr></thead><tbody>' + body + '</tbody></table></div>'
     document += '<h2>페이지별 요청</h2><div class="scroll"><table><tr><th>페이지</th><th>목록 HTTP</th><th>행</th><th>offer API 요청</th><th>offer 응답 상태</th><th>ZIP</th></tr>' + page_rows + '</table></div>'
     document += '<h2>실행 기록</h2><p><a href="run.log">상세 로그</a> · <a href="summary.json">요약 JSON</a> · <a href="offer_results.csv">검사 결과 CSV</a></p>'
+    errors = [{"page": p["page"], **error} for p in summary.get("pages", []) for error in p.get("api_errors", [])]
+    if errors:
+        document += '<h2>서버 오류 원문</h2><pre>' + esc(json.dumps(errors, ensure_ascii=False, indent=2)) + '</pre>'
     document += '<p class="muted">별도 테스트 폴더와 브라우저 프로필을 사용합니다. 상세 페이지 수집·DB 저장·S3 업로드는 실행하지 않습니다. 초기 목록 페이지는 세션 준비를 위해 한 번 열며, offer 숫자는 GraphQL 응답으로 계산합니다.</p></main></html>'
     (output / "report.html").write_text(document, encoding="utf-8")
     (output / "summary.txt").write_text(report_text(summary) + "\n", encoding="utf-8")
@@ -187,24 +214,21 @@ def save_pipeline(rows, output, listing, targets, final, detail, proof):
 
 
 def main(argv=None):
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="운영 GraphQL로 offer 실수집 / 콘솔·HTML 결과표 (테스트 전용)")
+    parser = argparse.ArgumentParser(description="Live production GraphQL offer check; Korean HTML report")
     parser.add_argument("--category", choices=("REF", "LDY"), default="REF")
     parser.add_argument("--pages", type=int, default=2)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--open-report", action="store_true", help="완료 후 Windows 기본 브라우저로 결과표 열기")
+    parser.add_argument("--open-report", action="store_true", help="Open HTML report after completion (Windows)")
     parser.add_argument("--zip-code")
-    parser.add_argument("--require-counts", default="1,2,3", help="표본에서 확인할 숫자 (기본 1,2,3)")
+    parser.add_argument("--require-counts", default="1,2,3", help="Required sample counts (default: 1,2,3)")
     args = parser.parse_args(argv)
     if not 1 <= args.pages <= 16:
-        parser.error("--pages는 1~16입니다.")
+        parser.error("--pages must be between 1 and 16")
     if args.zip_code and (not args.zip_code.isascii() or not args.zip_code.isdigit() or len(args.zip_code) != 5):
-        parser.error("--zip-code는 숫자 5자리입니다.")
+        parser.error("--zip-code must contain 5 digits")
     required = {v.strip() for v in args.require_counts.split(",") if v.strip()}
     if any(not v.isascii() or not v.isdigit() or int(v) < 1 for v in required):
-        parser.error("--require-counts에는 1,2,3처럼 양의 정수를 입력하세요.")
+        parser.error("--require-counts must contain positive integers, e.g. 1,2,3")
     root = Path(__file__).resolve().parent
     output = root / "offer_diagnostics" / (args.category + "_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:6])
     output.mkdir(parents=True)
@@ -217,9 +241,9 @@ def main(argv=None):
     started = time.perf_counter()
     exit_code = 1
     write_reports(output, summary, results)
-    print(f"[{args.category}] offer 테스트 시작 · 목록 {args.pages}페이지", flush=True)
-    print("운영 함수로 수집하고 테스트 보고서만 추가합니다. 첫 페이지는 세션 준비용으로 한 번 엽니다.", flush=True)
-    print("결과 폴더: " + str(output), flush=True)
+    console(f"[{args.category}] Live offer test | pages={args.pages}")
+    console("Production GraphQL path. Initial page opens once for session setup. Korean results: report.html")
+    console("OUTPUT_DIR=" + str(output))
     with (output / "run.log").open("w", encoding="utf-8", buffering=1) as log:
         try:
             # Resolve saved-request fallback paths the same way as the normal runner.
@@ -245,12 +269,15 @@ def main(argv=None):
                 listing.initialize_browser_graphql_session(browser)
             rows = []
             for page in range(1, args.pages + 1):
-                print(f"[{args.category}] {page}/{args.pages}페이지 · 운영 GraphQL 요청 중... (상세 진행: run.log)", flush=True)
+                console(f"[{args.category}] page {page}/{args.pages} | Requesting GraphQL... (details: run.log)")
                 with redirect_stdout(log):
                     payload = listing.prepare_product_list_payload(operation, page)
                     _, meta, page_rows = listing.collect_browser_graphql_page(page, payload, browser)
                 rows.extend(page_rows)
+                evidence_path = listing.RUN_ROOT / "raw/browser_graphql" / f"{listing.page_stem(page)}_offers.json"
+                errors = request_errors(json.loads(evidence_path.read_text(encoding="utf-8"))) if evidence_path.exists() else []
                 page_results.append({"page": page, "status_code": meta.get("status_code"), "rows": len(page_rows),
+                    "api_errors": errors,
                     "listing_complete": listing.listing_rows_complete(page_rows),
                     "offer_complete": meta.get("offer_graphql_complete"), "offer_reason": meta.get("offer_graphql_reason"),
                     "offer_requests": meta.get("offer_graphql_request_count", 0),
@@ -262,9 +289,11 @@ def main(argv=None):
                 summarize(summary, results, page_results, issues, required)
                 write_reports(output, summary, results)
                 for r in results[-len(page_rows):] if page_rows else []:
-                    value = r["collected_offer"] or ("0(표시없음)" if r["label_absent"] else "미확인")
-                    print(f"  SKU {r['sku_id']} | offer {value} | {'API·저장 일치' if r['status'] == 'passed' else '확인 필요: ' + r['reason']} | {r['product_name'][:55]}", flush=True)
-                print(f"  → {len(page_rows)}행 / 목록 HTTP {meta.get('status_code')} / offer 미확인 {meta.get('offer_graphql_unverified_rows', 0)}행", flush=True)
+                    value = r["collected_offer"] or ("0(no label)" if r["label_absent"] else "UNKNOWN")
+                    console(f"  SKU {r['sku_id']} | offer={value} | {r['status']} | {r['product_name'][:55]}")
+                console(f"  rows={len(page_rows)} | listing HTTP={meta.get('status_code')} | unknown offers={meta.get('offer_graphql_unverified_rows', 0)}")
+                for error in errors:
+                    console("  API_ERROR " + json.dumps(error, ensure_ascii=True))
             exit_code = 0 if summary["collection_status"] == "passed" else 2
         except KeyboardInterrupt:
             summary["collection_status"] = "interrupted"
@@ -279,14 +308,18 @@ def main(argv=None):
             summary["elapsed_seconds"] = round(time.perf_counter() - started, 2)
             summary["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
             write_reports(output, summary, results)
-    print("\n" + report_text(summary), flush=True)
-    print("보고서 열기: " + str(output / "report.html"), flush=True)
-    print("종료 코드: 0=API·저장 검사 통과 / 2=미확인·표본 부족 / 1=실행 오류 / 130=중단", flush=True)
+    console(f"\n[{args.category}] {summary['collection_status']} | unique SKUs={summary.get('unique_sku_count', 0)} | rows={summary.get('row_count', 0)}")
+    console(f"PASS={summary.get('passed_rows', 0)} | CHECK={summary.get('failed_rows', 0)} | missing samples={','.join(summary.get('missing_count_samples', [])) or 'none'}")
+    console("SCREEN_COMPARISON=not_checked | Issues=" + ",".join(summary.get("issues", [])))
+    if summary.get("error"):
+        console("ERROR=" + summary["error"])
+    console("REPORT=" + str(output / "report.html"))
+    console("Exit: 0=API/storage passed; 2=unknown/insufficient samples; 1=error; 130=interrupted")
     if args.open_report and hasattr(os, "startfile"):
         try:
             os.startfile(str(output / "report.html"))
         except OSError as exc:
-            print("자동 열기 실패: report.html을 직접 열어 주세요. " + str(exc), flush=True)
+            console("Cannot open report automatically; open report.html manually. " + str(exc))
     return exit_code
 
 

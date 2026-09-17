@@ -2,10 +2,12 @@
 
 import copy
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 from test_offer_graphql import Replay, collect, product, api
 from test_offer_pipeline import listing, targets, final
@@ -30,6 +32,27 @@ def page(complete=True):
 
 
 class LiveDiagnosticTests(unittest.TestCase):
+    def test_rdp_server_error_message_and_path_are_visible(self):
+        error = {"message": "Error - Internal Server Error", "path": ["productsBySkuIds"],
+                 "extensions": {"code": "INTERNAL_SERVER_ERROR"}}
+        report = {"requests": [{"operation": "OfferCountProducts", "attempt": 1,
+                                 "response": {"data": {"productsBySkuIds": None}, "errors": [error]}}]}
+        errors = diagnostic.request_errors(report)
+        self.assertEqual(errors[0]["message"], error["message"])
+        self.assertEqual(errors[0]["code"], "INTERNAL_SERVER_ERROR")
+        summary = {"category": "REF", "started_at": "fixture", "collection_status": "failed",
+                   "pages": [{**page(False), "api_errors": errors}]}
+        with tempfile.TemporaryDirectory() as folder:
+            diagnostic.write_reports(Path(folder), summary, [])
+            self.assertIn("Error - Internal Server Error", (Path(folder) / "report.html").read_text(encoding="utf-8"))
+
+    def test_console_output_is_ascii_independent_of_windows_code_page(self):
+        capture = io.StringIO()
+        with redirect_stdout(capture):
+            diagnostic.console("SKU 6467055 | UNKNOWN | Insignia™ – Frigidaire")
+        self.assertTrue(capture.getvalue().isascii())
+        self.assertIn("UNKNOWN", capture.getvalue())
+
     def test_real_csv_normalization_and_output_function_preserve_one_two_three(self):
         rows, _ = collect(Replay([product(), product("6486389", tier=True), product("6506246", tier=True, member=True)]))
         for category in ("REF", "LDY"):

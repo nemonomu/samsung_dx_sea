@@ -104,23 +104,6 @@ CONFIG_QUERY = {
     "query": "query PlatmanQuery($key:String!){versionedJsonByKey(key:$key){versionedJsonId json}}",
 }
 
-PRODUCT_QUERY = """query OfferCountProducts($skuIds:[String!]!,
-  $priceInput:ProductItemPriceInput!,$offersInput:ProductSkuOffersInput!){
-  productsBySkuIds(skuIds:$skuIds){... on Product{
-    __typename skuId
-    price(input:$priceInput){__typename showPlusOffers openBoxCondition
-      mobileContracts{__typename}
-      whatIfPrice{planPaidMember2{price savings} planPaidMember3{price savings}}
-      isEcoRebateEligible spendAndGetCabosAvailable{offerId}
-      tieredOffersTracking{tieredOffersGroupName}
-      customerSelectedDiscountsAvailable{offerId couponId}
-      giftSkus{skuId quantity} priceWithCart{giftSkus{skuId quantity}}
-    }
-    offers(input:$offersInput){offers{offerId offerType hotOffer complexMemberOffer}}
-  }}
-}"""
-
-
 class UnverifiedOffer(ValueError):
     pass
 
@@ -293,15 +276,16 @@ def browser_fetch(browser, payload, timeout):
     return json.loads(body) if isinstance(body, str) else body
 
 
-def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None):
-    """Three batched API phases; retry failed requests once, never navigate.
+def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None, listing_errors=()):
+    """Reuse listing products; fetch config/support, never re-query SKU products.
 
     Keep request/response proof in the caller's page_offers.json. An error in a
     content/rebate alias invalidates only SKUs that depend on that alias.
     """
     fetch = fetch or (lambda request: browser_fetch(browser, request, min(timeout, 30)))
     report = {"source": SOURCE, "rule_version": RULE_VERSION,
-              "observed_at": datetime.now(timezone.utc).isoformat(), "requests": [], "evidence": {}}
+              "observed_at": datetime.now(timezone.utc).isoformat(), "requests": [], "evidence": {},
+              "product_source": "listing_graphql_raw_product_json"}
     skus = sorted({str(row.get("sku_id") or "") for row in rows})
 
     def request(value):
@@ -340,6 +324,11 @@ def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None):
                 "observed_at": report["observed_at"], **fields}
 
     try:
+        # Partial GraphQL errors can turn an unavailable field into a null that
+        # otherwise looks like a legitimate zero. Do not certify such a page.
+        if listing_errors:
+            report["listing_errors"] = listing_errors
+            raise UnverifiedOffer("listing_graphql_errors")
         variables = payload.get("variables") or {}
         price_input = dict(required(variables, "productPriceInput", dict))
         if any(price_input.get(k) for k in ("customerId", "planPaidMemberType", "selectedCabo",
@@ -358,21 +347,28 @@ def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None):
                        "effectivePlanPaidMemberType": None,
                        **{k: config["specialOffersList"][k] for k in (
                            "maxOffers", "checkmarkMessagingRequired", "filterFinanceMinPurchaseAmount")}}
-        product_request = {"operationName": "OfferCountProducts", "query": PRODUCT_QUERY,
-                           "variables": {"skuIds": skus, "priceInput": price_input, "offersInput": offer_input}}
-        product_response = request(product_request)
-        products = alias(product_response, "productsBySkuIds")
-        if not isinstance(products, list):
-            raise UnverifiedOffer("invalid_products_response")
-        by_sku = {}
-        for product in products:
-            if isinstance(product, dict) and str(product.get("skuId")) in skus:
-                sku = str(product["skuId"])
+        if config["plusX.topOffers.enabled"]:
+            listing_offer_input = required(variables, "skuOffersInput", dict)
+            if any(listing_offer_input.get(k) != v for k, v in offer_input.items()):
+                raise UnverifiedOffer("listing_offer_context_mismatch")
+        by_sku, invalid = {}, {}
+        for row in rows:
+            sku = str(row.get("sku_id") or "")
+            try:
+                raw = row.get("raw_product_json")
+                product = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(product, dict) or str(product.get("skuId") or "") != sku:
+                    raise UnverifiedOffer("listing_product_missing_or_sku_mismatch")
                 if sku in by_sku and by_sku[sku] != product:
-                    raise UnverifiedOffer("conflicting_product_response")
+                    raise UnverifiedOffer("conflicting_listing_product")
                 by_sku[sku] = product
-        fields, offer_ids, rebate_skus, invalid = [], set(), set(), {}
+            except (ValueError, TypeError) as exc:
+                invalid[sku] = str(exc)
+        report["listing_product_count"] = len(by_sku)
+        fields, offer_ids, rebate_skus = [], set(), set()
         for sku in skus:
+            if sku in invalid:
+                continue
             try:
                 product = by_sku[sku]
                 price = required(product, "price", dict)

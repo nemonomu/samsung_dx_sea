@@ -1867,7 +1867,8 @@ def browser_graphql_fetch_once(page, payload, browser_page):
     offer_counts = {}
     offer_path = raw_dir / f"{stem}_offers.json"
     if rows and uses_graphql_offers(CATEGORY):
-        offer_report = collect_graphql_offers(rows, payload, browser_page, timeout=BROWSER_GRAPHQL_JS_TIMEOUT)
+        offer_report = collect_graphql_offers(rows, payload, browser_page, timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
+                                             listing_errors=graph.get("errors") or ())
         offer_path.write_text(json.dumps(offer_report, indent=2, ensure_ascii=False), encoding="utf-8")
         for row in rows:
             evidence = json.loads(row["offer_graphql_json"])
