@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +33,61 @@ def page(complete=True):
 
 
 class LiveDiagnosticTests(unittest.TestCase):
+    def test_manual_review_saves_opens_waits_then_closes_browser(self):
+        events = []
+        args = types.SimpleNamespace(category="REF", open_report=True, keep_browser=True)
+        summary = {"category": "REF", "started_at": "fixture", "collection_status": "failed"}
+        browser = object()
+        with tempfile.TemporaryDirectory() as folder, redirect_stdout(io.StringIO()):
+            output = Path(folder)
+            def opened(path):
+                self.assertTrue(Path(path).exists())
+                events.append("open_report")
+            def wait(prompt):
+                self.assertTrue((output / "summary.json").exists())
+                self.assertEqual(events, ["open_report"])
+                events.append("wait_for_enter")
+                return ""
+            def closed(actual):
+                self.assertIs(actual, browser)
+                events.append("close_browser")
+            with patch.object(diagnostic.os, "startfile", side_effect=opened, create=True), patch("builtins.input", side_effect=wait):
+                diagnostic.finish_review(output, summary, [], args, browser, closed, io.StringIO())
+        self.assertEqual(events, ["open_report", "wait_for_enter", "close_browser"])
+
+    def test_default_interrupted_and_cancelled_reviews_close_browser(self):
+        for keep, state, interruption in ((False, "passed", None), (True, "interrupted", None),
+                                           (True, "failed", KeyboardInterrupt), (True, "failed", EOFError)):
+            with self.subTest(keep=keep, state=state, interruption=interruption), tempfile.TemporaryDirectory() as folder, redirect_stdout(io.StringIO()):
+                args = types.SimpleNamespace(category="REF", open_report=False, keep_browser=keep)
+                summary = {"category": "REF", "started_at": "fixture", "collection_status": state}
+                with patch("builtins.input", side_effect=interruption) as wait, patch.object(listing, "close_browser_graphql_page") as close:
+                    browser = object()
+                    diagnostic.finish_review(Path(folder), summary, [], args, browser, close, io.StringIO())
+                    close.assert_called_once_with(browser)
+                    self.assertEqual(wait.call_count, 1 if interruption else 0)
+
+    def test_report_failure_still_closes_browser(self):
+        args = types.SimpleNamespace(category="REF", open_report=False, keep_browser=True)
+        with patch.object(diagnostic, "write_reports", side_effect=OSError("disk full")), patch.object(listing, "close_browser_graphql_page") as close:
+            browser = object()
+            with self.assertRaises(OSError):
+                diagnostic.finish_review(Path("unused"), {}, [], args, browser, close, io.StringIO())
+            close.assert_called_once_with(browser)
+
+    def test_report_links_preserve_exact_page_and_zip(self):
+        url = "https://www.bestbuy.com/site/searchpage.jsp?st=refrigerator&cp=2&intl=nosplash"
+        summary = {"category": "REF", "started_at": "fixture", "collection_status": "passed", "keep_browser": True,
+                   "pages": [{**page(), "page": 2, "url": url}]}
+        with tempfile.TemporaryDirectory() as folder:
+            diagnostic.write_reports(Path(folder), summary, [])
+            report = (Path(folder) / "report.html").read_text(encoding="utf-8")
+            self.assertIn(url.replace("&", "&amp;"), report)
+            self.assertIn("목록 2페이지 열기", report)
+            self.assertIn("ZIP 10010", report)
+            self.assertIn("Enter", report)
+        self.assertNotIn('href=', diagnostic.listing_link({"page": 1, "url": "javascript:alert(1)"}))
+
     def test_absent_content_response_is_explained_without_hiding_other_errors(self):
         error = {"message": "Error - Not Found", "path": ["o0", "rows"], "extensions": {"code": "NOT_FOUND"}}
         report = {"absent_offer_content": {"664995": {"alias": "o0", "count": 0}},

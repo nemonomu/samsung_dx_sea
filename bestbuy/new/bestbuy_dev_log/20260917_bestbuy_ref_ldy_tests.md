@@ -242,3 +242,31 @@
   replay result, not a fresh live crawl or a screen comparison. Overall collection
   is still incomplete because the three sponsored rows have no price inputs.
   Under-300 investigation remains deferred.
+
+## 13:12 KST (Asia/Seoul): manual listing comparison, test runner only
+
+- User requested list-page links or keeping the collected browser visible for
+  manual comparison, explicitly for diagnostic runs only. Added optional
+  `--keep-browser` to `diagnose_graphql_offers.py`; production code is unchanged.
+- Result HTML and console now include the exact list URL from production page
+  metadata and the request ZIP. The page link preserves page/query parameters.
+  The observed REF page-1 URL is
+  `https://www.bestbuy.com/site/searchpage.jsp?id=pcat17071&st=refrigerator&intl=nosplash`.
+- With `--keep-browser --open-report`, save results and open the report first,
+  then keep test Chrome alive until Enter is pressed in PowerShell. Close on
+  Enter, Ctrl+C/EOF during inspection, or report-writing failure. An interrupted
+  collection skips the wait. Default behavior still closes the test browser.
+  Headless plus keep-browser is rejected because it cannot serve visual review.
+- No automated offer DOM reads, extra navigation or product requests were added.
+  Chrome remains on the initial page even when later pages were collected via
+  API. Report explains matching visible ZIP and using the existing Chrome
+  session; a link opened by the default browser may use another profile.
+- Check: `python -m unittest discover -s tests -p
+  'test_graphql_offer_diagnostic.py'`, from `bestbuy/new`: **15 passed**, 0.139s.
+  Tests verify save/open/wait/close ordering, cancellation and failure cleanup,
+  exact page links and ZIP. Browser and opener are mocked; no real site access.
+  Sandbox escalation was needed for Windows temp directories. `--help` and
+  `git diff --check` passed; production-file diff is empty.
+- Files changed: diagnostic runner, diagnostic tests and this log. No actual
+  crawl artifacts were created; test files used temporary folders. Next runner
+  command adds `--keep-browser` to the existing REF one-page diagnostic command.

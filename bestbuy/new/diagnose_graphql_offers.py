@@ -18,6 +18,7 @@ from collections import Counter
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 
@@ -145,6 +146,15 @@ def report_text(summary):
     ])
 
 
+def listing_link(page):
+    label = f"목록 {page['page']}페이지 열기"
+    url = str(page.get("url") or "")
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.bestbuy.com", "bestbuy.com"}:
+        return html.escape(label + " (주소 기록 없음)")
+    return f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">{html.escape(label)}</a>'
+
+
 def write_reports(output, summary, results):
     """Standalone readable report; escape all remote text and use no external assets."""
     esc = lambda value: html.escape(str(value), quote=True)
@@ -160,7 +170,7 @@ def write_reports(output, summary, results):
                     f'{counts}<td>{esc(parts)}</td><td>{"확인 필요" if r["status"] != "passed" else "API·저장 일치"}'
                     f'<small>{esc(r["reason"])}</small></td></tr>')
     body = "".join(rows) or '<tr><td colspan="7">아직 수집 결과가 없습니다. 아래 실행 기록을 확인하세요.</td></tr>'
-    page_rows = "".join(f'<tr><td>{p["page"]}</td><td>{esc(p["status_code"])}</td><td>{p["rows"]}</td>'
+    page_rows = "".join(f'<tr><td>{listing_link(p)}</td><td>{esc(p["status_code"])}</td><td>{p["rows"]}</td>'
                         f'<td>{p["offer_requests"]}</td><td>{esc(p["offer_reason"])}</td><td>{esc(p["zip_code"])}</td></tr>'
                         for p in summary.get("pages", []))
     document = '''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -178,6 +188,12 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
         document += '<div class="notice">저장된 응답으로 수정 코드를 재검사한 결과입니다. 새로운 실수집 결과가 아닙니다.</div>'
     document += '<p>운영 GraphQL 수집 → 정규화 → 최종 대상 CSV → 운영 최종 출력 함수의 offer 값 비교</p>'
     document += '<div class="notice">이 보고서의 통과는 API 근거와 저장값의 일치를 뜻합니다. 실제 화면의 “N offers for you”와는 아직 대조하지 않았습니다. 숫자 2·3 표본이 없으면 표본 부족으로 표시합니다.</div>'
+    if summary.get("pages"):
+        document += '<h2>수집한 목록 직접 확인</h2><p>' + ' &nbsp; | &nbsp; '.join(
+            listing_link(p) + f' · ZIP {esc(p["zip_code"])}' for p in summary["pages"]) + '</p>'
+        document += '<p class="muted">화면의 ZIP을 수집 ZIP과 맞춰 비교하세요. 링크는 기본 브라우저에서 열릴 수 있으므로 같은 세션으로 비교하려면 테스트에서 열어 둔 Chrome 창을 사용하세요.</p>'
+        if summary.get("keep_browser"):
+            document += '<p>테스트 Chrome은 확인을 마칠 때까지 유지됩니다. 확인 후 PowerShell에서 Enter를 누르면 테스트 Chrome이 종료됩니다. 여러 페이지를 수집해도 Chrome 화면은 처음 연 1페이지에 머무릅니다.</p>'
     document += f'<pre>{esc(report_text(summary))}</pre><h2>상품별 결과</h2><p class="muted">미확인 상품이 먼저 나옵니다. SKU 링크는 수동 확인용입니다. 0 · 표시 없음은 실제 CSV에서는 빈 칸으로 저장됩니다.</p>'
     document += '<div class="scroll"><table><thead><tr><th>페이지</th><th>SKU / 상품</th><th>수집 offer</th><th>CSV offer</th><th>최종 offer</th><th>혜택 구성</th><th>검사 결과 / 사유</th></tr></thead><tbody>' + body + '</tbody></table></div>'
     document += '<h2>페이지별 요청</h2><div class="scroll"><table><tr><th>페이지</th><th>목록 HTTP</th><th>행</th><th>offer API 요청</th><th>offer 응답 상태</th><th>ZIP</th></tr>' + page_rows + '</table></div>'
@@ -226,15 +242,48 @@ def save_pipeline(rows, output, listing, targets, final, detail, proof):
     return audit_rows(rows, stored, load_csv(output / "final_offer_values.csv"), proof.offer_evidence, persisted_targets)
 
 
+def finish_review(output, summary, results, args, browser, close_browser, log):
+    """Persist/open results before waiting; always release the test browser."""
+    try:
+        write_reports(output, summary, results)
+        console(f"\n[{args.category}] {summary['collection_status']} | unique SKUs={summary.get('unique_sku_count', 0)} | rows={summary.get('row_count', 0)}")
+        console(f"PASS={summary.get('passed_rows', 0)} | CHECK={summary.get('failed_rows', 0)} | missing samples={','.join(summary.get('missing_count_samples', [])) or 'none'}")
+        console("SCREEN_COMPARISON=not_checked | Issues=" + ",".join(summary.get("issues", [])))
+        if summary.get("error"):
+            console("ERROR=" + summary["error"])
+        for page in summary.get("pages", []):
+            console(f"LIST_PAGE_{page['page']}={page.get('url', '')} | ZIP={page.get('zip_code', '')}")
+        console("REPORT=" + str(output / "report.html"))
+        console("Exit: 0=API/storage passed; 2=unknown/insufficient samples; 1=error; 130=interrupted")
+        if args.open_report and hasattr(os, "startfile"):
+            try:
+                os.startfile(str(output / "report.html"))
+            except OSError as exc:
+                console("Cannot open report automatically; open report.html manually. " + str(exc))
+        if args.keep_browser and browser is not None and summary["collection_status"] != "interrupted":
+            console("Test Chrome stays open for manual comparison. Match the on-screen ZIP to the report.")
+            try:
+                input("Press Enter here AFTER checking the list page to close test Chrome: ")
+            except (KeyboardInterrupt, EOFError):
+                console("Manual review ended; closing test Chrome.")
+    finally:
+        if browser is not None:
+            with redirect_stdout(log):
+                close_browser(browser)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Live production GraphQL offer check; Korean HTML report")
     parser.add_argument("--category", choices=("REF", "LDY"), default="REF")
     parser.add_argument("--pages", type=int, default=2)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--open-report", action="store_true", help="Open HTML report after completion (Windows)")
+    parser.add_argument("--keep-browser", action="store_true", help="Keep test Chrome open until Enter is pressed")
     parser.add_argument("--zip-code")
     parser.add_argument("--require-counts", default="1,2,3", help="Required sample counts (default: 1,2,3)")
     args = parser.parse_args(argv)
+    if args.keep_browser and args.headless:
+        parser.error("--keep-browser requires visible Chrome; omit --headless")
     if not 1 <= args.pages <= 16:
         parser.error("--pages must be between 1 and 16")
     if args.zip_code and (not args.zip_code.isascii() or not args.zip_code.isdigit() or len(args.zip_code) != 5):
@@ -247,7 +296,8 @@ def main(argv=None):
     output.mkdir(parents=True)
     summary = {"category": args.category, "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                "collection_status": "running", "issues": [], "display_accuracy": "not_compared",
-               "pages_requested": args.pages, "scope": "main listing and offer output only; no detail fetch/DB/S3",
+               "pages_requested": args.pages, "keep_browser": args.keep_browser,
+               "scope": "main listing and offer output only; no detail fetch/DB/S3",
                "differences_from_daily_run": ["isolated profile/output", "selected pages", "CSV URL source; same category search term",
                                               "no BSR/promotion/trend/detail fetch or DB selectors"], "source_sha256": {}}
     results, page_results, browser = [], [], None
@@ -290,6 +340,7 @@ def main(argv=None):
                 evidence_path = listing.RUN_ROOT / "raw/browser_graphql" / f"{listing.page_stem(page)}_offers.json"
                 errors = request_errors(json.loads(evidence_path.read_text(encoding="utf-8"))) if evidence_path.exists() else []
                 page_results.append({"page": page, "status_code": meta.get("status_code"), "rows": len(page_rows),
+                    "url": meta.get("url", ""),
                     "api_errors": errors,
                     "listing_complete": listing.listing_rows_complete(page_rows),
                     "offer_complete": meta.get("offer_graphql_complete"), "offer_reason": meta.get("offer_graphql_reason"),
@@ -319,24 +370,10 @@ def main(argv=None):
             summary.update(collection_status="error", error=f"{type(exc).__name__}: {exc}")
             traceback.print_exc(file=log)
         finally:
-            if browser is not None:
-                with redirect_stdout(log):
-                    listing.close_browser_graphql_page(browser)
             summary["elapsed_seconds"] = round(time.perf_counter() - started, 2)
             summary["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-            write_reports(output, summary, results)
-    console(f"\n[{args.category}] {summary['collection_status']} | unique SKUs={summary.get('unique_sku_count', 0)} | rows={summary.get('row_count', 0)}")
-    console(f"PASS={summary.get('passed_rows', 0)} | CHECK={summary.get('failed_rows', 0)} | missing samples={','.join(summary.get('missing_count_samples', [])) or 'none'}")
-    console("SCREEN_COMPARISON=not_checked | Issues=" + ",".join(summary.get("issues", [])))
-    if summary.get("error"):
-        console("ERROR=" + summary["error"])
-    console("REPORT=" + str(output / "report.html"))
-    console("Exit: 0=API/storage passed; 2=unknown/insufficient samples; 1=error; 130=interrupted")
-    if args.open_report and hasattr(os, "startfile"):
-        try:
-            os.startfile(str(output / "report.html"))
-        except OSError as exc:
-            console("Cannot open report automatically; open report.html manually. " + str(exc))
+            finish_review(output, summary, results, args, browser,
+                          listing.close_browser_graphql_page if browser is not None else None, log)
     return exit_code
 
 
