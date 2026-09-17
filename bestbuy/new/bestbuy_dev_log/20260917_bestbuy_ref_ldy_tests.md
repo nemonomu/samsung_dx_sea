@@ -270,3 +270,105 @@
 - Files changed: diagnostic runner, diagnostic tests and this log. No actual
   crawl artifacts were created; test files used temporary folders. Next runner
   command adds `--keep-browser` to the existing REF one-page diagnostic command.
+
+## 13:36 KST (Asia/Seoul): missing-price audit of runner REF archive
+
+- Target: REF step01/offer diagnostic, runner root
+  `C:\samsung_dx_sea\bestbuy\new\offer_diagnostics\REF_20260917_002403_eea544`.
+  Read the user-provided archive of that run with Python zipfile/json/csv;
+  compared saved request, response, collected rows and summary without extracting
+  browser profiles or reading cookies. No live requests, proxy, DB or S3 access.
+- Runner conditions: one page, browser GraphQL, ZIP 10010, visible Chrome with
+  keep-browser; grid documents enabled, list documents disabled, organic offset
+  18. Recorded result: HTTP 200, 24 rows / 21 unique SKUs, 46.16 seconds,
+  21 passing rows and 3 `incomplete_offer_proof:missing_price` rows.
+- All 18 detailedProductSearch products contain price. The three failed SKUs
+  6634588, 6477390 and 6470555 occur only in the sponsored grid response and have
+  no price, offers or name there. Their saved raw_product_json also lacks price;
+  this is not a price field lost during CSV serialization or product parsing.
+- Of six collected sponsored occurrences, three share SKUs with the organic
+  detailed products (6468479, 6360748, 6642584), so parse_page_rows merges the
+  detailed product data into those rows. The three sponsored-only SKUs have no
+  such source to merge and remain unknown.
+- Saved request inspection: sponsored product fragments request only
+  PlpViewSearchProductInfoFragment (badges/basic identity), while
+  DetailedSearchProductFragment adds ProductListItemFragment including price
+  experience and offers. Compared these three fragment definitions with
+  `git show 38474f3:bestbuy/new/references/page_001_request.json`: unchanged.
+  Thus the request omits required fields for sponsored-only products; no evidence
+  here that the server dropped requested price data for these SKUs.
+- Next: validate a narrowly scoped REF/LDY request addition for sponsored offer
+  inputs, preserving selection/navigation and unknown-on-incomplete behavior.
+  No collector/query changes made during this audit. No new raw artifacts or
+  manifests, no live screen comparison. Under-300 investigation remains deferred.
+  Only this development log changed.
+
+## 13:44 KST (Asia/Seoul): whether the three sponsored SKUs are listing targets
+
+- Read-only follow-up on the same REF runner archive, same one-page/ZIP 10010
+  conditions. Inspected placement documents, rejected entries, displayDocuments,
+  and local cached public Best Buy PLP JavaScript. No new network requests,
+  browser access, cookies, proxy experiments, DB/S3 operations or crawl artifacts.
+- `SEARCH_SPONSORED_INGRID.documentsGridView.sponsoredDocuments` contains an
+  interleaved list of 24 documents: 18 organic and 6 source-A sponsored items.
+  The missing-price SKUs occur at one-based document positions 4 (6634588),
+  7 (6477390), and 14 (6470555). None appears in the placement's rejected list;
+  that separate list has 18 rejected candidates with NOT_RELEVANT,
+  NOT_AVAILABLE or NO_SPACE reasons. Placement.documents is empty.
+- Previously downloaded public JS `plp-5076-6e75055dfe1a2f62.js` implements
+  useDocumentList: falls back from placement.documents to grid sponsoredDocuments
+  then list sponsoredDocuments. `plp-9368-ca1af624cb4b8dcb.js` consumes that hook
+  and maps its items to DocumentGateway components. This supports including the
+  three SKUs in this response's listing targets, rather than treating them as
+  rejected candidates. Runtime overrides/experiments exist in the hooks, so this
+  is not evidence that the user's separately loaded browser actually painted
+  those cards or displayed offer labels.
+- displayDocuments has rowNoFor3col/rowNoFor4col 3 and 5. Public JS also uses
+  these positions for display-ad insertion; they are not a three-SKU allowlist.
+  Do not use them alone to filter sponsored product cards.
+- Existing parse_page_rows writes organic occurrences first and appends sponsored
+  occurrences. Thus the same three items have stored visual_rank 20, 21 and 23,
+  not source-array positions 4, 7 and 14. Report order is not a proven rendered
+  screen order. Initial browser navigation and explicit diagnostic GraphQL fetch
+  are separate requests, so their ad selections are not guaranteed identical.
+- Result: retain these three as listing targets under the existing sponsored-
+  inclusive policy; preserve UNKNOWN until price/offer proof is obtained. No
+  production/test code changes, no rank/selection correction in this audit, no
+  live screen comparison. Only this log changed; under-300 work remains deferred.
+
+## 13:53 KST (Asia/Seoul): request sponsored offer inputs and prepare manual screen check
+
+- User authorized the scoped REF/LDY offer request fix followed by one-page
+  runner validation. Added PriceExperienceInit_Product to the existing
+  PlpViewSearchMediaProductFragment product selection, in production payload
+  preparation only for REF/LDY. This requests the same price/offer inputs used
+  by organic cards for sponsored-only SKUs, without extra API operations or PDP
+  navigation. Selection/rank/pagination/scroll code and offer arithmetic unchanged.
+- The patch reuses existing declared fragments and variables; it is idempotent.
+  An unfamiliar template raises a descriptive error before sending the request
+  rather than silently treating incomplete inputs as complete. TV/HHP query
+  contents remain unchanged. Missing price responses still produce UNKNOWN.
+- Test runner only: --keep-browser now pauses after initial Chrome navigation,
+  before the collection request. Operator sets the displayed delivery ZIP and
+  must type that ZIP to continue; Q/Ctrl+C/EOF cancels. Confirmation is explicitly
+  recorded as user_confirmed_zip, not automated DOM validation or offer accuracy.
+  Normal noninteractive/headless runs do not acquire this manual setup step.
+- HTML/results CSV label sponsored vs organic rows and explain why report order
+  and separately fetched browser ad selections can differ. Screens without
+  matching SKUs remain unverified; no screen-match status is automatically granted.
+- Checks: `python -m unittest discover -s tests -p 'test_*.py'` from bestbuy/new:
+  109 passed in 2.125 seconds, using escalation for Windows temporary directories.
+  Added cases cover real-template scope/unchanged variables/idempotence, fail-fast
+  template handling, sponsored-only parsing/counting and missing-price rejection,
+  and explicit screen ZIP confirmation/cancellation. The sponsored response test
+  uses controlled fixtures; it does not claim live resolution of the three SKUs.
+- Applied amendment offline to the user's archived page_001_request.json:
+  REF/LDY differ by exactly the 31-character fragment spread insertion; TV/HHP
+  unchanged. --help and git diff --check pass. No new live requests, paid proxy,
+  DB/S3 operations, raw response files or manifests. Existing saved responses
+  cannot supply fields that were never requested; live acceptance remains pending.
+- Changed: step00_offer_graphql.py, step01_main_list.py, diagnostic runner,
+  test_offer_pipeline.py, test_graphql_offer_diagnostic.py, and this log. Next:
+  push current feature branch, run REF --pages 1 --zip-code 10010 --open-report
+  --keep-browser on RDP, inspect sponsored UNKNOWNs and compare same-SKU labels.
+  Main merge and under-300 investigation are not part of this change.

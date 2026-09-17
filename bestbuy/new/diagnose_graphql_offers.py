@@ -102,6 +102,7 @@ def audit_rows(collected, saved, final_rows, proof_reader, final_targets=None):
                 reasons.append("최종 대상 CSV 근거 데이터 불일치")
         components = proof.get("components", {})
         results.append({"page": row.get("page", ""), "sku_id": row.get("sku_id", ""),
+                        "is_sponsored": str(row.get("is_sponsored", "")).lower() in {"true", "1"},
                         "product_name": row.get("product_name", ""),
                         "collected_offer": row.get("offer", ""), "csv_offer": stored.get("offer", ""),
                         "final_offer": final.get("offer", ""), "status": "failed" if reasons else "passed",
@@ -166,6 +167,7 @@ def write_reports(output, summary, results):
         parts = " · ".join(f"{LABELS.get(k, k)} {v}" for k, v in r["components"].items() if v) or ("혜택 표시 없음" if r["label_absent"] else "근거 부족")
         sku = r["sku_id"]
         link = f'<a href="https://www.bestbuy.com/site/{sku}.p?skuId={sku}" target="_blank" rel="noopener">{esc(sku)}</a>' if sku.isascii() and sku.isdigit() else esc(sku)
+        link += ' · 광고' if r.get("is_sponsored") else ' · 일반'
         rows.append(f'<tr class="{r["status"]}"><td>{esc(r["page"])}</td><td>{link}<small>{esc(r["product_name"])}</small></td>'
                     f'{counts}<td>{esc(parts)}</td><td>{"확인 필요" if r["status"] != "passed" else "API·저장 일치"}'
                     f'<small>{esc(r["reason"])}</small></td></tr>')
@@ -188,13 +190,16 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
         document += '<div class="notice">저장된 응답으로 수정 코드를 재검사한 결과입니다. 새로운 실수집 결과가 아닙니다.</div>'
     document += '<p>운영 GraphQL 수집 → 정규화 → 최종 대상 CSV → 운영 최종 출력 함수의 offer 값 비교</p>'
     document += '<div class="notice">이 보고서의 통과는 API 근거와 저장값의 일치를 뜻합니다. 실제 화면의 “N offers for you”와는 아직 대조하지 않았습니다. 숫자 2·3 표본이 없으면 표본 부족으로 표시합니다.</div>'
+    setup = summary.get("screen_setup", {})
+    if setup.get("status") == "user_confirmed_zip":
+        document += f'<p>수집 전 화면 ZIP: 사용자 확인 {esc(setup["zip_code"])}. 화면의 offer 숫자는 별도로 비교해야 합니다.</p>'
     if summary.get("pages"):
         document += '<h2>수집한 목록 직접 확인</h2><p>' + ' &nbsp; | &nbsp; '.join(
             listing_link(p) + f' · ZIP {esc(p["zip_code"])}' for p in summary["pages"]) + '</p>'
         document += '<p class="muted">화면의 ZIP을 수집 ZIP과 맞춰 비교하세요. 링크는 기본 브라우저에서 열릴 수 있으므로 같은 세션으로 비교하려면 테스트에서 열어 둔 Chrome 창을 사용하세요.</p>'
         if summary.get("keep_browser"):
             document += '<p>테스트 Chrome은 확인을 마칠 때까지 유지됩니다. 확인 후 PowerShell에서 Enter를 누르면 테스트 Chrome이 종료됩니다. 여러 페이지를 수집해도 Chrome 화면은 처음 연 1페이지에 머무릅니다.</p>'
-    document += f'<pre>{esc(report_text(summary))}</pre><h2>상품별 결과</h2><p class="muted">미확인 상품이 먼저 나옵니다. SKU 링크는 수동 확인용입니다. 0 · 표시 없음은 실제 CSV에서는 빈 칸으로 저장됩니다.</p>'
+    document += f'<pre>{esc(report_text(summary))}</pre><h2>상품별 결과</h2><p class="muted">미확인 상품이 먼저 나옵니다. 보고서 순서는 화면 순서와 다르므로 SKU와 상품명으로 비교하세요. 화면과 수집 API는 별도 요청이어서 광고 구성이 다를 수 있으며, 화면에서 찾지 못한 상품은 미대조로 남겨야 합니다. SKU 링크는 수동 확인용입니다. 0 · 표시 없음은 실제 CSV에서는 빈 칸으로 저장됩니다.</p>'
     document += '<div class="scroll"><table><thead><tr><th>페이지</th><th>SKU / 상품</th><th>수집 offer</th><th>CSV offer</th><th>최종 offer</th><th>혜택 구성</th><th>검사 결과 / 사유</th></tr></thead><tbody>' + body + '</tbody></table></div>'
     document += '<h2>페이지별 요청</h2><div class="scroll"><table><tr><th>페이지</th><th>목록 HTTP</th><th>행</th><th>offer API 요청</th><th>offer 응답 상태</th><th>ZIP</th></tr>' + page_rows + '</table></div>'
     document += '<h2>실행 기록</h2><p><a href="run.log">상세 로그</a> · <a href="summary.json">요약 JSON</a> · <a href="offer_results.csv">검사 결과 CSV</a></p>'
@@ -206,7 +211,7 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
     (output / "summary.txt").write_text(report_text(summary) + "\n", encoding="utf-8")
     save_json(output / "summary.json", summary)
     with (output / "offer_results.csv").open("w", encoding="utf-8-sig", newline="") as stream:
-        fields = ["page", "sku_id", "product_name", "collected_offer", "csv_offer", "final_offer", "status", "label_absent", "reason", "components"]
+        fields = ["page", "sku_id", "is_sponsored", "product_name", "collected_offer", "csv_offer", "final_offer", "status", "label_absent", "reason", "components"]
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows({**r, "components": json.dumps(r["components"], ensure_ascii=False)} for r in results)
@@ -240,6 +245,23 @@ def save_pipeline(rows, output, listing, targets, final, detail, proof):
                     for row in persisted_targets]
     listing.write_csv(output / "final_offer_values.csv", final_values)
     return audit_rows(rows, stored, load_csv(output / "final_offer_values.csv"), proof.offer_evidence, persisted_targets)
+
+
+def confirm_screen_setup(zip_code):
+    """Test-only human check; typed confirmation is not automatic DOM validation."""
+    console(f"BEFORE COLLECTION: In test Chrome, dismiss the survey with No, Thanks; set delivery ZIP to {zip_code} and apply it.")
+    console("Wait for the product list to reload. Check the displayed ZIP. If all cards remain Unavailable, type Q to stop.")
+    console("This checks setup only. Compare offer labels by SKU after collection; ads may differ between requests.")
+    while True:
+        try:
+            answer = input(f"Type the displayed ZIP ({zip_code}) to start collecting, or Q to cancel: ").strip()
+        except EOFError:
+            raise KeyboardInterrupt from None
+        if answer.lower() == "q":
+            raise KeyboardInterrupt
+        if answer == zip_code:
+            return {"status": "user_confirmed_zip", "zip_code": zip_code}
+        console("ZIP does not match. Apply the requested ZIP in Chrome first; collection has not started.")
 
 
 def finish_review(output, summary, results, args, browser, close_browser, log):
@@ -278,7 +300,7 @@ def main(argv=None):
     parser.add_argument("--pages", type=int, default=2)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--open-report", action="store_true", help="Open HTML report after completion (Windows)")
-    parser.add_argument("--keep-browser", action="store_true", help="Keep test Chrome open until Enter is pressed")
+    parser.add_argument("--keep-browser", action="store_true", help="Confirm on-screen ZIP before collection; keep Chrome open afterward until Enter")
     parser.add_argument("--zip-code")
     parser.add_argument("--require-counts", default="1,2,3", help="Required sample counts (default: 1,2,3)")
     args = parser.parse_args(argv)
@@ -328,13 +350,17 @@ def main(argv=None):
             with redirect_stdout(log):
                 listing.make_dirs()
                 operation = listing.load_product_list_operation()
+                first_payload = listing.prepare_product_list_payload(operation, 1)
                 browser = listing.create_browser_graphql_page()
                 listing.initialize_browser_graphql_session(browser)
+            if args.keep_browser:
+                summary["screen_setup"] = confirm_screen_setup(first_payload["variables"]["destinationZipCode"])
+                write_reports(output, summary, results)
             rows = []
             for page in range(1, args.pages + 1):
                 console(f"[{args.category}] page {page}/{args.pages} | Requesting GraphQL... (details: run.log)")
                 with redirect_stdout(log):
-                    payload = listing.prepare_product_list_payload(operation, page)
+                    payload = first_payload if page == 1 else listing.prepare_product_list_payload(operation, page)
                     _, meta, page_rows = listing.collect_browser_graphql_page(page, payload, browser)
                 rows.extend(page_rows)
                 evidence_path = listing.RUN_ROOT / "raw/browser_graphql" / f"{listing.page_stem(page)}_offers.json"

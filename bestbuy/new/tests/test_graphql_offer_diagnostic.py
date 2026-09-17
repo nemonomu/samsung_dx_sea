@@ -33,6 +33,16 @@ def page(complete=True):
 
 
 class LiveDiagnosticTests(unittest.TestCase):
+    def test_screen_setup_requires_matching_zip_and_records_only_user_confirmation(self):
+        with redirect_stdout(io.StringIO()), patch("builtins.input", side_effect=["", "90210", "10010"]) as prompt:
+            setup = diagnostic.confirm_screen_setup("10010")
+        self.assertEqual(prompt.call_count, 3)
+        self.assertEqual(setup, {"status": "user_confirmed_zip", "zip_code": "10010"})
+        for answer in ("q", "Q", EOFError):
+            with self.subTest(answer=answer), redirect_stdout(io.StringIO()), patch("builtins.input", side_effect=[answer]):
+                with self.assertRaises(KeyboardInterrupt):
+                    diagnostic.confirm_screen_setup("10010")
+
     def test_manual_review_saves_opens_waits_then_closes_browser(self):
         events = []
         args = types.SimpleNamespace(category="REF", open_report=True, keep_browser=True)

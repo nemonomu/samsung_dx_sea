@@ -24,7 +24,7 @@ from .step00_config import (
     url_for_page,
 )
 from .step00_graphql_query import sanitize_product_list_query
-from .step00_offer_graphql import collect_graphql_offers, normalize_graphql_offer, uses_graphql_offers
+from .step00_offer_graphql import add_sponsored_offer_fields, collect_graphql_offers, normalize_graphql_offer, uses_graphql_offers
 from .step00_parse_pdp import absolute_bestbuy_url, extract_apollo_payloads, first_nested, nested_get
 from .step00_parse_search import merge_dict, parse_product as parse_search_product
 
@@ -322,6 +322,7 @@ def prepare_product_list_payload(operation, page):
             query,
             strip_fulfillment=STRIP_PRODUCT_LIST_FULFILLMENT,
         )
+    query = add_sponsored_offer_fields(query, CATEGORY)
 
     extensions = operation.get("extensions") or {
         "clientLibrary": {

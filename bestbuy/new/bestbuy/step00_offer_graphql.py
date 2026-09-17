@@ -21,6 +21,34 @@ def uses_graphql_offers(category):
     return str(category or "").strip().upper() in {"REF", "LDY"}
 
 
+def add_sponsored_offer_fields(query, category):
+    """Request PLP price inputs for media products, without changing selection.
+
+    The saved PLP request loads these fields only for detailed organic products.
+    Sponsored-only SKUs need the same fragment in their media-product selection.
+    Reject an unfamiliar template instead of silently leaving offers incomplete.
+    """
+    if not uses_graphql_offers(category):
+        return query
+    if not re.search(r"\bfragment\s+PriceExperienceInit_Product\s+on\s+Product\s*\{", query):
+        raise ValueError("sponsored_offer_query_missing_price_fragment")
+    pattern = re.compile(
+        r"(\bfragment\s+PlpViewSearchMediaProductFragment\s+on\s+SearchMediaProduct\s*\{)"
+        r"(.*?)(?=\bfragment\s|$)", re.DOTALL)
+    matches = list(pattern.finditer(query))
+    if len(matches) != 1:
+        raise ValueError("sponsored_offer_query_missing_media_fragment")
+    match = matches[0]
+    selection = re.compile(
+        r"(\bproduct\s*\{\s*\.\.\.\s*PlpViewSearchProductInfoFragment\b)"
+        r"(\s*\.\.\.\s*PriceExperienceInit_Product\b)?(\s*\})")
+    body, count = selection.subn(
+        lambda m: m[1] + " ...PriceExperienceInit_Product" + m[3], match[2])
+    if count != 1:
+        raise ValueError("sponsored_offer_query_unrecognized_media_selection")
+    return query[:match.start(2)] + body + query[match.end(2):]
+
+
 def offer_evidence(row):
     value = row.get(EVIDENCE_FIELD)
     if isinstance(value, str):

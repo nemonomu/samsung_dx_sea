@@ -44,6 +44,56 @@ class ApiBrowser:
 
 
 class OfferPipelineTests(unittest.TestCase):
+    def test_real_listing_template_adds_price_fragment_only_for_ref_ldy_media(self):
+        operation = json.loads((Path(__file__).resolve().parents[1] / "references/page_001_request.json").read_text(encoding="utf-8"))
+        original = copy.deepcopy(operation)
+        with patch.multiple(listing, CATEGORY="TV", SANITIZE_PRODUCT_LIST_QUERY=False,
+                            STRIP_PRODUCT_LIST_FULFILLMENT=False):
+            baseline = listing.prepare_product_list_payload(operation, 1)
+        for category in ("REF", "LDY", "TV", "HHP"):
+            with self.subTest(category=category), patch.multiple(
+                    listing, CATEGORY=category, SANITIZE_PRODUCT_LIST_QUERY=False,
+                    STRIP_PRODUCT_LIST_FULFILLMENT=False):
+                payload = listing.prepare_product_list_payload(operation, 1)
+            self.assertEqual(payload["variables"], baseline["variables"])
+            if category in {"REF", "LDY"}:
+                added = "product{...PlpViewSearchProductInfoFragment ...PriceExperienceInit_Product}"
+                self.assertEqual(payload["query"].count(added), 1)
+                self.assertEqual(payload["query"].replace(added, "product{...PlpViewSearchProductInfoFragment}"), baseline["query"])
+                self.assertEqual(api.add_sponsored_offer_fields(payload["query"], category), payload["query"])
+            else:
+                self.assertEqual(payload, baseline)
+        self.assertEqual(operation, original)
+
+    def test_unfamiliar_sponsored_request_fails_before_fetch(self):
+        for query in ("query Q { skuId }", "fragment PriceExperienceInit_Product on Product{skuId}"):
+            with self.assertRaisesRegex(ValueError, "sponsored_offer_query_"):
+                api.add_sponsored_offer_fields(query, "REF")
+            self.assertEqual(api.add_sponsored_offer_fields(query, "TV"), query)
+
+    def test_sponsored_only_price_data_reaches_offer_without_changing_selected_rows(self):
+        # Controlled response fixture for the added selection, not live acceptance.
+        sponsored = product("6634588", tier=True)
+        sponsored["name"] = {"short": "Sponsored fixture"}
+        graph = {"data": {"detailedProductSearch": {"documents": []},
+                          "search": {"withBestMedia": {"placements": [{
+                              "name": "SEARCH_SPONSORED_INGRID", "documentsGridView": {
+                                  "sponsoredDocuments": [{"source": "A", "product": sponsored}]}}]}}}}
+        with patch.object(listing, "CATEGORY", "REF"):
+            rows = listing.parse_page_rows(1, graph)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sku_id"], "6634588")
+        self.assertTrue(rows[0]["is_sponsored"])
+        self.assertEqual(rows[0]["product_name"], "Sponsored fixture")
+        api.collect_graphql_offers(rows, PAYLOAD, None, fetch=Replay([sponsored]))
+        self.assertEqual(rows[0]["offer"], "2")
+        self.assertEqual(final_offer({**rows[0], "category_key": "REF"}, []), "2")
+        del sponsored["price"]
+        rows[0]["raw_product_json"] = json.dumps(sponsored)
+        api.collect_graphql_offers(rows, PAYLOAD, None, fetch=Replay([sponsored]))
+        self.assertEqual(rows[0]["offer"], "")
+        self.assertIn("missing_price", api.offer_evidence(rows[0])["reason"])
+
     def listing_page(self, category, replay):
         rows = [{"sku_id": p["skuId"], "category_key": category, "offer_count": "1",
                  "raw_product_json": json.dumps(p),
