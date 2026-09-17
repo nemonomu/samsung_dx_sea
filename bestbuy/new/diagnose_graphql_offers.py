@@ -52,12 +52,16 @@ def request_errors(report):
     requests = list(report.get("requests", []))
     if report.get("listing_errors"):
         requests.append({"operation": "Listing", "response": {"errors": report["listing_errors"]}})
+    if report.get("ignored_listing_errors"):
+        requests.append({"operation": "Listing", "affects_offer": False,
+                         "response": {"errors": report["ignored_listing_errors"]}})
     for request in requests:
         response = request.get("response") or {}
         for error in response.get("errors", []) if isinstance(response, dict) else []:
             errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
                            "message": error.get("message"), "path": error.get("path"),
-                           "code": (error.get("extensions") or {}).get("code")})
+                           "code": (error.get("extensions") or {}).get("code"),
+                           "affects_offer": request.get("affects_offer", True)})
         if request.get("error"):
             errors.append({"operation": request.get("operation"), "attempt": request.get("attempt"),
                            "message": request["error"]})
@@ -171,7 +175,7 @@ td.number{text-align:center;font-weight:700;font-size:18px;white-space:nowrap}tr
     document += '<h2>실행 기록</h2><p><a href="run.log">상세 로그</a> · <a href="summary.json">요약 JSON</a> · <a href="offer_results.csv">검사 결과 CSV</a></p>'
     errors = [{"page": p["page"], **error} for p in summary.get("pages", []) for error in p.get("api_errors", [])]
     if errors:
-        document += '<h2>서버 오류 원문</h2><pre>' + esc(json.dumps(errors, ensure_ascii=False, indent=2)) + '</pre>'
+        document += '<h2>서버 오류 원문</h2><p>affects_offer: false는 offer 계산에 사용하지 않는 항목의 오류입니다. 배송·AR·별도 오픈박스 항목 오류는 기록하되 정상 offer 데이터는 검사합니다.</p><pre>' + esc(json.dumps(errors, ensure_ascii=False, indent=2)) + '</pre>'
     document += '<p class="muted">별도 테스트 폴더와 브라우저 프로필을 사용합니다. 상세 페이지 수집·DB 저장·S3 업로드는 실행하지 않습니다. 초기 목록 페이지는 세션 준비를 위해 한 번 열며, offer 숫자는 GraphQL 응답으로 계산합니다.</p></main></html>'
     (output / "report.html").write_text(document, encoding="utf-8")
     (output / "summary.txt").write_text(report_text(summary) + "\n", encoding="utf-8")
@@ -293,7 +297,11 @@ def main(argv=None):
                     console(f"  SKU {r['sku_id']} | offer={value} | {r['status']} | {r['product_name'][:55]}")
                 console(f"  rows={len(page_rows)} | listing HTTP={meta.get('status_code')} | unknown offers={meta.get('offer_graphql_unverified_rows', 0)}")
                 for error in errors:
-                    console("  API_ERROR " + json.dumps(error, ensure_ascii=True))
+                    if error.get("affects_offer", True):
+                        console("  API_ERROR " + json.dumps(error, ensure_ascii=True))
+                unrelated_count = sum(e.get("affects_offer") is False for e in errors)
+                if unrelated_count:
+                    console(f"  NON_OFFER_WARNINGS={unrelated_count} (details in report.html; offer inputs checked separately)")
             exit_code = 0 if summary["collection_status"] == "passed" else 2
         except KeyboardInterrupt:
             summary["collection_status"] = "interrupted"

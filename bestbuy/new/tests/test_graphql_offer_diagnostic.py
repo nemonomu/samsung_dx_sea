@@ -32,6 +32,13 @@ def page(complete=True):
 
 
 class LiveDiagnosticTests(unittest.TestCase):
+    def test_unrelated_errors_are_recorded_as_non_offer_warnings(self):
+        errors = diagnostic.request_errors({"ignored_listing_errors": [
+            {"message": "Error - Not Found", "path": ["product", "arModels"],
+             "extensions": {"code": "NOT_FOUND"}}]})
+        self.assertEqual(len(errors), 1)
+        self.assertFalse(errors[0]["affects_offer"])
+
     def test_rdp_server_error_message_and_path_are_visible(self):
         error = {"message": "Error - Internal Server Error", "path": ["productsBySkuIds"],
                  "extensions": {"code": "INTERNAL_SERVER_ERROR"}}

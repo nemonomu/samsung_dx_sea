@@ -151,3 +151,45 @@
   locally. Next: run REF one page on RDP to validate config/content/rebate
   requests after removing the failed bulk lookup, then examine actual values.
   No claim of live accuracy yet; the under-300 investigation remains deferred.
+
+## 12:52 KST (Asia/Seoul): inspect REF_20260916_234024_9cd0fb ZIP
+
+- User requested analysis of the RDP result archive at
+  `C:\Users\kensi\Desktop\project\log\REF_20260916_234024_9cd0fb.zip`.
+  Read selected JSON/CSV entries directly with Python `zipfile`; no extraction,
+  browser launch or new site request. Archive remains unchanged.
+- Actual run: REF one page, started 2026-09-16 23:40:24 -04:00, finished
+  23:40:51 -04:00, elapsed 27.24 seconds. Listing HTTP 200; 24 occurrences,
+  22 unique SKUs; zero passed offer rows, all 24 blank/unverified with
+  `listing_graphql_errors`. Offer request count was **zero**.
+- All 84 listing GraphQL errors are unrelated to main-card offer inputs:
+  68 `fulfillmentOptions` errors (extension code `401`), 16 `arModels` errors
+  (`NOT_FOUND`). Paths include both main products and nested open-box options.
+  The previous unconditional listing-error guard blocked all offers before
+  config/support requests. This is a collector error-handling defect, not proof
+  of an offer API or numeric counting failure in this run.
+- The five production module hashes in summary match local files after
+  normalizing Git Windows CRLF checkout endings. The expected revision ran.
+- Saved products for 6472693 / 6486389 / 6506246 contain progressively gift,
+  tiered and membership inputs, but no live config/content/rebate responses
+  were requested in this run; final displayed counts remain unverified.
+- Four sponsored-ingrid SKUs have no price object: 6468484, 6477390, 6634588,
+  6470555. They remain unknown, not zero. This missing sponsored data requires
+  separate follow-up; do not remove these rows or call the whole sample passed.
+- Fix in `step00_offer_graphql.py`: inspect the subtree immediately below the
+  listing `product`; only fulfillmentOptions, arModels and separate openBoxOptions
+  subtrees are classified as unrelated. Price/offers, ancestor-level, absent or
+  unknown error paths still block verification. Retain unrelated errors in raw
+  proof. No formula, page selection, navigation or fulfillment change.
+- Diagnostic reports label unrelated errors `affects_offer: false`. Console
+  shows a warning count, avoiding 84 repeated error lines; HTML retains full
+  error detail. Real offer/API errors remain visible and do not pass silently.
+- Offline verification: full `python -m unittest discover -s tests -p 'test_*.py'`
+  from `bestbuy/new`: **98 passed**, 1.702 seconds. Windows temp tests used
+  sandbox escalation. Also ran the new classifier on the actual ZIP's complete
+  84-error array: blocking 0, unrelated 84. This replay tests classification only,
+  not live collection. `git diff --check` passed.
+- Files changed: collector, diagnostic report, their two test files, this log.
+  Existing collected rows/requests/reports are untouched. Next: REF one-page live
+  rerun to inspect actual config/content/rebate behavior and remaining sponsored
+  gaps. Under-300 investigation remains deferred.

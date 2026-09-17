@@ -77,6 +77,29 @@ def graphql_offer_count(row):
     proof = offer_evidence(row)
     return proof.get("count", "") if proof.get("status") == "verified" else ""
 
+
+def partition_listing_errors(errors):
+    """Ignore only known sibling subtrees that cannot feed this offer count.
+
+    Inspect the field immediately below the listing product, not arbitrary path
+    substrings. Errors on price/offers, a product/ancestor, or unknown paths still
+    block certification. Open-box option products do not supply the main card's
+    price.openBoxCondition or its offers.
+    """
+    blocking, unrelated = [], []
+    for error in errors:
+        path = error.get("path") if isinstance(error, dict) else None
+        sibling = None
+        if isinstance(path, list) and "product" in path:
+            index = path.index("product") + 1
+            if index < len(path):
+                sibling = path[index]
+        if sibling in ("fulfillmentOptions", "arModels", "openBoxOptions"):
+            unrelated.append(error)
+        else:
+            blocking.append(error)
+    return blocking, unrelated
+
 # Defaults from the price-experience package, merged with live Platman JSON.
 DEFAULTS = {
     "plusX.membershipUpsell.enabled": True,
@@ -324,10 +347,12 @@ def collect_graphql_offers(rows, payload, browser, timeout=30, fetch=None, listi
                 "observed_at": report["observed_at"], **fields}
 
     try:
-        # Partial GraphQL errors can turn an unavailable field into a null that
-        # otherwise looks like a legitimate zero. Do not certify such a page.
-        if listing_errors:
-            report["listing_errors"] = listing_errors
+        # Price/offer errors can masquerade as valid nulls. Unrelated sibling
+        # fields may fail independently without invalidating the offer inputs.
+        blocking, unrelated = partition_listing_errors(listing_errors)
+        report["ignored_listing_errors"] = unrelated
+        if blocking:
+            report["listing_errors"] = blocking
             raise UnverifiedOffer("listing_graphql_errors")
         variables = payload.get("variables") or {}
         price_input = dict(required(variables, "productPriceInput", dict))

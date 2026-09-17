@@ -255,6 +255,41 @@ class GraphqlOfferTests(unittest.TestCase):
         self.assertEqual(rows[0]["offer"], "")
         self.assertEqual(replay.calls, [])
 
+    def test_unrelated_listing_errors_do_not_block_valid_offer_inputs(self):
+        replay = Replay([product(), product("6486389", tier=True), product("6506246", tier=True, member=True)])
+        rows = [{"sku_id": p["skuId"], "raw_product_json": json.dumps(p)} for p in replay.products]
+        errors = [{"message": "Error - Internal Server Error", "extensions": {"code": "401"},
+                   "path": ["detailedProductSearch", "documents", 0, "product", "fulfillmentOptions"]},
+                  {"message": "Error - Not Found", "extensions": {"code": "NOT_FOUND"},
+                   "path": ["detailedProductSearch", "documents", 0, "product", "arModels"]},
+                  {"message": "Error - Internal Server Error", "path": ["detailedProductSearch", "documents",
+                   0, "product", "openBoxOptions", 0, "product", "fulfillmentOptions"]}]
+        report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=replay, listing_errors=errors)
+        self.assertTrue(report["complete"])
+        self.assertEqual([r["offer"] for r in rows], ["1", "2", "3"])
+        self.assertEqual(report["ignored_listing_errors"], errors)
+
+    def test_unknown_product_and_offer_error_paths_still_block(self):
+        prefix = ["detailedProductSearch", "documents", 0, "product"]
+        for path in (None, [], prefix, prefix + ["price"], prefix + ["offers", "offers", 0],
+                     prefix + ["price", "fulfillmentOptions"], prefix + ["newUnknownField"], ["detailedProductSearch"]):
+            with self.subTest(path=path):
+                replay = Replay()
+                rows = [{"sku_id": "6472693", "raw_product_json": json.dumps(product())}]
+                report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=replay,
+                    listing_errors=[{"message": "failed", "path": path}])
+                self.assertFalse(report["complete"])
+                self.assertEqual(rows[0]["offer"], "")
+                self.assertEqual(replay.calls, [])
+
+    def test_sponsored_product_without_price_remains_unknown(self):
+        rows = [{"sku_id": "6468484", "raw_product_json": json.dumps({"skuId": "6468484", "condition": "new"})}]
+        report = api.collect_graphql_offers(rows, PAYLOAD, None, fetch=Replay(), listing_errors=[
+            {"path": ["detailedProductSearch", "documents", 0, "product", "arModels"]}])
+        self.assertFalse(report["complete"])
+        self.assertEqual(rows[0]["offer"], "")
+        self.assertIn("missing_price", rows[0]["offer_graphql_json"])
+
     def test_listing_context_missing_fields_and_wrong_sku_fail_closed(self):
         for raw in (None, "invalid JSON", json.dumps(product("6506246")), json.dumps({"skuId": "6472693"})):
             rows = [{"sku_id": "6472693", "raw_product_json": raw}]
