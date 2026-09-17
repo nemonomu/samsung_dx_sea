@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .step00_availability_policy import inactive_availability_fields
+from .step00_offer_graphql import EVIDENCE_FIELD, normalize_graphql_offer, uses_graphql_offers
 from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, KRW_PER_USD, bestbuy_category, old_pdp_url, rel_path
 
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
@@ -192,6 +193,10 @@ def main_attribute_map(rows):
         for key in fill_keys:
             if not target.get(key) and row.get(key):
                 target[key] = row.get(key)
+        if uses_graphql_offers(CATEGORY):
+            offer_row = normalize_graphql_offer(dict(target, sku_id=sku), sources=(row,), category=CATEGORY)
+            for key in ("offer", "offer_count", EVIDENCE_FIELD):
+                target[key] = offer_row[key]
     return attrs
 
 
@@ -409,6 +414,10 @@ def enrich_rows(rows, bsr, promotions, trends, main_attrs):
             out[key] = first_non_empty(out.get(key), value)
         out["product_name"] = first_non_empty(out.get("product_name"), bsr_attrs.get("product_name"))
         out["product_url"] = first_non_empty(out.get("product_url"), bsr_attrs.get("product_url"))
+        if uses_graphql_offers(CATEGORY):
+            offer_row = normalize_graphql_offer(dict(row, sku_id=sku), sources=(attrs, bsr_attrs), category=CATEGORY)
+            for key in ("offer", "offer_count", EVIDENCE_FIELD):
+                out[key] = offer_row[key]
         output.append(out)
     return output
 

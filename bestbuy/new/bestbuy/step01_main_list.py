@@ -24,6 +24,7 @@ from .step00_config import (
     url_for_page,
 )
 from .step00_graphql_query import sanitize_product_list_query
+from .step00_offer_graphql import collect_graphql_offers, normalize_graphql_offer, uses_graphql_offers
 from .step00_parse_pdp import absolute_bestbuy_url, extract_apollo_payloads, first_nested, nested_get
 from .step00_parse_search import merge_dict, parse_product as parse_search_product
 
@@ -797,6 +798,7 @@ def parse_product_occurrence(product, occurrence, extra=None):
         row["product_url"] = absolute_bestbuy_url(row["product_url"])
     if extra:
         row.update(extra)
+    normalize_graphql_offer(row, category=CATEGORY)
     return row
 
 
@@ -1855,13 +1857,23 @@ def browser_graphql_fetch_once(page, payload, browser_page):
         error = str(exc)
     if raw:
         response_path.write_text(str(raw), encoding="utf-8", errors="replace")
-    elapsed = round(time.perf_counter() - start, 3)
     rows = []
     if status_code_ok(status_code) and graph:
         try:
             rows = parse_page_rows(page, graph)
         except Exception as exc:
             parse_error = repr(exc)
+    offer_report = None
+    offer_counts = {}
+    offer_path = raw_dir / f"{stem}_offers.json"
+    if rows and uses_graphql_offers(CATEGORY):
+        offer_report = collect_graphql_offers(rows, payload, browser_page, timeout=BROWSER_GRAPHQL_JS_TIMEOUT)
+        offer_path.write_text(json.dumps(offer_report, indent=2, ensure_ascii=False), encoding="utf-8")
+        for row in rows:
+            evidence = json.loads(row["offer_graphql_json"])
+            offer_counts[evidence["status"]] = offer_counts.get(evidence["status"], 0) + 1
+        print(f"page={page:03d} offer_graphql={offer_counts} reason={offer_report['reason']}", flush=True)
+    elapsed = round(time.perf_counter() - start, 3)
     meta = {
         "page": page,
         "url": page_url,
@@ -1889,6 +1901,12 @@ def browser_graphql_fetch_once(page, payload, browser_page):
         "browser_graphql_profile_dir": rel_path(browser_graphql_profile_dir()),
         "browser_graphql_cache_dir": rel_path(browser_graphql_cache_dir()),
         "browser_graphql_navigate_each_page": int(BROWSER_GRAPHQL_NAVIGATE_EACH_PAGE),
+        "offer_graphql_path": rel_path(offer_path) if offer_report is not None else "",
+        "offer_graphql_complete": offer_report.get("complete") if offer_report is not None else None,
+        "offer_graphql_reason": offer_report.get("reason", "") if offer_report is not None else "",
+        "offer_graphql_request_count": len(offer_report["requests"]) if offer_report is not None else 0,
+        "offer_graphql_verified_rows": offer_counts.get("verified", 0),
+        "offer_graphql_unverified_rows": offer_counts.get("unverified", 0),
         "browser_graphql_context_url": getattr(browser_page, "url", "") or "",
     }
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2371,9 +2389,11 @@ def main():
             except ValueError:
                 pass
     listing_request_calls = sum(int(summary.get("attempt_count") or 1) for summary in page_benchmarks)
+    offer_graphql_calls = sum(int(item["meta"].get("offer_graphql_request_count") or 0) for item in raw_search)
     graphql_post_calls = listing_request_calls if LISTING_COLLECTION_MODE in {"graphql", "browser_graphql"} else 0
+    graphql_post_calls += offer_graphql_calls
     bootstrap_call_count = len(bootstrap_attempts)
-    total_request_calls = listing_request_calls + bootstrap_call_count
+    total_request_calls = listing_request_calls + offer_graphql_calls + bootstrap_call_count
     manifest = {
         "run_type": "step01_main_list",
         "run_root": rel_path(RUN_ROOT),
@@ -2403,6 +2423,10 @@ def main():
         "total_request_calls": total_request_calls,
         "listing_request_calls": listing_request_calls,
         "graphql_post_calls": graphql_post_calls,
+        "offer_graphql_request_calls": offer_graphql_calls,
+        "offer_graphql_unverified_pages": [
+            item["page"] for item in raw_search if item["meta"].get("offer_graphql_unverified_rows")
+        ],
         "bootstrap_call_count": bootstrap_call_count,
         "bootstrap_attempts": bootstrap_attempts,
         "page_count": len(page_benchmarks),

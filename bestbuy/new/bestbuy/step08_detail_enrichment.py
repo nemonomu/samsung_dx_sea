@@ -41,6 +41,7 @@ from .step00_config import (
 from .step00_availability_policy import ALL_AVAILABILITY_FIELDS
 from .step00_detail_benchmarks import append_detail_benchmark, write_detail_benchmarks
 from .step00_parse_pdp import event_data, extract_apollo_payloads
+from .step00_offer_graphql import graphql_offer_count, uses_graphql_offers
 
 
 def parse_float_sequence(value):
@@ -6500,7 +6501,8 @@ def output_row(target):
         "final_sku_price": final_price,
         "original_sku_price": original_price,
         "savings": savings,
-        "offer": first_non_empty(target.get("offer"), target.get("offer_count"), offer_count(products)),
+        "offer": graphql_offer_count(target) if uses_graphql_offers(CATEGORY) else
+        first_non_empty(target.get("offer"), target.get("offer_count"), offer_count(products)),
         "pick_up_availability": first_text_starting(
             "Pick up",
             pickup_text(pickup),

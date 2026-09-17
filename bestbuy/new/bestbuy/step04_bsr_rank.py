@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, rel_path
+from .step00_offer_graphql import EVIDENCE_FIELD, uses_graphql_offers
 
 RUN_DATE = os.getenv("BESTBUY_RUN_DATE", datetime.now().strftime("%Y%m%d"))
 RUN_ROOT = Path(os.getenv("BESTBUY_RUN_ROOT", DEFAULT_BESTBUY_RUN_ROOT)) / os.getenv("BESTBUY_BSR_RUN_ID", "bsr")
@@ -43,6 +44,8 @@ def main():
         "syndicated_review_summary_json",
     ]
     seen = set()
+    if any(uses_graphql_offers(row.get("category_key")) for row in rows):
+        carry_fields.append(EVIDENCE_FIELD)
     output = []
     for row in organic:
         sku = str(row.get("sku_id") or "").strip()

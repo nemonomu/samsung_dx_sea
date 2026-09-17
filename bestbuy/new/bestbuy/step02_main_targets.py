@@ -8,6 +8,7 @@ from pathlib import Path
 from requests import RequestException
 
 from .step00_config import DEFAULT_BESTBUY_RUN_ROOT, old_pdp_url, rel_path
+from .step00_offer_graphql import normalize_graphql_offer
 from .step00_parse_pdp import absolute_bestbuy_url, nested_get
 from .step00_parse_search import (
     listing_availability_values,
@@ -203,6 +204,7 @@ def enrich_sponsored_row(row, product):
         row["offer_count"] = normalized_offer
     apply_listing_availability(row, raw_product)
     row["raw_product_json"] = compact_json(raw_product)
+    normalize_graphql_offer(row)
     return row
 
 
@@ -238,6 +240,7 @@ def normalize_existing_listing_row(row):
     if sku and not row.get("product_url"):
         row["product_url"] = old_pdp_url(sku)
     apply_listing_availability(row, raw_product)
+    normalize_graphql_offer(row)
     return row
 
 
