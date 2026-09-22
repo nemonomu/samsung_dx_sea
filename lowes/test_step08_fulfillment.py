@@ -22,7 +22,7 @@ def parser_functions(category='REF'):
     names = {
         '_format_lead_date', '_fulfillment_slot', '_slot_text', '_slot_qty',
         'parse_productdetail',
-        'build_row', 'has_body', 'collect_fulfillment_display',
+        'build_row', 'has_body', 'collect_fulfillment_display', 'fetch_sku',
     }
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {
@@ -30,7 +30,14 @@ def parser_functions(category='REF'):
         'json': json,
         'lowes_product_type': lambda: category,
         'purchased_units_phrase': lambda value: value,
+        '_category_fallback_ref_type': lambda value: '',
+        'ref_capacity_from_description': lambda value: '',
         'api_display': display.api_display,
+        'pickup_display': display.pickup_display,
+        'service_selection': display.service_selection,
+        'needs_service_selection': display.needs_service_selection,
+        'VERIFIED_FLAGS': display.VERIFIED_FLAGS,
+        'DISPLAY_PROFILE': display.DISPLAY_PROFILE,
         'date_label': display.date_label,
         'promise_date': display.promise_date,
         'fulfillment_slot': display.fulfillment_slot,
@@ -39,7 +46,7 @@ def parser_functions(category='REF'):
         'review_response_labels': lambda responses: [],
         'parse_reviews': lambda *args: {},
         'now_iso': lambda: '2026-09-15T04:25:00',
-        'ZIP': '10010', 'STATE': 'NY', 'NEARBY_STORE': '1674',
+        'ZIP': '10010', 'STATE': 'NY', 'NEARBY_STORE': '1674', 'STORE_FMT': '0289',
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
@@ -49,6 +56,7 @@ def delivery_product():
     # Minimal synthetic response reproducing the observed disagreement between
     # the analytics lead days and the appointment displayed on the product page.
     return {
+        'additionalServices': False,
         'product': {
             'majorAppliance': True,
             'specs': [
@@ -92,6 +100,7 @@ def add_shipping(node):
         'itmLdTmDays': 4, 'itmLdTm': '09-18-2026-04:00 UTC',
     }
     node['location']['itemInventory']['itemAvailList'][0].update({
+        **node['itemInventory']['analyticsData']['parcel'],
         'isAvlSts': True, 'displayStatus': True,
     })
 
@@ -103,7 +112,7 @@ class FulfillmentTests(unittest.TestCase):
                 result = parse_node(delivery_product(), category)
                 self.assertEqual(result['delivery_availability'], 'Delivery Wed, Sep 16')
                 self.assertEqual(result['available_quantity_for_purchase_delivery'], 10)
-                self.assertEqual(result['pick_up_availability'], 'Pickup Ready Today')
+                self.assertEqual(result['pick_up_availability'], '')  # analytics-only pickup is not a display promise
                 self.assertEqual(result['fastest_delivery'], '')
 
     def test_appointment_uses_local_calendar_date(self):
@@ -128,17 +137,17 @@ class FulfillmentTests(unittest.TestCase):
                 }
                 self.assertEqual(formatter(slot), expected)
 
-    def test_missing_page_inventory_requires_screen_when_analytics_has_no_promise(self):
+    def test_missing_page_inventory_is_unresolved_without_analytics_guess(self):
         node = delivery_product()
         for location in (None, {}, {'itemInventory': None}, {'itemInventory': {'itemAvailList': 'invalid'}}):
             with self.subTest(location=location):
                 node['location'] = location
                 self.assertEqual(parse_node(node)['delivery_availability'], '')
-                self.assertEqual(display.api_display(node, FLAGS)[1], 'missing_delivery_date')
+                self.assertEqual(display.api_display(node, FLAGS)[1], 'missing_page_inventory')
 
-    def test_hidden_delivery_is_not_restored_by_installation_fallback(self):
+    def test_unavailable_delivery_is_not_restored_by_installation_fallback(self):
         node = delivery_product()
-        node['location']['itemInventory']['itemAvailList'][1]['displayStatus'] = False
+        node['location']['itemInventory']['itemAvailList'][1]['isAvlSts'] = False
         result = parse_node(node)
         self.assertEqual(result['delivery_availability'], '')
         self.assertEqual(result['available_quantity_for_purchase_delivery'], '')
@@ -180,10 +189,10 @@ class FulfillmentTests(unittest.TestCase):
                 self.assertEqual(result['delivery_availability'], 'Shipping Fri, Sep 18')
                 self.assertEqual(result['available_quantity_for_purchase_delivery'], 5)
 
-    def test_hidden_parcel_is_not_included_even_if_analytics_says_available(self):
+    def test_unavailable_parcel_is_not_included_even_if_analytics_says_available(self):
         node = delivery_product()
         add_shipping(node)
-        node['location']['itemInventory']['itemAvailList'][0]['displayStatus'] = False
+        node['location']['itemInventory']['itemAvailList'][0]['isAvlSts'] = False
         self.assertEqual(parse_node(node)['delivery_availability'], 'Delivery Wed, Sep 16')
 
     def test_both_api_methods_require_screen_instead_of_inventing_two_cards(self):
@@ -193,7 +202,7 @@ class FulfillmentTests(unittest.TestCase):
             parse_node(node)['delivery_availability'],
             '',
         )
-        self.assertEqual(display.api_display(node, FLAGS)[1], 'multiple_delivery_methods')
+        self.assertEqual(display.api_display(node, FLAGS)[1], 'missing_delivery_priority')
 
     def test_parcel_relative_dates_do_not_use_delivery_label(self):
         formatter = parser_functions()['_slot_text']
@@ -211,13 +220,13 @@ class FulfillmentTests(unittest.TestCase):
         }
         self.assertEqual(parser_functions()['_slot_text'](slot), 'Shipping Fri, Sep 18')
 
-    def test_shipping_can_fall_back_to_analytics_when_page_inventory_is_missing(self):
+    def test_missing_inventory_does_not_use_unverified_analytics_shipping(self):
         node = delivery_product()
         node['product']['majorAppliance'] = False
         add_shipping(node)
         node['itemInventory']['analyticsData']['truck']['isAvlSts'] = False
         node['location'] = {}
-        self.assertEqual(parse_node(node)['delivery_availability'], 'Shipping Fri, Sep 18')
+        self.assertEqual(parse_node(node)['delivery_availability'], '')
 
     def test_parcel_in_major_appliance_layout_is_delivery(self):
         node = delivery_product()
@@ -330,85 +339,50 @@ class DisplayIntegrationTests(unittest.TestCase):
                 expected = evidence['values'] if status == 'ok' else display.empty_display()
                 self.assertEqual({key: row[key] for key in display.FIELDS}, expected)
 
-    def test_request_zip_is_used_not_store_response_zip(self):
-        snapshot = {'path': '/pd/example/5015197285', 'contexts': [
-            {'sku': '5015197285', 'store': '1854', 'zip': '10010', 'state': 'NY'},
-        ]}
-        context = {'store': '1854', 'zip': '10010', 'state': 'NY'}
-        self.assertTrue(display.matching_snapshot(snapshot, '5015197285', context))
-        snapshot['contexts'].append({'sku': '5015197285', 'store': '1854', 'zip': '99503', 'state': 'AK'})
-        self.assertFalse(display.matching_snapshot(snapshot, '5015197285', context))
-        snapshot['contexts'].pop()
-        context['nearby_store'] = '1674'
-        self.assertFalse(display.matching_snapshot(snapshot, '5015197285', context))
-        snapshot['contexts'][0]['nearby_store'] = '1674'
-        self.assertTrue(display.matching_snapshot(snapshot, '5015197285', context))
-
-    def test_one_flag_request_per_store_and_no_repeated_navigation_after_block(self):
+    def test_collector_never_opens_or_fetches_product_page(self):
         namespace = parser_functions()
         calls = []
-        namespace['run_xhr_get'] = lambda driver, path: calls.append(path) or {'status': 200, 'body': json.dumps(FLAGS)}
-        namespace['read_display'] = lambda *args: calls.append('screen') or {
-            'status': 'unresolved', 'source': 'screen', 'reason': 'page_blocked', 'values': display.empty_display(),
-        }
+        namespace['run_xhr_get'] = lambda driver, path, **kwargs: calls.append(path) or {'status': 403}
+        class NoBrowser:
+            def __getattr__(self, name):
+                raise AssertionError('Unexpected browser access: ' + name)
         node = delivery_product()
-        add_shipping(node)
         node['product']['pdURL'] = '/pd/example/sample'
         response = {'status': 200, 'body': json.dumps({'productDetails': {'sample': node}})}
         cache = {}
         collect = namespace['collect_fulfillment_display']
-        collect(None, 'sample', response, '0289', cache)
-        result = collect(None, 'sample', response, '0289', cache)
-        self.assertEqual(calls, ['/pd/example/sample', 'screen'])
-        self.assertEqual(json.loads(result['body'])['source'], 'screen_skipped')
-        collect(None, 'sample', response, '1854', cache)
-        self.assertEqual(len(calls), 4)
-        self.assertEqual(cache['0289']['screen_checks'], 1)
-        self.assertEqual(cache['0289']['unresolved'], 2)
+        for store in ('0289', '0289', '1854'):
+            result = json.loads(collect(NoBrowser(), 'sample', response, store, cache)['body'])
+            self.assertEqual(result['source'], 'api')
+            self.assertEqual(result['context']['store'], store)
+        self.assertEqual(calls, [])
+        self.assertEqual(cache['0289']['screen_checks'], 0)
+        self.assertFalse(hasattr(display, 'read_display'))
 
-    def test_screen_check_waits_for_stable_values_and_restores_timeout(self):
-        context = {'store': '1854', 'zip': '10010', 'state': 'NY'}
-        snapshot = {'path': '/pd/example/5015197285', 'cards': hisense_cards(), 'contexts': [
-            {'sku': '5015197285', 'store': '1854', 'zip': '10010', 'state': 'NY'},
-        ]}
-        class Clock:
-            value = 0
-            def monotonic(self): return self.value
-            def sleep(self, seconds): self.value += seconds
-        class Driver:
-            timeouts = SimpleNamespace(page_load=75)
-            navigations = []
-            timeout_values = []
-            def get(self, path): self.navigations.append(path)
-            def set_page_load_timeout(self, value): self.timeout_values.append(value)
-            def execute_script(self, script): return snapshot
-        driver = Driver()
-        with patch.object(display, 'time', Clock()):
-            result = display.read_display(driver, '5015197285', '/pd/example/5015197285', context)
-        self.assertEqual(result['status'], 'ok')
-        self.assertEqual(result['values'], display.displayed_fields(hisense_cards()))
-        self.assertEqual(len(driver.navigations), 1)
-        self.assertEqual(driver.timeout_values, [12, 75])
+    def test_service_failure_does_not_stop_remaining_products_or_navigate(self):
+        namespace = parser_functions()
+        calls = []
+        namespace['run_xhr_get'] = lambda driver, path, **kwargs: calls.append(path) or {'status': 403}
+        node = delivery_product()
+        node['additionalServices'] = True
+        response = {'status': 200, 'body': json.dumps({'productDetails': {'sample': node}})}
+        result = json.loads(namespace['collect_fulfillment_display'](None, 'sample', response, '0289', {})['body'])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].startswith('/purchase/api/items/sample/additionalServices?storeNumber=1674&'))
+        self.assertNotIn('/pd/', calls[0])
+        self.assertEqual(result['values']['delivery_availability'], '')
+        self.assertIn('services_http_403', result['reason'])
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['values']['available_quantity_for_purchase_delivery'], 10)
 
-    def test_screen_mismatch_and_pickup_only_loading_never_save_success(self):
-        for mismatch in (True, False):
-            with self.subTest(mismatch=mismatch):
-                snapshot = {'path': '/pd/example/5015197285', 'cards': hisense_cards() if mismatch else hisense_cards()[:1],
-                            'contexts': [{'sku': '5015197285', 'store': '1854',
-                                          'zip': '99503' if mismatch else '10010', 'state': 'NY'}]}
-                class Clock:
-                    value = 0
-                    def monotonic(self): return self.value
-                    def sleep(self, seconds): self.value += seconds
-                driver = SimpleNamespace(
-                    timeouts=SimpleNamespace(page_load=75), set_page_load_timeout=lambda value: None,
-                    get=lambda path: None, execute_script=lambda script: snapshot,
-                )
-                with patch.object(display, 'time', Clock()):
-                    result = display.read_display(driver, '5015197285', '/pd/example/5015197285',
-                                                  {'store': '1854', 'zip': '10010', 'state': 'NY'}, wait_timeout=2)
-                self.assertEqual(result['status'], 'unresolved')
-                self.assertEqual(result['values'], display.empty_display())
+    def test_malformed_product_does_not_inherit_listing_fields(self):
+        namespace = parser_functions()
+        response = {'status': 200, 'body': 'not json'}
+        evidence = namespace['collect_fulfillment_display'](None, 'sample', response, '0289', {})
+        responses = {'productdetail': response, 'fulfillment_display': evidence}
+        src = dict.fromkeys((*display.FIELDS, 'pick_up_availability', 'available_quantity_for_purchase_pickup'), 'OLD')
+        row = namespace['build_row'](src, 'sample', responses)
+        self.assertTrue(all(row[k] == '' for k in src))
 
 
 if __name__ == '__main__':

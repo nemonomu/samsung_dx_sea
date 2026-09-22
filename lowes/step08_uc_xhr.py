@@ -1,5 +1,5 @@
 """
-Detail/Review enrichment via UC + 4 XHR per SKU (Plan D).
+Detail/Review enrichment via UC and same-origin APIs (Plan D).
 
 One UC browser session navigates to lowes.com (seed Akamai cookies),
 then iterates final_targets SKUs doing same-origin XHRs:
@@ -7,8 +7,9 @@ then iterates final_targets SKUs doing same-origin XHRs:
   - GET  /rnr/r/get-by-product/{sku}?sortBy=newestFirst&offset=N (covers 51,52, 53 reviews)
   - POST /pythia-recs-svc/v2/compare                            (covers 54)
 
-Display flags use one HTML XHR per store. Ambiguous delivery methods additionally
-read the rendered PDP cards in the same region, with a bounded wait.
+Delivery uses productdetail plus the read-only additionalServices API when needed.
+No product HTML fetch or PDP navigation is used. Unknown display inputs are logged
+and left blank, using the versioned guest rendering profile in step08_fulfillment.
 
 Zero ZenRows cost. Spec 41~54 fully covered (43/44/45 saved as raw labels).
 """
@@ -27,8 +28,9 @@ from .step00_config import DEFAULT_LOWES_RUN_ROOT, load_env, redact_sensitive, l
 from .step00_erd_schema import retailer_sku_name_text
 from .step00_uc import launch_chrome
 from .step08_fulfillment import (
-    api_display, date_label, display_flags, empty_display, fulfillment_slot,
-    promise_date, read_display,
+    api_display, date_label, empty_display, fulfillment_slot,
+    promise_date, pickup_display, service_selection, needs_service_selection,
+    DISPLAY_PROFILE, VERIFIED_FLAGS,
 )
 
 
@@ -98,7 +100,9 @@ CATEGORY_BY_PRODUCT = {
 
 XHR_GET = r"""
     const done = arguments[arguments.length - 1];
-    fetch(arguments[0], {credentials:'include', headers:{'accept':'application/json'}})
+    const headers = Object.assign({'accept':'application/json'},
+      typeof arguments[1] === 'object' ? arguments[1] : {});
+    fetch(arguments[0], {credentials:'include', headers})
       .then(async r => done({status: r.status, body: await r.text()}))
       .catch(e => done({status:'err', error: String(e && e.message || e)}));
 """
@@ -220,9 +224,10 @@ def reseed_for_alt(driver):
     return elapsed
 
 
-def run_xhr_get(driver, path):
+def run_xhr_get(driver, path, headers=None):
     try:
-        return driver.execute_async_script(XHR_GET, path)
+        args = (path,) if headers is None else (path, headers)
+        return driver.execute_async_script(XHR_GET, *args)
     except Exception as exc:
         return {'status': 'err', 'error': f'{type(exc).__name__}: {exc}'}
 
@@ -327,45 +332,57 @@ def fetch_reviews_until_target(driver, sku):
 
 
 def collect_fulfillment_display(driver, sku, response, store, flag_cache):
+    """API-only display evidence. Never fetch or navigate to a /pd/ page."""
     context = {'store': store, 'zip': ZIP, 'state': STATE, 'nearby_store': NEARBY_STORE}
-    try:
-        node = json.loads(response.get('body') or '{}').get('productDetails', {}).get(str(sku)) or {}
-    except (TypeError, ValueError):
-        node = {}
-    path = (node.get('product') or {}).get('pdURL') or ''
-    if store not in flag_cache:
-        # One HTML XHR per serving-store context, without rendering the PDP.
-        # Keep only the allowlisted display flags, never the document itself.
-        if path.startswith('/pd/') and path.endswith('/' + str(sku)):
-            html = run_xhr_get(driver, path)
-            flags = display_flags(html.get('body', '')) if html.get('status') == 200 else {}
-        else:
-            flags = {}
-        flag_cache[store] = {'flags': flags, 'screen_blocked': False,
-                             'screen_checks': 0, 'unresolved': 0, 'screen_seconds': 0}
-    state = flag_cache[store]
+    state = flag_cache.setdefault(store, {
+        'flags': dict(VERIFIED_FLAGS), 'profile': DISPLAY_PROFILE,
+        'screen_checks': 0, 'unresolved': 0, 'screen_seconds': 0,
+        'services_blocked': False,
+    })
     flags = state['flags']
-    values, reason = api_display(node, flags)
-    evidence = {'status': 'ok', 'source': 'api', 'values': values, 'context': context, 'flags': flags}
-    if reason:
-        if state['screen_blocked']:
-            evidence = {'status': 'unresolved', 'source': 'screen_skipped', 'values': empty_display(),
-                        'context': context, 'reason': 'screen_blocked_in_this_context'}
-        else:
-            evidence = read_display(driver, sku, path, context)
-            state['screen_checks'] += 1
-            state['screen_seconds'] += evidence.get('elapsed_seconds', 0)
-            if evidence.get('reason') == 'page_blocked':
-                state['screen_blocked'] = True
-        evidence.update(flags=flags, trigger=reason)
-        if evidence['status'] != 'ok':
-            state['unresolved'] += 1
-            print(f'[fulfillment] sku={sku} {evidence["status"]}: {evidence.get("reason", "unknown")}')
-    return {'status': evidence['status'], 'body': json.dumps(evidence, ensure_ascii=False)}
+    try:
+        payload = json.loads(response.get('body') or '{}')
+        node = payload.get('productDetails', {}).get(str(sku)) or {}
+        if not isinstance(node, dict):
+            node = {}
+    except (TypeError, ValueError, AttributeError):
+        payload, node = {}, {}
+    services, service_reason = None, ''
+    if node.get('additionalServices') is False:
+        services = {'rtf': False, 'eligible_methods': None}
+    elif needs_service_selection(node) and state['services_blocked']:
+        service_reason = 'services_blocked_in_this_context'
+    elif needs_service_selection(node):
+        # Match ServiceDiscovery's guest request; it uses the nearby delivery
+        # store, not the pickup store. Project display inputs, never persist its
+        # full context/user payload in raw artifacts or the CSV.
+        try:
+            service_response = run_xhr_get(driver,
+                f'/purchase/api/items/{sku}/additionalServices?storeNumber={int(NEARBY_STORE or store)}'
+                f'&quantity=1&zipCode={ZIP}&stateCode={STATE}&userType=REGULAR&isSDV2Enabled=true',
+                headers={'content-type': 'application/json', 'x-requested-with': 'XMLHttpRequest',
+                         'x-include-context': 'true'})
+            services, service_reason = service_selection(service_response)
+            if service_response.get('status') in (401, 403, 429):
+                state['services_blocked'] = True
+        except Exception as exc:
+            service_reason = 'services_' + type(exc).__name__
+    values, reason = api_display(node, flags, services=services)
+    pickup, pickup_reason = pickup_display(node, payload.get('storeDetails'), flags)
+    values.update(pickup)
+    reasons = ';'.join(dict.fromkeys(x for x in (reason, pickup_reason, service_reason) if x))
+    status = ('partial' if any(value != '' for value in values.values()) else 'unresolved') if reasons else 'ok'
+    evidence = {'status': status, 'source': 'api', 'values': values, 'context': context,
+                'flags': flags, 'profile': DISPLAY_PROFILE, 'reason': reasons,
+                'services': services, 'elapsed_seconds': 0}
+    if reasons:
+        state['unresolved'] += 1
+        print(f'[fulfillment] sku={sku} {status}: {reasons}')
+    return {'status': status, 'body': json.dumps(evidence, ensure_ascii=False)}
 
 
 def fetch_sku(driver, sku, category_id, parent_category, store=None, flag_cache=None):
-    """Run 4 XHRs for a SKU. `store` overrides STORE_FMT for productdetail URL + compare body."""
+    """Fetch API data; `store` overrides productdetail and compare store context."""
     store = store or STORE_FMT
     out = {}
     out['productdetail'] = run_xhr_get(driver, f'/wpd/{sku}/productdetail/{store}/Guest/{ZIP}?nearByStore={NEARBY_STORE}&zipState={STATE}')
@@ -547,10 +564,8 @@ def parse_productdetail(sku, body, display_configuration=None):
     spm = node.get('socialProofingMessages', {}) or {}
     out['number_of_units_purchased_past_week'] = purchased_units_phrase(spm.get('socialProofingMessage', ''))
 
-    inv = (node.get('itemInventory', {}) or {}).get('analyticsData', {}) or {}
-    pickup = inv.get('pickup', {}) or {}
-    out['available_quantity_for_purchase_pickup'] = _slot_qty(pickup)
-    out['pick_up_availability'] = _slot_text(pickup)
+    pickup, _ = pickup_display(node, obj.get('storeDetails'), display_configuration)
+    out.update(pickup)
     display, _ = api_display(node, display_configuration)
     out.update(display)
 
@@ -775,11 +790,12 @@ def build_row(src, sku, responses, serving_store=None):
         evidence = json.loads((responses.get('fulfillment_display') or {}).get('body') or '{}')
         row.update(parse_productdetail(sku, responses['productdetail']['body'], evidence.get('flags')))
         if evidence:
-            # Explicit blanks prevent an unverified API guess or old list value
-            # from leaking into final_output when the screen check fails.
-            row.update(empty_display())
+            # Clear all six original columns before applying verified values.
+            # An unresolved field must never inherit stale listing information.
+            fields = (*empty_display(), 'pick_up_availability', 'available_quantity_for_purchase_pickup')
+            row.update(dict.fromkeys(fields, ''))
             if evidence.get('status') in ('ok', 'partial'):
-                row.update({key: evidence.get('values', {}).get(key, '') for key in empty_display()})
+                row.update({key: evidence.get('values', {}).get(key, '') for key in fields})
             row['fulfillment_display_source'] = evidence.get('source', '')
             row['fulfillment_display_status'] = evidence.get('status', '')
             row['fulfillment_display_reason'] = evidence.get('reason', '')

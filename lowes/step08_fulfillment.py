@@ -1,15 +1,14 @@
-"""Lowe's display rules and bounded, same-region checks for ambiguous inventory.
+"""Lowe's API display rules for the verified guest layout.
 
 The productdetail methods are shipping options, not necessarily separate cards.
-Keep simple cases on XHR; read rendered cards when selecting a card would require
-guessing UI eligibility, pricing, or the customer's selected delivery option.
+Use API inputs and the verified guest rendering profile. Unsupported cases stay
+explicitly unresolved; the collector never navigates to a product page.
 This module has no crawler/configuration imports and can be tested offline.
 """
 import json
+import math
 import re
-import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 
 
 FIELDS = (
@@ -104,55 +103,310 @@ def promise_date(slot, parcel=False):
             or next((path.get('promiseDate') for path in paths if path.get('promiseDate')), None))
 
 
-def api_display(node, flags=None, now=None):
-    """Return (fields, reason_for_screen_check). Never join underlying methods."""
-    result = empty_display()
-    flags = flags or {}
-    analytics = (node.get('itemInventory') or {}).get('analyticsData') or {}
-    slots = [fulfillment_slot(node, analytics, key, kind) for key, kind in (
-        ('truck', 'Delivery'), ('parcel', 'Parcel'),
-        ('expeditedDelivery', 'ExpeditedDelivery'), ('fastTruck', 'FAST_TRUCK'),
-    )]
-    regular = [slot for slot in slots[:2] if available(slot)]
-    if any(available(slot) for slot in slots[2:]):
-        return result, 'fast_delivery_display'
-    if len(regular) > 1:
-        return result, 'multiple_delivery_methods'
-    if not regular:
+# The page's guest layout captured on 2026-09-22. This is an explicit,
+# versioned rendering profile, not a claim that productdetail contains UI flags.
+DISPLAY_PROFILE = 'select_inventory_display/0_304_0:guest:20260922'
+VERIFIED_FLAGS = dict(zip(FLAG_NAMES, (True, True, False)))
+
+
+def inventory_items(node):
+    location = node.get('location') or {}
+    if not isinstance(location, dict):
+        return None
+    inventories = location.get('itemInventoryList')
+    inventory = inventories[0] if isinstance(inventories, list) and inventories else location.get('itemInventory')
+    items = inventory.get('itemAvailList') if isinstance(inventory, dict) else None
+    return items if isinstance(items, list) and all(isinstance(x, dict) for x in items) else None
+
+
+def method(slot):
+    return re.sub(r'[_\s]', '', str(slot.get('fulfillmentType') or slot.get('fullMtdMsg') or '')).lower()
+
+
+def eligible(slot):
+    if not slot or slot.get('isAvlSts') is not True:
+        return False
+    minimum = slot.get('orderItemMinQty')
+    return not minimum or (isinstance(minimum, (int, float))
+                           and isinstance(slot.get('totalQty'), (int, float))
+                           and slot['totalQty'] >= minimum)
+
+
+def needs_service_selection(node):
+    return node.get('additionalServices') is True and any(
+        method(item) != 'pickup' and eligible(item) for item in inventory_items(node) or []
+    )
+
+
+def display_quantity(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0 or int(value) != value):
+        return ''
+    return '5000+' if value > 5000 else int(value)
+
+
+def is_major(product):
+    return (product.get('majorAppliance') is True
+            or str(product.get('productMerchClass') or '').lower() == 'major_appliance'
+            or str((product.get('merchandisingHierarchy') or {}).get('productGroup')) in APPLIANCE_GROUPS)
+
+
+def service_selection(response):
+    """Project only display inputs from the read-only additionalServices API.
+
+    ServiceDiscovery 0_124_0 defaults CUSTOM_RTF to its first service after
+    sorting descriptions descending. Other service selections need independent
+    evidence; do not treat installAvailInd as a selected installation.
+    """
+    if not isinstance(response, dict) or response.get('status') != 200:
+        return None, 'services_http_' + str((response or {}).get('status', 'missing'))
+    try:
+        payload = json.loads(response.get('body') or '{}')
+    except (ValueError, TypeError):
+        return None, 'invalid_services_json'
+    services = payload.get('additionalServices') if isinstance(payload, dict) else None
+    if not isinstance(services, dict) or services.get('alerts'):
+        return None, 'missing_or_restricted_services'
+    if any(not isinstance(services.get(key, []), list) for key in ('CUSTOM_RTF', 'ILB', 'LAB')):
+        return None, 'invalid_services_shape'
+    # Premium/default installation or assembly can change the selected method.
+    for key in ('ILB', 'LAB'):
+        for item in services.get(key) or []:
+            if not isinstance(item, dict) or any(item.get(k) for k in (
+                'selected', 'isDefaultSelected', 'isPremiumInstallation', 'mandatory',
+            )):
+                return None, 'unsupported_default_service'
+    rtf = services.get('CUSTOM_RTF') or []
+    if not rtf:
+        return {'rtf': False, 'eligible_methods': None}, ''
+    if any(not isinstance(x, dict) or not isinstance(x.get('description'), str) for x in rtf):
+        return None, 'invalid_rtf_services'
+    item = sorted(rtf, key=lambda x: x['description'], reverse=True)[0]
+    types = item.get('avlFulfillTypes')
+    if item.get('alerts') or not isinstance(types, list) or not all(isinstance(x, str) for x in types):
+        return None, 'missing_rtf_fulfillments'
+    mapping = {'SD': ('delivery', 'fasttruck'), 'ED': ('expediteddelivery',),
+               'SH': ('parcel',), 'DDC': ('parcel',), 'SP': ('pickup',)}
+    allowed = sorted({kind for code in types for kind in mapping.get(code, ())})
+    if not allowed or 'ID' in types:
+        return None, 'unsupported_installer_delivery'
+    return {'rtf': True, 'eligible_methods': allowed}, ''
+
+
+def pickup_display(node, store_details=None, flags=None, now=None):
+    result = {'pick_up_availability': '', 'available_quantity_for_purchase_pickup': ''}
+    items = inventory_items(node)
+    if items is None:
+        return result, 'missing_pickup_inventory'
+    if sum(method(x) == 'pickup' for x in items) > 1:
+        return result, 'duplicate_pickup_inventory'
+    slot = next((x for x in items if method(x) == 'pickup'), {})
+    if not eligible(slot):
+        if any(x.get('isAvlSts') for x in slot.get('nearestStores') or []):
+            return result, 'nearby_pickup_not_verified'
         return result, ''
+    flags = flags or {}
+    if any(k not in flags for k in FLAG_NAMES):
+        return result, 'unknown_pickup_display_flags'
+    onhand, total = slot.get('onhandQty'), slot.get('totalQty')
+    quantity_reason = ''
+    if flags['enableNetworkStock']:
+        if display_quantity(onhand) == '' or display_quantity(total) == '':
+            quantity_reason = 'missing_pickup_quantity'
+        elif onhand > 0 or total > 0:
+            result['available_quantity_for_purchase_pickup'] = display_quantity(onhand if onhand >= 1 else total)
+    store_details = store_details or {}
+    # Never use the delivery ZIP timezone for a pickup store.
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        zone = ZoneInfo(store_details.get('timeZone') or store_details.get('storeTZ') or '')
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return result, 'missing_pickup_store_timezone'
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        return result, 'missing_current_timezone'
+    current = current.astimezone(zone)
+    promised = date_value(slot.get('itmLdDateTm'))
+    if promised is not None and promised.tzinfo is not None:
+        local = promised.astimezone(zone)
+        hours = (local - current).total_seconds() / 3600
+    else:
+        local = date_value(slot.get('itmLdTm'))
+        if local is None:
+            return result, 'missing_pickup_date'
+        hours = None
+    days = (local.date() - current.date()).days
+    major = is_major(node.get('product') or {})
+    three = flags.get('enableThreeTileDesign') and not major
+    if hours is not None and hours < 0:
+        return result, 'expired_pickup_promise'
+    if hours is not None and hours < 3:
+        label = 'within 3 hrs' if three else 'Ready within 3 hrs'
+    elif days == 0:
+        label = 'Today' if three else 'Ready Today'
+    elif days == 1:
+        prefix = ''
+        if promised is not None and promised.tzinfo is not None:
+            day = local.strftime('%A')
+            entries = store_details.get('storeHours') or []
+            hours_entry = next((x.get('day', {}) for x in entries
+                                if isinstance(x, dict) and isinstance(x.get('day'), dict)
+                                and x['day'].get('day') == day), {})
+            opening = hours_entry.get('open')
+            try:
+                hour, minute, second = map(int, opening.split('.'))
+                processing = (hour + 3) % 24
+            except (AttributeError, ValueError):
+                return result, 'missing_pickup_store_hours'
+            # The UI compares the promise's own clock to opening + 3 hours.
+            if (promised.hour, promised.minute, promised.second) <= (processing, minute, second):
+                prefix = str(processing % 12 or 12) + (f':{minute:02}' if minute else '')
+                prefix += ('pm' if processing >= 12 else 'am') + ' '
+        label = ('' if three else ('Ready by ' if prefix else 'Ready ')) + prefix + 'Tomorrow'
+    else:
+        label = date_label(local.isoformat())
+        if not slot.get('itmLdDateTm') and not slot.get('isDynamicLeadTime'):
+            label += ' (Est.)'
+        if not three:
+            label = 'Ready by ' + label
+    result['pick_up_availability'] = 'Pickup ' + label
+    return result, quantity_reason
+
+
+def api_display(node, flags=None, now=None, services=None):
+    """Render verified guest cases from API data; return explicit partial reasons.
+
+    No HTML request or browser navigation is a fallback. Inventory availability,
+    card quantity, selected option and date are separate decisions.
+    """
+    result = empty_display()
+    items = inventory_items(node)
+    if items is None:
+        return result, 'missing_page_inventory'
+    kinds = [method(x) for x in items]
+    if len(kinds) != len(set(kinds)):
+        return result, 'duplicate_fulfillment_methods'
+    active = [x for x in items if method(x) != 'pickup' and eligible(x)]
+    if not active:
+        return result, ''
+    flags = flags or {}
     if any(name not in flags for name in FLAG_NAMES):
         return result, 'unknown_display_flags'
-    if flags['enableNetworkStock'] is not True or flags['isApplianceSwimLaneEnabled']:
+    if flags['isApplianceSwimLaneEnabled']:
         return result, 'different_display_configuration'
-    slot = regular[0]
     product = node.get('product') or {}
-    major = (product.get('majorAppliance') is True
-             or str(product.get('productMerchClass') or '').lower() == 'major_appliance'
-             or str((product.get('merchandisingHierarchy') or {}).get('productGroup')) in APPLIANCE_GROUPS)
-    parcel = slot.get('fulfillmentType') == 'Parcel'
-    label = 'Shipping' if parcel and flags['enableThreeTileDesign'] and not major else 'Delivery'
-    value = promise_date(slot, parcel=parcel)
-    date = date_label(value, now=now, relative=parcel)
-    # Parcel's display utility abbreviates tomorrow, but prints today's date.
-    if parcel and date == 'Today':
-        date = date_label(value)
-    if not date:
-        # itmLdTmDays=0 describes processing/lead time, not a missing parcel promise.
-        return result, 'missing_delivery_date'
-    if parcel and not slot.get('isDynamicLeadTime'):
-        return result, 'estimated_delivery_date'
-    qty = slot.get('totalQty')
-    if qty is None:
-        return result, 'missing_display_quantity'
-    try:
-        qty = int(qty)
-    except (TypeError, ValueError):
-        return result, 'invalid_display_quantity'
-    if qty > 5000:
-        return result, 'capped_display_quantity'
-    result['delivery_availability'] = f'{label} {date}'
-    result['available_quantity_for_purchase_delivery'] = qty if qty > 0 else ''
-    return result, ''
+    if product.get('groupType') or product.get('marketplaceSeller'):
+        return result, 'unsupported_product_layout'
+    if any(method(x) not in ('parcel', 'delivery', 'fasttruck', 'expediteddelivery') for x in active):
+        return result, 'unknown_delivery_method'
+    major = is_major(product)
+    three = bool(flags['enableThreeTileDesign'] and not major)
+    parcel = next((x for x in active if method(x) == 'parcel'), None)
+    # The additionalServices API may fail independently; preserve a verified
+    # shipping card while leaving service-dependent delivery values unresolved.
+    issues = []
+    if services is None:
+        if node.get('additionalServices') is False:
+            services = {'rtf': False, 'eligible_methods': None}
+        else:
+            issues.append('unknown_service_selection')
+    allowed = services.get('eligible_methods') if services is not None else None
+    delivery = [x for x in active if method(x) != 'parcel'
+                and (allowed is None or method(x) in allowed)]
+
+    def quantity(slots):
+        if not flags['enableNetworkStock']:
+            return ''
+        values = [x.get('totalQty') for x in slots]
+        if not values or any(display_quantity(x) == '' for x in values):
+            issues.append('missing_display_quantity')
+            return ''
+        return display_quantity(max(values))
+
+    def calendar(slot, kind):
+        if kind == 'parcel':
+            value = promise_date(slot, parcel=True)
+        elif kind in ('delivery', 'fasttruck'):
+            value = slot.get('itmConsolidationApptDate') or slot.get('itmConsolidationDate')
+        else:
+            value = promise_date(slot)
+        label = date_label(value, now=now, relative=True)
+        if not label:
+            issues.append('missing_' + kind + '_promise')
+            return ''
+        if kind != 'expediteddelivery' and label == 'Today':
+            label = date_label(value)
+        if kind == 'parcel' and label != 'Tomorrow' and not slot.get('isDynamicLeadTime'):
+            label += ' (Est.)'
+        return label
+
+    def selected(slots):
+        if len(slots) == 1:
+            return slots[0]
+        priorities = [x.get('priority') for x in slots]
+        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or x <= 0 for x in priorities):
+            issues.append('missing_delivery_priority')
+            return None
+        first = min(priorities)
+        if priorities.count(first) != 1:
+            issues.append('ambiguous_delivery_priority')
+            return None
+        return slots[priorities.index(first)]
+
+    if three and parcel and services is not None and (allowed is None or 'parcel' in allowed):
+        label = calendar(parcel, 'parcel')
+        if label:
+            result['delivery_availability'] = 'Shipping ' + label
+        result['available_quantity_for_purchase_delivery'] = quantity([parcel])
+    candidates = delivery if three else [x for x in active if allowed is None or method(x) in allowed]
+    if not candidates:
+        return result, ';'.join(dict.fromkeys(issues))
+    chosen = selected(candidates)
+    if chosen is None:
+        return result, ';'.join(dict.fromkeys(issues))
+    kind = method(chosen)
+    if three:
+        # Separate Shipping and Fast Delivery cards have been verified. A second
+        # ordinary Delivery card cannot be silently squeezed into the same column.
+        label = calendar(chosen, kind)
+        if kind != 'expediteddelivery' or label not in ('Today', 'Tomorrow') or services is None or services.get('rtf'):
+            issues.append('unverified_three_tile_delivery_title')
+        else:
+            # Free scheduled-delivery promos can change the title to Delivery.
+            promotion = (node.get('location') or {}).get('promotion') or {}
+            if promotion.get('productLevelPromotions'):
+                issues.append('delivery_promotion_title_not_verified')
+            else:
+                result['fastest_delivery'] = 'Get it ' + label
+                grouped = [x for x in items if x.get('fullMtdMsg') in ('ExpeditedDelivery', 'Delivery')
+                           and (x.get('isAvlSts') or x.get('totalQty'))]
+                result['available_quantity_for_purchase_fastdelivery'] = quantity(grouped)
+    else:
+        grouped = [x for x in items if method(x) != 'pickup' and (x.get('isAvlSts') or x.get('totalQty'))]
+        result['available_quantity_for_purchase_delivery'] = quantity(grouped)
+        if services is not None and not services.get('rtf'):
+            pickup = next((x for x in items if method(x) == 'pickup' and eligible(x)), None)
+            if pickup and (not pickup.get('priority') or not chosen.get('priority')
+                           or pickup['priority'] < chosen['priority']):
+                # With pickup selected, the legacy tile can show the earliest
+                # alternative instead of the first delivery option. Do not
+                # confuse that state with a selected delivery date.
+                issues.append('pickup_selected_delivery_message_not_verified')
+                return result, ';'.join(dict.fromkeys(issues))
+        if services is not None:
+            if services.get('rtf'):
+                result['delivery_availability'] = 'Delivery w/FREE Installation'
+            else:
+                label = calendar(chosen, kind)
+                if label:
+                    result['delivery_availability'] = 'Delivery ' + label
+            # A legacy option has no separate stock card. Never copy truck stock
+            # into the fast quantity column merely because an option is selected.
+            if kind in ('fasttruck', 'expediteddelivery'):
+                label = calendar(chosen, kind)
+                if label:
+                    result['fastest_delivery'] = ('Get it ' if label in ('Today', 'Tomorrow') else 'Get it by ') + label
+    return result, ';'.join(dict.fromkeys(issues))
 
 
 def displayed_fields(cards, fast_message=''):
@@ -198,106 +452,4 @@ def displayed_fields(cards, fast_message=''):
         # The legacy layout shows a fast badge with the selected delivery option,
         # but no separate fast stock card. Read its message, leave that qty empty.
         result['fastest_delivery'] = fast_message
-    return result
-
-
-# Scope all values to the fulfillment cards, excluding carousel/recommendation text.
-# Productdetail resource URLs establish the actual delivery region; location.zipcode
-# in the response can instead be the store ZIP and must not be used for this check.
-CARD_SCRIPT = r"""
-const visible = e => !!(e && e.getClientRects().length &&
-    getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none');
-const text = e => visible(e) ? (e.innerText || '').replace(/\s+/g, ' ').trim() : '';
-const contexts = performance.getEntriesByType('resource').flatMap(e => {
-    try {
-        const u = new URL(e.name), m = u.pathname.match(/^\/wpd\/(\d+)\/productdetail\/(\d+)\/Guest\/(\d+)$/);
-        return m && u.hostname === 'www.lowes.com' ? [{sku:m[1], store:m[2], zip:m[3],
-            state:u.searchParams.get('zipState') || '', nearby_store:u.searchParams.get('nearByStore') || ''}] : [];
-    } catch (_) { return []; }
-});
-const cards = [...document.querySelectorAll('.radio-tile')].filter(visible).map(e => ({
-    title: text(e.querySelector('.tile-title, .fulfilment-title')),
-    date: text(e.querySelector('[data-testid="tile-time"], .fulfilment-messages')),
-    stock: text(e.querySelector('[data-testid="tile-stock"], [data-testid="delivery-stock-msg"], .fulfilment-stock-messages')),
-    disabled: !!e.querySelector('input:disabled') || e.getAttribute('aria-disabled') === 'true'
-}));
-const legacyFast = !document.querySelector('.three-tile') &&
-    [...document.querySelectorAll('.zipcode-link')].some(e => /fast\s*delivery/i.test(text(e)));
-const fastOption = legacyFast ? [...document.querySelectorAll('.delivery-option')]
-    .filter(visible).find(e => e.querySelector('input:checked')) : null;
-const fastMatch = text(fastOption).match(/Get it(?: by)?\s+(?:Today|Tomorrow|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})/i);
-return {path:location.pathname, contexts, cards,
-    loading: [...document.querySelectorAll('.loader-tile, .three-tile [aria-busy="true"]')].some(visible),
-    blocked: /access denied|verify you are human/i.test(document.title || ''),
-    legacyFast, fast_message: fastMatch ? fastMatch[0] : ''};
-"""
-
-
-def matching_snapshot(snapshot, sku, context):
-    if not str(snapshot.get('path') or '').rstrip('/').endswith('/' + str(sku)):
-        return False
-    requests = [r for r in snapshot.get('contexts', []) if r.get('sku') == str(sku)]
-    if not requests:
-        return False
-    latest = requests[-1]
-    return (str(latest.get('store') or '').lstrip('0') == str(context['store']).lstrip('0')
-            and latest.get('zip') == context['zip']
-            and latest.get('state') == context['state']
-            and (not context.get('nearby_store') or latest.get('nearby_store') == context['nearby_store']))
-
-
-def read_display(driver, sku, path, context, page_timeout=12, wait_timeout=8):
-    """One navigation, no retry loop; require stable cards and matching request ZIP."""
-    result = {'status': 'unresolved', 'source': 'screen', 'context': context, 'values': empty_display()}
-    parts = urlsplit(path or '')
-    if parts.scheme or parts.netloc or not parts.path.startswith('/pd/') or not parts.path.endswith('/' + str(sku)):
-        result['reason'] = 'invalid_product_path'
-        return result
-    started = time.monotonic()
-    original_timeout = None
-    try:
-        original_timeout = driver.timeouts.page_load
-        driver.set_page_load_timeout(page_timeout)
-        try:
-            driver.get('https://www.lowes.com' + parts.path)
-        except Exception as exc:
-            # A load timeout may be caused by ads while the cards are already ready.
-            result['navigation_error'] = type(exc).__name__
-        deadline = time.monotonic() + wait_timeout
-        previous, stable_since = None, None
-        while time.monotonic() < deadline:
-            snapshot = driver.execute_script(CARD_SCRIPT) or {}
-            if snapshot.get('blocked'):
-                result['reason'] = 'page_blocked'
-                break
-            delivery_card_ready = any(str(card.get('title') or '').lower() in (
-                'shipping', 'delivery', 'appliance delivery', 'fast delivery',
-            ) for card in snapshot.get('cards', []))
-            if matching_snapshot(snapshot, sku, context) and delivery_card_ready and not snapshot.get('loading'):
-                cards = snapshot['cards']
-                signature = json.dumps([cards, snapshot.get('fast_message', '')], sort_keys=True)
-                if signature != previous:
-                    previous, stable_since = signature, time.monotonic()
-                elif time.monotonic() - stable_since >= 1:
-                    values = displayed_fields(cards, snapshot.get('fast_message', ''))
-                    if values is not None:
-                        result.update(status='ok', values=values, cards=cards,
-                                      captured_at=datetime.now(timezone.utc).isoformat())
-                        if snapshot.get('legacyFast') and not snapshot.get('fast_message'):
-                            result.update(status='partial', reason='legacy_fast_message_unresolved')
-                        break
-            else:
-                previous, stable_since = None, None
-            time.sleep(0.25)
-        else:
-            result['reason'] = 'cards_not_ready_or_region_mismatch'
-    except Exception as exc:
-        result['reason'] = 'screen_check_' + type(exc).__name__
-    finally:
-        if original_timeout is not None:
-            try:
-                driver.set_page_load_timeout(original_timeout)
-            except Exception:
-                result.update(status='unresolved', values=empty_display(), reason='restore_page_timeout_failed')
-        result['elapsed_seconds'] = round(time.monotonic() - started, 2)
     return result
