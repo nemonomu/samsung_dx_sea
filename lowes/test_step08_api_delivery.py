@@ -64,8 +64,18 @@ def rdp_service_response():
     }]}})}
 
 
+def observed_options(second_selected=False):
+    # Two radio options; their order/dates do not decide which is checked.
+    return [
+        {'visible': True, 'disabled': False, 'checked': not second_selected,
+         'text': 'Get it by Wed, Sep 23'},
+        {'visible': True, 'disabled': False, 'checked': second_selected,
+         'text': 'Get it by Thu, Sep 24'},
+    ]
+
+
 class CapturedDisplayTests(unittest.TestCase):
-    def test_mini_all_six_fields_match_observed_cards(self):
+    def test_mini_cards_do_not_prove_field_45_radio_selection(self):
         node = mini()
         values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
         pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, NOW)
@@ -73,7 +83,7 @@ class CapturedDisplayTests(unittest.TestCase):
         self.assertEqual(values | pickup, {
             'pick_up_availability': 'Pickup 9am Tomorrow',
             'delivery_availability': 'Shipping Wed, Sep 23',
-            'fastest_delivery': 'Get it Tomorrow',
+            'fastest_delivery': '',
             'available_quantity_for_purchase_pickup': 9,
             'available_quantity_for_purchase_delivery': 1225,
             'available_quantity_for_purchase_fastdelivery': 866,
@@ -81,7 +91,7 @@ class CapturedDisplayTests(unittest.TestCase):
 
     def test_washer_installation_message_and_selected_option_are_separate(self):
         node = washer()
-        values, reason = display.api_display(node, FLAGS, NOW, RTF)
+        values, reason = display.api_display(node, FLAGS, NOW, RTF, observed_options())
         pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, NOW)
         self.assertEqual((reason, pickup_reason), ('', ''))
         self.assertEqual(values | pickup, {
@@ -131,16 +141,22 @@ class CapturedDisplayTests(unittest.TestCase):
     def test_conflicting_or_missing_priority_does_not_choose_fastest_date(self):
         for priority in (None, 4):
             node = washer()
+            node['location']['itemInventory']['itemAvailList'][0]['isAvlSts'] = False
             node['location']['itemInventory']['itemAvailList'][-1]['priority'] = priority
-            values, reason = display.api_display(node, FLAGS, NOW, RTF)
+            values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
             self.assertEqual(values['fastest_delivery'], '')
             self.assertIn('priority', reason)
 
     def test_calendar_relative_to_destination_and_store_not_korean_clock(self):
         node = mini()
         now = datetime.fromisoformat('2026-09-22T04:01:00+00:00')
-        values, _ = display.api_display(node, FLAGS, now, NO_SERVICES)
-        self.assertEqual(values['fastest_delivery'], 'Get it Today')
+        # A candidate date still uses destination time, but is not evidence of
+        # a checked radio and must not enter field 45 without that evidence.
+        candidate, _ = display._candidate_display(node, FLAGS, now, NO_SERVICES)
+        self.assertEqual(candidate['fastest_delivery'], 'Get it Today')
+        values, reason = display.api_display(node, FLAGS, now, NO_SERVICES)
+        self.assertEqual(values['fastest_delivery'], '')
+        self.assertEqual(reason, '')
         pickup, _ = display.pickup_display(node, STORE, FLAGS, now)
         self.assertEqual(pickup['pick_up_availability'], 'Pickup 9am Tomorrow')
 
@@ -170,6 +186,139 @@ class CapturedDisplayTests(unittest.TestCase):
         self.assertEqual(values['delivery_availability'], 'Shipping Wed, Sep 23')
 
 
+class SelectedOptionTests(unittest.TestCase):
+    def test_rtf_default_order_wins_over_api_priority(self):
+        node = washer()
+        slots = node['location']['itemInventory']['itemAvailList']
+        slots[1]['priority'], slots[2]['priority'] = 2, 4
+        values, reason = display.api_display(node, FLAGS, NOW, RTF)
+        self.assertEqual(reason, '')
+        self.assertEqual(values['fastest_delivery'], 'Get it by Wed, Sep 23')
+
+    def test_no_service_default_includes_pickup(self):
+        node = washer()
+        values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
+        self.assertEqual(values['fastest_delivery'], '')
+        self.assertIn('pickup_selected', reason)
+
+    def test_no_service_default_can_select_later_regular_truck(self):
+        node = washer()
+        slots = node['location']['itemInventory']['itemAvailList']
+        slots[0]['priority'], slots[1]['priority'], slots[2]['priority'] = 5, 2, 3
+        values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
+        self.assertEqual(reason, '')
+        self.assertEqual(values['fastest_delivery'], 'Get it by Thu, Sep 24')
+
+    def test_missing_selected_date_does_not_use_unselected_fast_date(self):
+        node = washer()
+        slots = node['location']['itemInventory']['itemAvailList']
+        slots[0]['priority'], slots[1]['priority'], slots[2]['priority'] = 5, 2, 3
+        del slots[1]['itmConsolidationApptDate']
+        values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
+        self.assertEqual(values['fastest_delivery'], '')
+        self.assertIn('missing_', reason)
+
+    def test_rdp_midea_has_fast_card_but_no_field_45_options(self):
+        # 2026-09-22 05:20 UTC user probe: options=[], field45=null.
+        cards = [
+            {'title': 'Pickup', 'date': 'Tomorrow', 'stock': '9 available'},
+            {'title': 'Shipping', 'date': 'Tomorrow', 'stock': '1,141 available'},
+            {'title': 'Fast Delivery', 'date': 'Today', 'stock': '8 available'},
+        ]
+        values = display.displayed_fields(cards)
+        self.assertEqual(values, {
+            'delivery_availability': 'Shipping Tomorrow',
+            'fastest_delivery': '',
+            'available_quantity_for_purchase_delivery': 1141,
+            'available_quantity_for_purchase_fastdelivery': 8,
+        })
+        self.assertEqual(display.selected_delivery_text([]), ('', ''))
+
+    def test_rdp_midea_pickup_really_has_no_ready_word(self):
+        node = mini()
+        pickup = node['location']['itemInventory']['itemAvailList'][1]
+        pickup.update(totalQty=329, onhandQty=9, itmLdDateTm='2026-09-22T11:20-08:00')
+        now = datetime.fromisoformat('2026-09-22T05:20:29+00:00')
+        values, reason = display.pickup_display(node, STORE, FLAGS, now)
+        self.assertEqual(reason, '')
+        self.assertEqual(values, {'pick_up_availability': 'Pickup Tomorrow',
+                                  'available_quantity_for_purchase_pickup': 9})
+
+    def test_rdp_whirlpool_preserves_est_and_checked_tomorrow(self):
+        node = washer()
+        node['location']['itemInventory']['itemAvailList'][0]['totalQty'] = 90
+        options = observed_options()
+        options[0]['text'] = 'Get it Tomorrow'
+        now = datetime.fromisoformat('2026-09-22T05:19:21+00:00')
+        values, reason = display.api_display(node, FLAGS, now, RTF, options)
+        pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, now)
+        self.assertEqual((reason, pickup_reason), ('', ''))
+        self.assertEqual(values | pickup, {
+            'delivery_availability': 'Delivery w/FREE Installation',
+            'fastest_delivery': 'Get it Tomorrow',
+            'available_quantity_for_purchase_delivery': 14,
+            'available_quantity_for_purchase_fastdelivery': '',
+            'pick_up_availability': 'Pickup Ready by Mon, Sep 28 (Est.)',
+            'available_quantity_for_purchase_pickup': 90,
+        })
+
+    def test_checked_second_option_wins_over_fastest_priority_and_date(self):
+        node = washer()
+        original = copy.deepcopy(node)
+        for second, expected in ((False, 'Get it by Wed, Sep 23'),
+                                 (True, 'Get it by Thu, Sep 24')):
+            values, reason = display.api_display(node, FLAGS, NOW, RTF, observed_options(second))
+            self.assertEqual(reason, '')
+            self.assertEqual(values['fastest_delivery'], expected)
+            self.assertEqual(values['available_quantity_for_purchase_delivery'], 14)
+            self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], '')
+        self.assertEqual(node, original)
+
+    def test_unknown_service_selection_not_proved_by_one_available_method(self):
+        node = washer()
+        node['location']['itemInventory']['itemAvailList'] = [
+            node['location']['itemInventory']['itemAvailList'][-1]]
+        values, reason = display.api_display(node, FLAGS, NOW)
+        self.assertEqual(values['fastest_delivery'], '')
+        self.assertIn('unknown_service_selection', reason)
+
+    def test_hidden_disabled_and_ambiguous_options_are_not_collected(self):
+        for change in ('hidden', 'disabled', 'two_checked', 'none_checked'):
+            options = observed_options()
+            if change == 'hidden':
+                options[0]['visible'] = False
+            elif change == 'disabled':
+                options[0]['disabled'] = True
+            elif change == 'two_checked':
+                options[1]['checked'] = True
+            else:
+                options[0]['checked'] = False
+            with self.subTest(change=change):
+                value, reason = display.selected_delivery_text(options)
+                self.assertEqual(value, '')
+                self.assertTrue(reason)
+
+    def test_visible_text_is_preserved_without_added_words(self):
+        options = observed_options()
+        options[0]['text'] = 'Get it Tomorrow'
+        self.assertEqual(display.selected_delivery_text(options), ('Get it Tomorrow', ''))
+        self.assertEqual(display.selected_delivery_text([]), ('', ''))
+        self.assertEqual(display.selected_delivery_text(None),
+                         ('', 'selected_delivery_option_not_verified'))
+
+    def test_explicit_null_pickup_date_does_not_add_est_suffix(self):
+        node = washer()
+        pickup = node['location']['itemInventory']['itemAvailList'][0]
+        # JS `undefined !== value` is true for null, false for an absent key.
+        pickup['itmLdDateTm'] = None
+        values, reason = display.pickup_display(node, STORE, FLAGS, NOW)
+        self.assertEqual(reason, '')
+        self.assertEqual(values['pick_up_availability'], 'Pickup Ready by Mon, Sep 28')
+        del pickup['itmLdDateTm']
+        values, _ = display.pickup_display(node, STORE, FLAGS, NOW)
+        self.assertEqual(values['pick_up_availability'], 'Pickup Ready by Mon, Sep 28 (Est.)')
+
+
 class ServiceAndCollectorTests(unittest.TestCase):
     def test_rdp_null_selection_uses_verified_page_default_not_api_boolean(self):
         selection, reason = display.service_selection(rdp_service_response())
@@ -180,7 +329,7 @@ class ServiceAndCollectorTests(unittest.TestCase):
         self.assertEqual(values['fastest_delivery'], 'Get it by Wed, Sep 23')
         self.assertNotIn('$43.48', json.dumps(values))
 
-    def test_collector_with_rdp_service_shape_matches_whirlpool_capture(self):
+    def test_collector_uses_verified_guest_default_selection_without_dom(self):
         namespace = parser_functions()
         calls = []
         def get(driver, path, **kwargs):

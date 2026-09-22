@@ -298,7 +298,7 @@ class DisplayIntegrationTests(unittest.TestCase):
         result = display.displayed_fields(hisense_cards())
         self.assertEqual(result, {
             'delivery_availability': 'Shipping Wed, Sep 16',
-            'fastest_delivery': 'Get it Tomorrow',
+            'fastest_delivery': '',
             'available_quantity_for_purchase_delivery': 1236,
             'available_quantity_for_purchase_fastdelivery': 878,
         })
