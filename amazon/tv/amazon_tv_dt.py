@@ -43,7 +43,7 @@ if _project_root not in sys.path:
 from common.setup import setup_environment
 setup_environment(__file__)
 
-from amazon.savings import build_amazon_extracted_data
+from amazon.savings import build_amazon_extracted_data, extract_page_savings
 
 from common.amazon_base import AmazonBaseCrawler
 from amazon.tv.amazon_login import (
@@ -427,6 +427,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             for index, product in enumerate(product_list, 1):
                 # No PDP was opened, so redirect state is unknown rather than False.
                 product['redirect'] = None
+                product['savings'] = None  # No PDP badge was collected.
                 if self.save_to_retail_com(product):
                     saved += 1
                 else:
@@ -1064,6 +1065,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
 
     def crawl_detail(self, product):
         """상세 페이지 크롤링: 페이지 로드 → 가격/상태 추출 → TV 스펙 추출 → 리뷰 추출"""
+        product['savings'] = None  # Never retain a previous run's savings badge.
         try:
             # ============================================================================================================
             # 상세페이지 진입 및 추출 준비
@@ -1144,6 +1146,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             original_sku_price = None
             if final_sku_price and '$' in final_sku_price:
                 original_sku_price = self.extract_original_sku_price(tree, 'original_sku_price')
+            product['savings'] = extract_page_savings(tree)
             sku_popularity = self.normalize_sku_popularity(
                 self.safe_extract_chain(tree, 'sku_popularity')
             )
@@ -1301,6 +1304,7 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                 f"{f'{final_sku_price} (출처: {final_sku_price_source})' if final_sku_price_source else (final_sku_price or '-')}"
             )
             print(f"  ├─ original_sku_price: {original_sku_price or '-'}")
+            print(f"  ├─ savings: {product.get('savings') or '-'}")
             print(f"  ├─ star_rating: {star_rating or '-'}")
             print(f"  ├─ count_of_star_ratings: {count_of_star_ratings or '-'}")
             print(f"  ├─ sku_popularity: {sku_popularity or '-'}")

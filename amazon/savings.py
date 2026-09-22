@@ -1,47 +1,56 @@
-"""Derive Amazon savings from the price strings being saved to the DB.
+"""Collect Amazon's displayed savings percentage and normalize it for the DB."""
 
-Only a complete, non-negative US-style amount is accepted. Availability text,
-mixed price messages, ranges and missing prices produce None (SQL NULL).
-The crawler's original price strings are never changed.
-"""
-
-from decimal import Decimal, localcontext
 import re
 
 
-_PRICE = re.compile(
-    r'(?:\$\s*)?(?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)'
-    r'(?:\.[0-9]{1,2})?'
+_PERCENTAGE = re.compile(r'[-\u2212]?\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*%')
+_SAVINGS_XPATH = (
+    "//*[@id='corePriceDisplay_desktop_feature_div' or @id='corePrice_feature_div']"
+    "//*[contains(concat(' ', normalize-space(@class), ' '), ' savingsPercentage ')]"
 )
 
 
-def _parse_price(value):
-    """Parse a whole crawler price string, never a number inside a message."""
+def normalize_savings(value):
+    """Convert '-21%' to '21%'; missing or non-percentage values become NULL."""
     if not isinstance(value, str):
         return None
-    value = value.strip()
-    if _PRICE.fullmatch(value) is None:
+    match = _PERCENTAGE.fullmatch(value.strip())
+    if match is None or float(match[1]) > 100:
         return None
-    return Decimal(value.replace('$', '').replace(',', '').strip())
+    return match[1] + '%'
 
 
-def calculate_savings(original_sku_price, final_sku_price):
-    """Return '$1,234.56', '$0.00', or None for invalid/inverted prices."""
-    original = _parse_price(original_sku_price)
-    final = _parse_price(final_sku_price)
-    if original is None or final is None or original < final:
+def extract_page_savings(tree):
+    """Read the main PDP price badge, preserving its displayed minus sign.
+
+    Amazon marks this visual badge aria-hidden for screen readers; that alone
+    does not make it invisible. Ignore explicitly hidden DOM and other offers.
+    """
+    if tree is None:
         return None
-    # Keep cents exact even for amounts longer than Decimal's default precision.
-    with localcontext() as context:
-        context.prec = max(len(original.as_tuple().digits),
-                           len(final.as_tuple().digits), 28) + 2
-        return f'${original - final:,.2f}'
+    values = []
+    for node in tree.xpath(_SAVINGS_XPATH):
+        hidden = False
+        for ancestor in (node, *node.iterancestors()):
+            classes = (ancestor.get('class') or '').split()
+            style = re.sub(r'\s+', '', ancestor.get('style') or '').lower()
+            if (ancestor.get('hidden') is not None or 'aok-hidden' in classes
+                    or 'a-offscreen' in classes or 'display:none' in style
+                    or 'visibility:hidden' in style):
+                hidden = True
+                break
+        if hidden:
+            continue
+        value = node.text_content().strip()
+        if normalize_savings(value) is not None and value not in values:
+            values.append(value)
+    # Conflicting badges cannot identify a single displayed offer reliably.
+    return values[0] if len(values) == 1 else None
 
 
 def build_amazon_extracted_data(product, fields):
-    """Build INSERT/UPDATE values, replacing stale savings from the input row."""
+    """Build INSERT/UPDATE values from the collected badge, never price math."""
     data = {field: product.get(field) for field in fields}
-    data['savings'] = calculate_savings(
-        data.get('original_sku_price'), data.get('final_sku_price')
-    )
+    if 'savings' in data:
+        data['savings'] = normalize_savings(data['savings'])
     return data

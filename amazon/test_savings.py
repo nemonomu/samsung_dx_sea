@@ -6,78 +6,95 @@ Config is replaced before imports; no credentials, sessions or live DB are used.
 """
 
 from contextlib import ExitStack, redirect_stdout
-from decimal import Decimal, localcontext
 import importlib
 import io
 import types
 import unittest
 from unittest.mock import Mock, patch
 
-from amazon.savings import build_amazon_extracted_data, calculate_savings
+from lxml import html
+
+from amazon.savings import (
+    build_amazon_extracted_data, extract_page_savings, normalize_savings,
+)
 
 
-class SavingsCalculationTests(unittest.TestCase):
-    def test_valid_prices_and_formatting(self):
-        cases = [
-            ('$1,499.99', '$847.99', '$652.00'),
-            ('$179.99', '$134.98', '$45.01'),
-            ('$3,499.99', '$2,297.99', '$1,202.00'),
-            ('$579.99', '$497.99', '$82.00'),
-            ('$1,299.99', '$747.99', '$552.00'),
-            ('$1.00', '$0.99', '$0.01'),
-            ('$0.30', '$0.10', '$0.20'),
-            ('$100', '$20.5', '$79.50'),
-            ('1499.99', '847.99', '$652.00'),
-            (' \t$\u00a01,499.99\n', ' $ 847.99 ', '$652.00'),
-            ('$10.00', '$10.00', '$0.00'),
-            ('$10.00', '$0.00', '$10.00'),
-            ('$0', '$0', '$0.00'),
-        ]
-        for original, final, expected in cases:
-            with self.subTest(original=original, final=final):
-                self.assertEqual(calculate_savings(original, final), expected)
+# Minimal markup matching the supplied iFFALCON main price badge. No raw page data.
+PAGE_BADGE = """
+<div id="corePriceDisplay_desktop_feature_div">
+  <div class="a-section apex-core-price-identifier">
+    <span class="apex-savings-container">
+      <span aria-hidden="true" class="a-size-large a-color-price savingPriceOverride aok-align-center reinventPriceSavingsPercentageMargin savingsPercentage apex-savings-percentage">-21%</span>
+    </span>
+    <span class="a-price"><span class="a-offscreen">$699.99</span></span>
+    <span>List Price: $885.99</span>
+  </div>
+</div>
+"""
 
-    def test_non_prices_are_null_in_either_column(self):
-        invalid = [
-            None, '', ' ', 'NULL', 'N/A', '품절', 'Out of stock',
-            'Currently unavailable.', 'No featured offers available',
-            'See price in cart', 'To see our price, add this item to your cart.',
-            'Only 3 left in stock', 'No featured offers available from $99.99',
-            'From $99.99', '$99.99 / month', '$99.99 - $199.99',
-            '$99.99 ($10 savings)', '$1,49.99', '$1,,499.99', '$1, 499.99',
-            '$1.499,99', '$99.999', '$', '$-10.00', '-10', '+10',
-            'NaN', 'Infinity', '1e2', '€10.00', '£10.00', 'C$10.00',
-            '$１２.００', '$10.00\nextra', True, 100, 99.99,
-            Decimal('100'), [], {},
-        ]
-        for value in invalid:
+
+class SavingsPercentageTests(unittest.TestCase):
+    def test_normalization_preserves_percentage_and_removes_minus(self):
+        for raw, expected in [('-21%', '21%'), ('21%', '21%'),
+                              (' \n-21%\t', '21%'), ('\u221221%', '21%'),
+                              ('- 21 %', '21%'), ('-12.5%', '12.5%'),
+                              ('0%', '0%'), ('-100%', '100%')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_savings(raw), expected)
+
+    def test_invalid_or_old_amount_savings_are_null(self):
+        for value in (None, '', ' ', '$186.00', '$652.00', '-21', 'Save 21%',
+                      '+21%', '--21%', '-101%', 'NaN%', '21% off',
+                      '21% - 30%', True, 21, 21.0, [], {}):
             with self.subTest(value=value):
-                self.assertIsNone(calculate_savings('$1,499.99', value))
-                self.assertIsNone(calculate_savings(value, '$847.99'))
+                self.assertIsNone(normalize_savings(value))
 
-    def test_inverted_prices_are_null(self):
-        self.assertIsNone(calculate_savings('$99.99', '$100.00'))
-
-    def test_precision_does_not_depend_on_global_decimal_context(self):
-        with localcontext() as context:
-            context.prec = 3
-            self.assertEqual(calculate_savings('$1,499.99', '$847.99'), '$652.00')
-        self.assertEqual(
-            calculate_savings('$123456789012345678901234567890.99', '$0.98'),
-            '$123,456,789,012,345,678,901,234,567,890.01',
-        )
-
-    def test_derived_value_replaces_stale_savings_without_changing_input(self):
-        product = {'original_sku_price': '$100', 'final_sku_price': '$80',
-                   'savings': '$999.00', 'item': 'test-item'}
-        original = dict(product)
+    def test_supplied_badge_keeps_raw_minus_until_db_mapping(self):
+        raw = extract_page_savings(html.fromstring(PAGE_BADGE))
+        self.assertEqual(raw, '-21%')
+        product = {'original_sku_price': '$885.99', 'final_sku_price': '$699.99',
+                   'savings': raw, 'item': 'test-item'}
+        before = dict(product)
         data = build_amazon_extracted_data(product, list(product))
-        self.assertEqual(data['savings'], '$20.00')
-        self.assertEqual(product, original)
-        product['final_sku_price'] = 'No featured offers available'
-        data = build_amazon_extracted_data(product, list(product))
-        self.assertIsNone(data['savings'])
-        self.assertEqual(data['final_sku_price'], product['final_sku_price'])
+        self.assertEqual(data['savings'], '21%')
+        self.assertEqual(product, before)
+        self.assertEqual(data['original_sku_price'], '$885.99')
+        self.assertEqual(data['final_sku_price'], '$699.99')
+
+    def test_missing_badge_does_not_use_prices_or_other_discounts(self):
+        markup = PAGE_BADGE.replace('savingsPercentage ', '') + (
+            '<div id="recommendations"><span class="savingsPercentage">-70%</span></div>'
+            '<span>Get $50 off instantly</span>')
+        raw = extract_page_savings(html.fromstring('<html>' + markup + '</html>'))
+        self.assertIsNone(raw)
+        product = {'savings': raw, 'original_sku_price': '$885.99',
+                   'final_sku_price': '$699.99'}
+        self.assertIsNone(build_amazon_extracted_data(product, product)['savings'])
+        self.assertIsNone(extract_page_savings(None))
+
+    def test_hidden_badges_are_skipped(self):
+        for attribute in ('class="aok-hidden"', 'hidden', 'style="display: none"',
+                          'style="visibility: hidden"', 'class="a-offscreen"'):
+            with self.subTest(attribute=attribute):
+                hidden = '<div ' + attribute + '>' + PAGE_BADGE.replace('-21%', '-90%') + '</div>'
+                tree = html.fromstring('<html>' + hidden + PAGE_BADGE + '</html>')
+                self.assertEqual(extract_page_savings(tree), '-21%')
+                self.assertIsNone(extract_page_savings(html.fromstring(hidden)))
+
+    def test_duplicate_and_conflicting_badges(self):
+        self.assertEqual(extract_page_savings(html.fromstring(
+            '<html>' + PAGE_BADGE * 2 + '</html>')), '-21%')
+        self.assertIsNone(extract_page_savings(html.fromstring(
+            '<html>' + PAGE_BADGE + PAGE_BADGE.replace('-21%', '-30%') + '</html>')))
+
+    def test_legacy_core_price_container(self):
+        tree = html.fromstring(PAGE_BADGE.replace(
+            'corePriceDisplay_desktop_feature_div', 'corePrice_feature_div'))
+        self.assertEqual(extract_page_savings(tree), '-21%')
+
+    def test_fields_without_savings_do_not_add_it(self):
+        self.assertEqual(build_amazon_extracted_data({'item': 'test'}, ['item']),
+                         {'item': 'test'})
 
 
 class AmazonSavingsSaveTests(unittest.TestCase):
@@ -125,7 +142,7 @@ class AmazonSavingsSaveTests(unittest.TestCase):
     def product():
         return dict(id=123, item='test-item', redirect=False,
                     original_sku_price='$1,499.99', final_sku_price='$847.99',
-                    savings='$999.00', star_rating='4.5',
+                    savings='-21%', star_rating='4.5',
                     detailed_review_content='test review')
 
     def saved_data(self, crawler):
@@ -147,7 +164,7 @@ class AmazonSavingsSaveTests(unittest.TestCase):
         cursor.close.assert_called_once()
         return query, dict(zip(columns, values))
 
-    def test_insert_and_update_use_final_prices_and_preserve_other_fields(self):
+    def test_insert_and_update_use_page_percentage_and_preserve_other_fields(self):
         for cls in self.crawlers:
             for test_mode in (False, True):
                 with self.subTest(crawler=cls.__name__, test_mode=test_mode):
@@ -157,7 +174,7 @@ class AmazonSavingsSaveTests(unittest.TestCase):
                     self.assertTrue(crawler.save_to_retail_com(product))
                     query, data = self.saved_data(crawler)
                     self.assertEqual(product, before)
-                    self.assertEqual(data['savings'], '$652.00')
+                    self.assertEqual(data['savings'], '21%')
                     for field in ('original_sku_price', 'final_sku_price', 'item',
                                   'star_rating', 'detailed_review_content'):
                         self.assertEqual(data[field], product[field])
@@ -166,6 +183,79 @@ class AmazonSavingsSaveTests(unittest.TestCase):
                     self.assertIn(' ' + table + ' ', query)
                     if query.startswith('INSERT'):
                         self.assertEqual(data['account_name'], 'Amazon')
+
+    def test_detail_collection_replaces_stale_savings_before_insert_and_update(self):
+        for cls in self.crawlers:
+            for markup, raw, stored in (
+                (PAGE_BADGE, '-21%', '21%'),
+                ('<html><span>List Price: $885.99; Price: $699.99</span></html>', None, None),
+            ):
+                with self.subTest(crawler=cls.__name__, raw=raw):
+                    crawler = self.make_crawler(cls)
+                    crawler.page = Mock(html=markup, url='https://example.test/product')
+                    crawler.page.run_js.return_value = markup
+                    crawler.xpaths = {}
+                    crawler.product_type = 'tv'
+                    crawler._first_detail_html_saved = True
+                    crawler.spec_diffs = []
+                    for name, value in {
+                        'recover_amazon_pages': True,
+                        'resolve_loaded_product_url_for_tv': None,
+                        'should_take_capture': False,
+                        'extract_final_sku_price': '$699.99',
+                        'extract_original_sku_price': '$885.99',
+                        'safe_extract_chain': None,
+                        'normalize_sku_popularity': None,
+                        'extract_delivery_field': None,
+                        'convert_first_number': None,
+                        'normalize_available_quantity_for_purchase': None,
+                        'scroll_to_section': None,
+                        'get_tv_specs_from_mst': (None, None, None),
+                        'extract_sku': (None, None, None),
+                        'extract_model_year': None,
+                        'extract_screen_size': (None, None, None),
+                        'move_to_review_section': None,
+                        'extract_star_rating': '4.5',
+                        'extract_count_of_star_rating': '37',
+                        'extract_reviews_with_retry': (None, 0, False),
+                    }.items():
+                        setattr(crawler, name, Mock(return_value=value))
+                    crawler.resolve_hidden_price_from_cart = Mock(
+                        side_effect=lambda tree, *args: ('$699.99', False, None, tree, None))
+                    product = self.product()
+                    product.update(product_url='https://example.test/product', savings='-99%')
+                    # crawl_detail is inherited from the detail module by UPDATE.
+                    detail_module = importlib.import_module(self.crawlers[0].__module__)
+                    with redirect_stdout(io.StringIO()), patch.object(detail_module.time, 'sleep'):
+                        result = crawler.crawl_detail(product)
+                    self.assertEqual(result['savings'], raw)
+                    self.assertEqual(result['original_sku_price'], '$885.99')
+                    self.assertEqual(result['final_sku_price'], '$699.99')
+                    self.assertTrue(crawler.save_to_retail_com(result))
+                    self.assertEqual(self.saved_data(crawler)[1]['savings'], stored)
+
+    def test_failed_detail_collection_clears_previous_percentage(self):
+        for cls in self.crawlers:
+            crawler = self.make_crawler(cls)
+            crawler.page = Mock(url='https://example.test/product')
+            crawler.page.get.side_effect = RuntimeError('test page failure')
+            product = self.product()
+            product['product_url'] = 'https://example.test/product'
+            with redirect_stdout(io.StringIO()):
+                result = crawler.crawl_detail(product)
+            self.assertIsNone(result['savings'])
+            self.assertTrue(crawler.save_to_retail_com(result))
+            self.assertIsNone(self.saved_data(crawler)[1]['savings'])
+
+    def test_missing_badge_and_old_amounts_save_null_despite_valid_prices(self):
+        for cls in self.crawlers:
+            for value in (None, '', '$652.00'):
+                with self.subTest(crawler=cls.__name__, savings=value):
+                    crawler = self.make_crawler(cls)
+                    product = self.product()
+                    product['savings'] = value
+                    self.assertTrue(crawler.save_to_retail_com(product))
+                    self.assertIsNone(self.saved_data(crawler)[1]['savings'])
 
     def test_hhp_insert_and_update_do_not_calculate_or_write_savings(self):
         for cls in self.excluded_crawlers:
@@ -177,8 +267,8 @@ class AmazonSavingsSaveTests(unittest.TestCase):
                         product['final_sku_price'] = final
                         before = dict(product)
                         self.assertNotIn('savings', crawler.EXTRACTED_FIELDS)
-                        with patch('amazon.savings.calculate_savings',
-                                   side_effect=AssertionError('HHP must not calculate savings')):
+                        with patch('amazon.savings.normalize_savings',
+                                   side_effect=AssertionError('HHP must not process savings')):
                             self.assertTrue(crawler.save_to_retail_com(product))
                         query, data = self.saved_data(crawler)
                         self.assertNotIn('savings', data)
@@ -188,7 +278,7 @@ class AmazonSavingsSaveTests(unittest.TestCase):
                         table = ('test_' if test_mode else '') + 'hhp_retail_com'
                         self.assertIn(' ' + table + ' ', query)
 
-    def test_non_numeric_and_missing_prices_save_sql_null_and_keep_raw_values(self):
+    def test_page_percentage_does_not_depend_on_valid_prices(self):
         for cls in self.crawlers:
             for original, final in [
                 ('$1,499.99', 'No featured offers available'),
@@ -202,17 +292,18 @@ class AmazonSavingsSaveTests(unittest.TestCase):
                     product.update(original_sku_price=original, final_sku_price=final)
                     self.assertTrue(crawler.save_to_retail_com(product))
                     _, data = self.saved_data(crawler)
-                    self.assertIsNone(data['savings'])
+                    self.assertEqual(data['savings'], '21%')
                     self.assertEqual(data['original_sku_price'], original)
                     self.assertEqual(data['final_sku_price'], final)
 
-    def test_equal_prices_save_zero(self):
+    def test_equal_prices_without_badge_save_null(self):
         for cls in self.crawlers:
             crawler = self.make_crawler(cls)
             product = self.product()
             product['final_sku_price'] = product['original_sku_price']
+            product['savings'] = None
             self.assertTrue(crawler.save_to_retail_com(product))
-            self.assertEqual(self.saved_data(crawler)[1]['savings'], '$0.00')
+            self.assertIsNone(self.saved_data(crawler)[1]['savings'])
 
     def test_listing_only_insert_without_original_price_is_null(self):
         for cls in (self.crawlers[0],):
@@ -221,7 +312,7 @@ class AmazonSavingsSaveTests(unittest.TestCase):
             self.assertTrue(crawler.save_to_retail_com(product))
             self.assertIsNone(self.saved_data(crawler)[1]['savings'])
 
-    def test_tv_listing_fallback_uses_the_same_savings_calculation(self):
+    def test_tv_listing_fallback_clears_uncollected_savings(self):
         crawler = self.make_crawler(self.crawlers[0])
         crawler.detail_report = {'run_errors': [], 'saved_records': 0,
                                  'listing_only_records': 0}
@@ -230,17 +321,17 @@ class AmazonSavingsSaveTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(crawler.save_listing_only_fallback('test'), 1)
         _, data = self.saved_data(crawler)
-        self.assertEqual(data['savings'], '$652.00')
+        self.assertIsNone(data['savings'])
         self.assertIsNone(data['redirect'])
         self.assertEqual(crawler.detail_report['listing_only_records'], 1)
 
-    def test_all_price_update_modes_recalculate_savings(self):
+    def test_all_price_update_modes_save_page_percentage(self):
         for cls, modes in [(self.crawlers[1], ('1', '2', '3', '5'))]:
             for mode in modes:
                 with self.subTest(crawler=cls.__name__, mode=mode):
                     crawler = self.make_crawler(cls, mode=mode)
                     self.assertTrue(crawler.save_to_retail_com(self.product()))
-                    self.assertEqual(self.saved_data(crawler)[1]['savings'], '$652.00')
+                    self.assertEqual(self.saved_data(crawler)[1]['savings'], '21%')
 
     def test_review_only_update_does_not_touch_prices_or_savings(self):
         cls = self.crawlers[1]
