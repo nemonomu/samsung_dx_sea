@@ -294,13 +294,13 @@ def hisense_cards():
 
 
 class DisplayIntegrationTests(unittest.TestCase):
-    def test_hisense_uses_visible_fast_quantity_not_expedited_api_quantity(self):
+    def test_fast_quantity_is_disabled_while_shipping_quantity_is_preserved(self):
         result = display.displayed_fields(hisense_cards())
         self.assertEqual(result, {
             'delivery_availability': 'Shipping Wed, Sep 16',
             'fastest_delivery': '',
             'available_quantity_for_purchase_delivery': 1236,
-            'available_quantity_for_purchase_fastdelivery': 878,
+            'available_quantity_for_purchase_fastdelivery': '',
         })
 
     def test_equator_uses_one_card_and_currently_selected_date(self):

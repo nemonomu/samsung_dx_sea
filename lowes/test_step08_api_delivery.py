@@ -86,7 +86,7 @@ class CapturedDisplayTests(unittest.TestCase):
             'fastest_delivery': '',
             'available_quantity_for_purchase_pickup': 9,
             'available_quantity_for_purchase_delivery': 1225,
-            'available_quantity_for_purchase_fastdelivery': 866,
+            'available_quantity_for_purchase_fastdelivery': '',
         })
 
     def test_washer_installation_message_and_selected_option_are_separate(self):
@@ -125,17 +125,19 @@ class CapturedDisplayTests(unittest.TestCase):
 
     def test_network_quantity_cap_is_not_an_exact_count(self):
         node = mini()
-        node['location']['itemInventory']['itemAvailList'][2]['totalQty'] = 9000
+        node['location']['itemInventory']['itemAvailList'][0]['totalQty'] = 9000
         values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
         self.assertEqual(reason, '')
-        self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], '5000+')
+        self.assertEqual(values['available_quantity_for_purchase_delivery'], '5000+')
+        self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], '')
 
     def test_api_inventory_takes_precedence_over_stale_analytics(self):
         node = mini()
         node['itemInventory'] = {'analyticsData': {'expeditedDelivery': {'totalQty': 9999}}}
         original = copy.deepcopy(node)
         values, _ = display.api_display(node, FLAGS, NOW, NO_SERVICES)
-        self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], 866)
+        self.assertEqual(values['available_quantity_for_purchase_delivery'], 1225)
+        self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], '')
         self.assertEqual(node, original)
 
     def test_conflicting_or_missing_priority_does_not_choose_fastest_date(self):
@@ -230,7 +232,7 @@ class SelectedOptionTests(unittest.TestCase):
             'delivery_availability': 'Shipping Tomorrow',
             'fastest_delivery': '',
             'available_quantity_for_purchase_delivery': 1141,
-            'available_quantity_for_purchase_fastdelivery': 8,
+            'available_quantity_for_purchase_fastdelivery': '',
         })
         self.assertEqual(display.selected_delivery_text([]), ('', ''))
 
@@ -382,6 +384,14 @@ class ServiceAndCollectorTests(unittest.TestCase):
             self.assertEqual(result['delivery_availability'], '')
             self.assertEqual(result['fastest_delivery'], '')
             self.assertEqual(result['available_quantity_for_purchase_delivery'], '5000+')
+            active = {'delivery_availability': 'Delivery Tomorrow', 'fastest_delivery': 'Get it Tomorrow',
+                      'pick_up_availability': 'Pickup Today',
+                      'available_quantity_for_purchase_delivery': '14',
+                      'available_quantity_for_purchase_pickup': '9'}
+            source.update(active, available_quantity_for_purchase_fastdelivery='866')
+            result = namespace['finalize_row'](source, 'test', '2026-09-22 00:00:00')
+            self.assertEqual({key: result[key] for key in active}, active)
+            self.assertEqual(result['available_quantity_for_purchase_fastdelivery'], '')
 
     def test_eighty_products_continue_after_service_block_without_any_page_visit(self):
         namespace = parser_functions()
@@ -438,6 +448,37 @@ class ServiceAndCollectorTests(unittest.TestCase):
         row = namespace['build_row'](dict.fromkeys(keys, 'STALE'), 'sample', responses)
         self.assertEqual(row['available_quantity_for_purchase_delivery'], 14)
         self.assertTrue(all(row[key] == '' for key in keys if key != 'available_quantity_for_purchase_delivery'))
+
+    def test_old_cache_and_csv_disable_only_fast_quantity_for_ref_and_ldy(self):
+        active = {'delivery_availability': 'Delivery Tomorrow', 'fastest_delivery': 'Get it Tomorrow',
+                  'pick_up_availability': 'Pickup Today',
+                  'available_quantity_for_purchase_delivery': '14',
+                  'available_quantity_for_purchase_pickup': '9'}
+        disabled = 'available_quantity_for_purchase_fastdelivery'
+        stale = dict(active, **{disabled: '866'})
+        db_path = Path(__file__).with_name('step14_db_load.py')
+        tree = ast.parse(db_path.read_text(encoding='utf-8-sig'))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {'as_int', 'calendar_week_now', 'map_row', 'empty_to_none'}]
+        for category in ('REF', 'LDY'):
+            with self.subTest(category=category):
+                responses = {
+                    'productdetail': {'status': 200, 'body': json.dumps({'productDetails': {'sample': washer()}})},
+                    'fulfillment_display': {'body': json.dumps({'source': 'api', 'status': 'ok',
+                                                               'flags': FLAGS, 'values': stale})},
+                }
+                parser = parser_functions(category)
+                for cached_responses in (responses, {}):
+                    row = parser['build_row'](stale, 'sample', cached_responses)
+                    self.assertEqual({key: row[key] for key in active}, active)
+                    self.assertEqual(row[disabled], '')
+                namespace = {'datetime': datetime, 'PRODUCT_TYPE': category, 'INT_COLUMNS': set(),
+                             'output_page_type': lambda row: 'main', 'retailer_sku_name_text': lambda row: ''}
+                exec(compile(ast.Module(body=functions, type_ignores=[]), str(db_path), 'exec'), namespace)
+                mapped = namespace['map_row'](stale)
+                self.assertEqual({key: mapped[key] for key in active}, active)
+                self.assertIsNone(namespace['empty_to_none'](mapped[disabled], disabled))
+                self.assertEqual(stale[disabled], '866')
 
 
 if __name__ == '__main__':

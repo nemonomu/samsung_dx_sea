@@ -16,6 +16,8 @@ FIELDS = (
     'available_quantity_for_purchase_delivery',
     'available_quantity_for_purchase_fastdelivery',
 )
+# Fast-delivery quantity collection is discontinued; retain its blank column.
+# Delivery/pickup quantities and the selected delivery date remain active.
 FLAG_NAMES = ('enableThreeTileDesign', 'enableNetworkStock', 'isApplianceSwimLaneEnabled')
 # select_inventory_display 0_302_0, fulfillment constants / isMajorAppliance.
 APPLIANCE_GROUPS = {
@@ -380,9 +382,6 @@ def _candidate_display(node, flags=None, now=None, services=None):
                 issues.append('delivery_promotion_title_not_verified')
             else:
                 result['fastest_delivery'] = 'Get it ' + label
-                grouped = [x for x in items if x.get('fullMtdMsg') in ('ExpeditedDelivery', 'Delivery')
-                           and (x.get('isAvlSts') or x.get('totalQty'))]
-                result['available_quantity_for_purchase_fastdelivery'] = quantity(grouped)
     else:
         grouped = [x for x in items if method(x) != 'pickup' and (x.get('isAvlSts') or x.get('totalQty'))]
         result['available_quantity_for_purchase_delivery'] = quantity(grouped)
@@ -545,9 +544,6 @@ def displayed_fields(cards, fast_message=''):
         title, date, qty = normal[0]
         result['delivery_availability'] = f'{title} {date}'
         result['available_quantity_for_purchase_delivery'] = qty
-    if fast:
-        _, _, qty = fast[0]
-        result['available_quantity_for_purchase_fastdelivery'] = qty
     if fast_message:
         # Field 45 is separate from a Fast Delivery card's date/quantity.
         # Never invent "Get it" for a page with no such selected option.

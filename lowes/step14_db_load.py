@@ -159,7 +159,10 @@ def map_row(row):
     out["fastest_delivery"] = row.get("fastest_delivery", "")
     out["available_quantity_for_purchase_pickup"] = row.get("available_quantity_for_purchase_pickup", "")
     out["available_quantity_for_purchase_delivery"] = row.get("available_quantity_for_purchase_delivery", "")
-    out["available_quantity_for_purchase_fastdelivery"] = row.get("available_quantity_for_purchase_fastdelivery", "")
+    # Keep the DB column, but do not load this discontinued REF/LDY value.
+    out["available_quantity_for_purchase_fastdelivery"] = (
+        "" if PRODUCT_TYPE in ("REF", "LDY") else row.get("available_quantity_for_purchase_fastdelivery", "")
+    )
     out["recommendation_intent"] = row.get("recommendation_intent", "")
     out["summarized_review_content"] = row.get("summarized_review_content", "")
     out["detailed_review_content"] = row.get("detailed_review_content", "")

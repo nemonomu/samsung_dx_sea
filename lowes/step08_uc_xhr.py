@@ -814,6 +814,9 @@ def build_row(src, sku, responses, serving_store=None):
     row['detail_xhr_status'] = json.dumps(statuses)
     if serving_store is not None:
         row['serving_store'] = serving_store
+    if lowes_product_type().upper() in ('REF', 'LDY'):
+        # Also discard the discontinued value from cached display evidence.
+        row['available_quantity_for_purchase_fastdelivery'] = ''
     return row
 
 
