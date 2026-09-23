@@ -60,6 +60,9 @@ class FakeNextDataClient:
 
 def bare_crawler():
     crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
+    crawler.account_name = 'Walmart'
+    crawler.batch_id = 'test-save-scope'
+    crawler.test_mode = True
     crawler._env_int = lambda name, default, minimum=1: default
     crawler._record_run_error = lambda *args, **kwargs: None
     crawler.detail_next_data_workers = 1
@@ -1361,6 +1364,20 @@ class DetailSaveGuardTests(unittest.TestCase):
 
 
 class DetailReportTests(unittest.TestCase):
+    def test_file_cleanup_warning_is_separate_from_missing_db_rows(self):
+        body, severity = build_walmart_tv_email_report(
+            crawl_results={},
+            detail_report={
+                'target_records': 1, 'detail_records': 1, 'saved_records': 1,
+                'recovery_file_pending': 1, 'run_errors': [],
+            },
+            log_file=None, elapsed=1, failed_stages=[],
+        )
+        self.assertEqual(severity, 'warning')
+        self.assertIn('DB 적재 성공·복구 파일 정리 필요: 1건', body)
+        self.assertNotIn('detail missing', body)
+        self.assertNotIn('실패 단계', body)
+
     def test_review_mismatch_is_warning_without_missing_detail(self):
         body, severity = build_walmart_tv_email_report(
             crawl_results={},
@@ -1476,6 +1493,7 @@ class DetailUpdateSaveTests(unittest.TestCase):
     def test_none_review_body_preserves_existing_value(self):
         class FakeCursor:
             def __init__(self):
+                self.rowcount = 1
                 self.query = None
                 self.params = None
 
@@ -1504,6 +1522,8 @@ class DetailUpdateSaveTests(unittest.TestCase):
             WalmartTVDetailUpdateCrawler
         )
         crawler.test_mode = True
+        crawler.account_name = 'Walmart'
+        crawler.batch_id = 'test-save-scope'
         crawler.db_conn = FakeConnection()
         product = {
             'id': 7,
