@@ -311,8 +311,8 @@ class RecoveryTests(unittest.TestCase):
         note = common.recovery_notification("TV", self.root)
         self.assertFalse(note["incomplete"])
         self.assertIn("수집 완료", note["subject"])
-        self.assertIn("수집 성공·부가 필드 경고: 1개 항목", note["body"])
-        self.assertIn("NOT_FOUND productBySkuId.reviewInfo.proFeatures", note["body"])
+        self.assertNotIn("부가 필드 경고", note["body"])
+        self.assertNotIn("proFeatures", note["body"])
         self.assertNotIn("보류", note["body"])
         with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
             final = list(csv.DictReader(stream))

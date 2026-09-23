@@ -229,17 +229,6 @@ def recovery_notification(category, root, status="success"):
         lines.append(f"- 전체 {len(failures)}개 미완료 항목 중 50개 표시. 전체 내역: {root / 'detail/parsed/detail_failures.csv'}")
     if not failures:
         lines.append("- 없음" if detail else "- 상세 미실행")
-    warnings = detail.get("warnings", [])
-    if warnings:
-        lines += ["", f"수집 성공·부가 필드 경고: {len(warnings)}개 항목",
-                  "- 필요한 비교상품 데이터는 검증·저장했습니다. 아래 리뷰 장단점 요약 오류는 수집 실패가 아닙니다.",
-                  "SKU | main 순위 | BSR 순위 | 항목 | 오류 코드·경로"]
-        for item in warnings[:50]:
-            paths = "; ".join(str((error.get("extensions") or {}).get("code", "")) + " " +
-                              ".".join(map(str, error.get("path") or [])) for error in item.get("warnings", []))
-            lines.append(" | ".join(str(item.get(k, "")) for k in ("sku_id", "main_rank", "bsr_rank", "stage")) + " | " + paths)
-        if len(warnings) > 50:
-            lines.append(f"- 전체 {len(warnings)}개 중 50개 표시. 전체 내역: {root / 'output/collection_status.json'}")
     lines += ["", "복구 이력"]
     for report in reports:
         for event in report.get("recovery_history", []):
