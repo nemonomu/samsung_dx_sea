@@ -12,17 +12,37 @@ from .step00_collection_recovery import (
 )
 
 
+def is_compare_feature_warning(stage, error):
+    """Only the observed NOT_FOUND review-summary leaves are nonessential."""
+    if stage != "compare" or not isinstance(error, dict):
+        return False
+    extensions = error.get("extensions")
+    path = error.get("path")
+    if not isinstance(extensions, dict) or extensions.get("code") != "NOT_FOUND" or not isinstance(path, list):
+        return False
+    if len(path) == 3:
+        return path[:2] == ["productBySkuId", "reviewInfo"] and path[2] in ("proFeatures", "conFeatures")
+    return (len(path) == 8 and path[:2] == ["recommendations", "subPlacements"]
+            and type(path[2]) is int and path[2] >= 0 and path[3] == "recommendations"
+            and type(path[4]) is int and path[4] >= 0 and path[5:7] == ["item", "reviewInfo"]
+            and path[7] in ("proFeatures", "conFeatures"))
+
+
 def validate_operation(d, stage, sku, item, target):
     if not isinstance(item, dict):
         return "failed", "missing_data"
     errors = item.get("errors") or []
-    if errors:
-        return "failed", "permanent_graphql_error" if permanent_errors(errors) else "graphql_errors"
+    if not isinstance(errors, list):
+        return "failed", "graphql_errors"
+    blocking = [error for error in errors if not is_compare_feature_warning(stage, error)]
+    if blocking:
+        return "failed", "permanent_graphql_error" if permanent_errors(
+            [error for error in blocking if isinstance(error, dict)]) else "graphql_errors"
     if not isinstance(item.get("data"), dict):
         return "failed", "missing_data"
     data = item["data"]
     product = data.get("productBySkuId") or {}
-    if stage in {"detail", "review"} or (stage == "compare" and product):
+    if stage in {"detail", "review", "compare"}:
         if not isinstance(product, dict) or str(product.get("skuId") or "") != sku:
             return "failed", "product_identity_mismatch_or_missing"
     if stage == "detail":
@@ -52,7 +72,17 @@ def validate_operation(d, stage, sku, item, target):
             return "failed", "recommendations_shape_missing"
         if any(not isinstance(p, dict) or not isinstance(p.get("recommendations"), list) for p in placements):
             return "failed", "recommendations_list_missing"
-        return ("empty", "verified_empty") if not any(p["recommendations"] for p in placements) else ("success", "verified")
+        for placement in placements:
+            for recommendation in placement["recommendations"]:
+                candidate = recommendation.get("item") if isinstance(recommendation, dict) else None
+                if not isinstance(candidate, dict) or not str(candidate.get("skuId") or "").strip():
+                    return "failed", "recommendation_identity_missing"
+                name = d.product_short_name(candidate)
+                if not isinstance(name, str) or not name.strip():
+                    return "failed", "recommendation_name_missing"
+        empty = not any(p["recommendations"] for p in placements)
+        reason = "verified_empty" if empty else "verified"
+        return ("empty" if empty else "success"), reason + ("_with_warnings" if errors else "")
     return "success", "verified"
 
 
@@ -96,7 +126,7 @@ def store_operation(d, target, stage, payload, item, state):
 
 
 def make_report(targets, states, evidence, reason="", status="running"):
-    failures, counts = [], {}
+    failures, warnings, counts = [], [], {}
     complete = 0
     for target in targets:
         sku = str(target["sku_id"])
@@ -107,8 +137,11 @@ def make_report(targets, states, evidence, reason="", status="running"):
             if state.get("required") and state["status"] not in SUCCESS_STATES:
                 failures.append(dict(sku_id=sku, main_rank=target.get("main_rank", ""),
                     bsr_rank=target.get("bsr_rank", ""), stage=stage, **state))
+            if state["status"] in SUCCESS_STATES and state.get("warnings"):
+                warnings.append(dict(sku_id=sku, main_rank=target.get("main_rank", ""),
+                    bsr_rank=target.get("bsr_rank", ""), stage=stage, **state))
     return dict(status=status, target_count=len(targets), completed_skus=complete,
-                stage_counts=counts, failures=failures, items=states, reason=reason,
+                stage_counts=counts, failures=failures, warnings=warnings, items=states, reason=reason,
                 evidence_path=str(evidence.root), collected_date=str(date.today()),
                 recovery_history=[e for e in evidence.events if e["event"] in RECOVERY_EVENTS],
                 updated_at=utc_now())
@@ -272,6 +305,8 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                     outcome, why = validate_operation(d, stage, sku, response[index], target)
                     state.update(status=outcome, reason=why, status_code=code,
                                  evidence_path=event["evidence_path"], collected_at=utc_now(), response_received=True)
+                    state["warnings"] = sanitized(response[index].get("errors") or []) if (
+                        outcome in SUCCESS_STATES and isinstance(response[index], dict)) else []
                     if outcome not in SUCCESS_STATES and budget.started is None:
                         budget.started = budget.clock()
                     store_operation(d, target, stage, payload, response[index], state)
@@ -295,7 +330,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         for folder in (d.PARSED_DIR, d.BENCHMARKS_DIR, d.OUTPUT_ROOT):
             folder.mkdir(parents=True, exist_ok=True)
         atomic_csv(d.write_csv, d.DETAIL_ROWS_CSV, rows)
-        atomic_csv(d.write_csv, d.FAILURES_CSV, report["failures"], ["sku_id", "main_rank", "bsr_rank", "stage", "status", "attempt", "reason", "evidence_path"])
+        atomic_csv(d.write_csv, d.FAILURES_CSV, report["failures"], ["sku_id", "main_rank", "bsr_rank", "stage", "status", "attempt", "request_attempt", "reason", "evidence_path"])
         fields = d.sample_fields()
         for row in rows:
             for field in fields:

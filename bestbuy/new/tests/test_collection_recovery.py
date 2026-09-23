@@ -1,6 +1,7 @@
 """Offline regression scenarios for the September 22 intermittent failures."""
 
 import io
+import copy
 import csv
 import json
 import os
@@ -222,6 +223,102 @@ class RecoveryTests(unittest.TestCase):
         item = {"data": {"recommendations": {"subPlacements": []}}, "errors": [{"message": "broken"}]}
         self.assertEqual(recovery.validate_operation(detail, "compare", "A", item, t)[0], "failed")
 
+    @staticmethod
+    def compare_with_warning(sku="12345"):
+        return {"data": {"productBySkuId": {"skuId": sku, "name": {"short": "Current"}},
+                         "recommendations": {"subPlacements": [{"recommendations": [
+                             {"item": {"skuId": "99999", "name": {"short": "Similar"}}}]}]}},
+                "errors": [{"message": "Error - Not Found", "extensions": {"code": "NOT_FOUND"},
+                            "path": ["productBySkuId", "reviewInfo", "proFeatures"]},
+                           {"message": "Error - Not Found", "extensions": {"code": "NOT_FOUND"},
+                            "path": ["recommendations", "subPlacements", 0, "recommendations", 0,
+                                     "item", "reviewInfo", "conFeatures"]}]}
+
+    def test_compare_optional_warning_requires_valid_core_and_exact_error_paths(self):
+        good = self.compare_with_warning()
+        self.assertEqual(recovery.validate_operation(detail, "compare", "12345", good, {}),
+                         ("success", "verified_with_warnings"))
+        for mutation in ("missing_product", "wrong_sku", "null_placements", "null_list", "null_item",
+                         "missing_sku", "missing_name", "critical_error", "unknown_code", "unknown_path",
+                         "wrong_index", "malformed_error"):
+            with self.subTest(mutation=mutation):
+                item = copy.deepcopy(good)
+                product = item["data"]["productBySkuId"]
+                recs = item["data"]["recommendations"]
+                candidate = recs["subPlacements"][0]["recommendations"][0]["item"]
+                if mutation == "missing_product": item["data"]["productBySkuId"] = None
+                elif mutation == "wrong_sku": product["skuId"] = "wrong"
+                elif mutation == "null_placements": recs["subPlacements"] = None
+                elif mutation == "null_list": recs["subPlacements"][0]["recommendations"] = None
+                elif mutation == "null_item": recs["subPlacements"][0]["recommendations"][0]["item"] = None
+                elif mutation == "missing_sku": candidate.pop("skuId")
+                elif mutation == "missing_name": candidate["name"] = {"short": " "}
+                elif mutation == "critical_error": item["errors"].append({"path": ["recommendations"], "extensions": {"code": "NOT_FOUND"}})
+                elif mutation == "unknown_code": item["errors"][0]["extensions"]["code"] = "INTERNAL_SERVER_ERROR"
+                elif mutation == "unknown_path": item["errors"][0]["path"][-1] = "reviewCount"
+                elif mutation == "wrong_index": item["errors"][1]["path"][2] = -1
+                elif mutation == "malformed_error": item["errors"].append("unexpected")
+                self.assertEqual(recovery.validate_operation(detail, "compare", "12345", item, {})[0], "failed")
+        for stage in ("detail", "review", "compare_v2"):
+            self.assertEqual(recovery.validate_operation(detail, stage, "12345", good, {})[0], "failed")
+
+    def test_compare_explicit_empty_differs_from_missing_even_with_warning(self):
+        item = self.compare_with_warning()
+        item["errors"] = item["errors"][:1]
+        item["data"]["recommendations"]["subPlacements"] = []
+        self.assertEqual(recovery.validate_operation(detail, "compare", "12345", item, {}),
+                         ("empty", "verified_empty_with_warnings"))
+        item["data"]["recommendations"]["subPlacements"] = None
+        self.assertEqual(recovery.validate_operation(detail, "compare", "12345", item, {})[0], "failed")
+
+    def test_warning_success_is_saved_not_retried_and_survives_resume(self):
+        self.install_detail()
+        targets = [dict(sku_id=sku, main_rank=rank, bsr_rank="7", review_count="0")
+                   for sku, rank in (("12345", "15"), ("67890", "16"))]
+        requests = []
+        def post(payloads, *args):
+            requests.append(payloads)
+            responses = []
+            for payload in payloads:
+                sku = payload["variables"]["skuId"]
+                if payload["operationName"] == "GetCompareProduct" and sku == "12345":
+                    responses.append(self.compare_with_warning(sku))
+                else:
+                    responses.append(self.response(payload, compare_failure=True))
+            return 200, "", responses, {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            with self.assertRaises(common.CollectionIncomplete):
+                recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+        self.assertEqual([len(p) for p in requests], [6, 1, 1])
+        self.assertTrue(all(p["variables"]["skuId"] == "67890" for batch in requests[1:] for p in batch))
+        report = common.read_json(self.root / "output/collection_status.json")
+        self.assertEqual(report["completed_skus"], 1)
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertEqual(report["warnings"][0]["main_rank"], "15")
+        rows = common.read_json(self.root / "output/partial_output.json")
+        self.assertEqual(rows[0]["retailer_sku_name_similar"], "Current ||| Similar")
+        self.assertIsNone(rows[1]["retailer_sku_name_similar"])
+        journal = next((self.root / "detail/recovery").rglob("events.jsonl")).read_text(encoding="utf-8")
+        self.assertIn('"warnings":', journal)
+        self.assertIn("proFeatures", journal)
+        def recovered(payloads, *args):
+            self.assertTrue(all(p["variables"]["skuId"] == "67890" for p in payloads))
+            return 200, "", [self.response(p) for p in payloads], {}, 0
+        with patch.object(detail, "browser_graphql_post", recovered):
+            report = recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(len(report["warnings"]), 1)
+        note = common.recovery_notification("TV", self.root)
+        self.assertFalse(note["incomplete"])
+        self.assertIn("수집 완료", note["subject"])
+        self.assertIn("수집 성공·부가 필드 경고: 1개 항목", note["body"])
+        self.assertIn("NOT_FOUND productBySkuId.reviewInfo.proFeatures", note["body"])
+        self.assertNotIn("보류", note["body"])
+        with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
+            final = list(csv.DictReader(stream))
+        self.assertEqual(final[0]["retailer_sku_name_similar"], "Current ||| Similar")
+        self.assertEqual((final[0]["main_rank"], final[0]["bsr_rank"]), ("15", "7"))
+
     def test_cross_page_duplicate_restarts_without_accepting_shifted_ranks(self):
         api, calls = self.fake_listing(iter([page_data("same"), page_data("same"), page_data("probe"),
                                            page_data("a"), page_data("b"), page_data("c")]))
@@ -285,7 +382,7 @@ class RecoveryTests(unittest.TestCase):
         from bestbuy import step16_email_notify as notify
         report = dict(status="partial", target_count=300, completed_skus=298,
             failures=[dict(sku_id="A", main_rank=15, bsr_rank=7, stage="detail", status="failed",
-                           request_attempt=3, reason="timeout")], reason="item_attempt_limit")
+                           request_attempt=4, attempt=3, reason="timeout")], reason="item_attempt_limit")
         common.atomic_json(self.root / "output/collection_status.json", report)
         common.atomic_json(self.root / "main/collection_status.json", dict(status="complete", listing_request_calls=20))
         common.atomic_json(self.root / "detail/manifest_detail_enrichment.json",
@@ -293,7 +390,8 @@ class RecoveryTests(unittest.TestCase):
         result = notify.build_notification("REF", self.root, status="failed", failed_step_name="detail_html")
         self.assertIn("298/300", result["subject"])
         self.assertIn("부분 완료", result["subject"])
-        self.assertIn("A | 15 | 7 | detail | failed | 3", result["body"])
+        self.assertIn("A | 15 | 7 | detail | failed | 4 | 3 | timeout", result["body"])
+        self.assertIn("실제 요청 횟수 | 응답 판정 횟수", result["body"])
         self.assertIn("실행 결과: failed", result["body"])
         self.assertNotIn("총 수집 0", result["body"])
         self.assertEqual(result["metrics"]["call_counts"]["total"], 28)

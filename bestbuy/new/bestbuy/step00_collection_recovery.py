@@ -217,17 +217,29 @@ def recovery_notification(category, root, status="success"):
     for stage, counts in detail.get("stage_counts", {}).items():
         lines.append(f"- {stage}: 성공 {counts.get('success', 0)}, 정상 빈 결과 {counts.get('empty', 0)}, "
                      f"미완료 {sum(n for s, n in counts.items() if s not in SUCCESS_STATES)}")
-    lines += ["", "미완료 상품 (SKU | main 순위 | BSR 순위 | 항목 | 상태 | 시도 | 원인)"]
+    lines += ["", "미완료 상품 (SKU | main 순위 | BSR 순위 | 항목 | 상태 | 실제 요청 횟수 | 응답 판정 횟수 | 원인)"]
     lines += ["detail=상세정보, review=리뷰, compare=비교상품 / failed=실패, pending=미실행"]
     failures = detail.get("failures", [])
     for item in failures[:50]:
-        shown = dict(item, attempt=item.get("request_attempt", item.get("attempt", 0)))
+        shown = dict(item, request_attempt=item.get("request_attempt", item.get("attempt", 0)),
+                     attempt=item.get("attempt", "미기록"))
         lines.append(" | ".join(str(shown.get(k, "")) for k in
-                              ("sku_id", "main_rank", "bsr_rank", "stage", "status", "attempt", "reason")))
+                              ("sku_id", "main_rank", "bsr_rank", "stage", "status", "request_attempt", "attempt", "reason")))
     if len(failures) > 50:
         lines.append(f"- 전체 {len(failures)}개 미완료 항목 중 50개 표시. 전체 내역: {root / 'detail/parsed/detail_failures.csv'}")
     if not failures:
         lines.append("- 없음" if detail else "- 상세 미실행")
+    warnings = detail.get("warnings", [])
+    if warnings:
+        lines += ["", f"수집 성공·부가 필드 경고: {len(warnings)}개 항목",
+                  "- 필요한 비교상품 데이터는 검증·저장했습니다. 아래 리뷰 장단점 요약 오류는 수집 실패가 아닙니다.",
+                  "SKU | main 순위 | BSR 순위 | 항목 | 오류 코드·경로"]
+        for item in warnings[:50]:
+            paths = "; ".join(str((error.get("extensions") or {}).get("code", "")) + " " +
+                              ".".join(map(str, error.get("path") or [])) for error in item.get("warnings", []))
+            lines.append(" | ".join(str(item.get(k, "")) for k in ("sku_id", "main_rank", "bsr_rank", "stage")) + " | " + paths)
+        if len(warnings) > 50:
+            lines.append(f"- 전체 {len(warnings)}개 중 50개 표시. 전체 내역: {root / 'output/collection_status.json'}")
     lines += ["", "복구 이력"]
     for report in reports:
         for event in report.get("recovery_history", []):
