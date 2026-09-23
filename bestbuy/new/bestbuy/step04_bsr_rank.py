@@ -20,6 +20,8 @@ def load_rows(path):
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT.parent, listing=RUN_ROOT.name)
     rows = load_rows(INPUT_CSV)
     organic = [row for row in rows if row.get("container_type") == "organic_product"]
     organic.sort(key=lambda row: int(row.get("global_organic_rank") or row.get("visual_rank") or 999999))

@@ -440,6 +440,8 @@ def load_rows(cur, table_name, columns, rows, dry_run=False):
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT)
     started_at = now()
     category = CATEGORY.strip().upper()
     if category not in ITEM_MST_TABLES:

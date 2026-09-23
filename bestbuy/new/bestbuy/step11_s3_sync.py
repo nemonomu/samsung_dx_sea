@@ -142,6 +142,8 @@ def write_manifest(started_at, sync_cmd, attempts, verify_cmd=None, verify_resul
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT)
     require_config()
     started_at = now()
     command = sync_command()

@@ -6771,6 +6771,11 @@ def main():
         )
     if BROWSER_GRAPHQL_CANARY_ONLY and not targets:
         raise DetailBrowserCanaryError("BestBuy home-origin GraphQL canary has no selected targets")
+    if browser_direct_graphql and not BROWSER_GRAPHQL_CANARY_ONLY:
+        import sys
+        from .step08_collection_recovery import run
+        return run(sys.modules[__name__], targets, output_targets)
+
     preflight_size = (
         max(1, BROWSER_GRAPHQL_PREFLIGHT_SIZE)
         if BROWSER_GRAPHQL_CANARY_ONLY

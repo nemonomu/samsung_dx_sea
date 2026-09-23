@@ -298,6 +298,8 @@ def write_csv(path, rows):
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT.parent, listing=RUN_ROOT.name)
     started_at = now()
     rows = load_rows(INPUT_CSV)
     target_rows = [row for row in rows if row.get("container_type") in TARGET_CONTAINERS]

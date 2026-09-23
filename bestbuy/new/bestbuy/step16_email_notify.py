@@ -225,6 +225,9 @@ def manifest_call_counts(run_root):
 
     for sub in ("main", "bsr"):
         data = read_json(run_root / sub / "manifest.json")
+        recovery = read_json(run_root / sub / "collection_status.json")
+        if recovery:
+            data = recovery
         if not data:
             continue
         calls = as_int(
@@ -235,6 +238,10 @@ def manifest_call_counts(run_root):
         if calls:
             listing_total += calls
             listing_breakdown.append({"source": sub, "calls": calls})
+        if recovery and as_int(recovery.get("offer_request_calls")):
+            offer_calls = as_int(recovery["offer_request_calls"])
+            listing_total += offer_calls
+            listing_breakdown.append({"source": sub + "_offers", "calls": offer_calls})
 
     sponsored = read_json(run_root / "main" / "manifest_main_targets.json")
     if sponsored:
@@ -933,6 +940,18 @@ def build_notification(category, run_root, status="success", failed_step="", fai
     rank_counts = rank_collection_counts(rows)
     subject = build_subject(category, issues)
     body = build_body(collected_count, cost_krw, call_counts, issues, rank_counts=rank_counts, notes=notes)
+    from .step00_collection_recovery import recovery_notification
+    recovery = recovery_notification(category, run_root, status)
+    if recovery:
+        subject = recovery["subject"]
+        collected_count = recovery["collected_count"]
+        execution = f"실행 결과: {status} / 중단 단계: {failed_step_name or failed_step or '-'}"
+        body = recovery["body"] + "\n\n" + execution
+        body += f"\n총 호출 {call_counts.get('total', 0)}회 / 비용 {cost_krw:,}원"
+        issues = ["collection_incomplete"] if recovery["incomplete"] else issues
+        if not recovery["incomplete"] and issues:
+            subject = subject.replace("[수집 완료]", "[확인 필요]")
+            body += "\n\n추가 확인사항\n" + "\n".join("- " + str(issue) for issue in issues)
     return {
         "subject": subject,
         "body": body,

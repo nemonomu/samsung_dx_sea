@@ -791,6 +791,8 @@ def write_db_load_manifest(manifest):
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT)
     started_at = now()
     config = db_config()
     if not config and not DRY_RUN:

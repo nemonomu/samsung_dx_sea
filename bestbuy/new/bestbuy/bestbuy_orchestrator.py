@@ -426,6 +426,9 @@ def expected_pages(step):
 
 def main_list_complete(step):
     root = run_root(step.env) / step.env.get("BESTBUY_MAIN_RUN_ID", "main")
+    recovery = read_json(root / "collection_status.json")
+    if recovery and recovery.get("status") != "complete":
+        return False, "listing recovery incomplete"
     manifest = read_json(root / "manifest.json")
     expected = expected_pages(step)
     calls = int(
@@ -434,7 +437,7 @@ def main_list_complete(step):
         or manifest.get("actual_post_calls")
         or 0
     ) if manifest else 0
-    if not manifest or calls < expected:
+    if not manifest or (not recovery and calls < expected):
         return False, f"calls {calls}/{expected}"
     csv_path = root / "parsed" / "main_occurrences.csv"
     if csv_count(csv_path) <= 0:
@@ -518,6 +521,14 @@ def final_targets_complete():
 
 def detail_html_complete():
     root = run_root()
+    recovery = read_json(root / "output" / "collection_status.json")
+    if recovery:
+        from .step00_collection_recovery import assert_ready, CollectionIncomplete
+        try:
+            assert_ready(root)
+        except CollectionIncomplete as exc:
+            return False, str(exc)
+        return recovery.get("status") == "complete", f"collection {recovery.get('status')}"
     target_csv = root / "output" / "bestbuy_final_targets.csv"
     target_count = csv_unique_count(target_csv, "sku_id")
     detail_meta = list((root / "detail" / "raw" / "detail_html").rglob("*_meta.json"))
@@ -531,6 +542,14 @@ def detail_html_complete():
 
 def review20_complete():
     root = run_root()
+    recovery = read_json(root / "output" / "collection_status.json")
+    if recovery:
+        from .step00_collection_recovery import assert_ready, CollectionIncomplete
+        try:
+            assert_ready(root)
+        except CollectionIncomplete as exc:
+            return False, str(exc)
+        return recovery.get("status") == "complete", f"collection {recovery.get('status')}"
     target_csv = root / "output" / "bestbuy_final_targets.csv"
     target_count = csv_unique_count(target_csv, "sku_id")
     output_count = csv_count(root / "output" / "final_output.csv")
@@ -651,6 +670,9 @@ def run_step(step, dry_run=False, resume=False):
         print("[env] " + " ".join(f"{key}={value}" for key, value in effective_env.items()))
     if dry_run:
         return
+    if step.name in {"s3_sync", "db_prepare", "db_load", "item_mst_load", "local_cleanup"}:
+        from .step00_collection_recovery import assert_ready
+        assert_ready(run_root(env))
     try:
         subprocess.run(command, check=True, env=env)
     except subprocess.CalledProcessError as exc:

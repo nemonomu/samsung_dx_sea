@@ -1811,7 +1811,7 @@ def browser_graphql_fetch_once(page, payload, browser_page):
     page_url = build_search_url(page)
     raw_dir = RUN_ROOT / "raw/browser_graphql"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    stem = page_stem(page)
+    stem = page_stem(page) + "_" + secrets.token_hex(8)
     request_path = raw_dir / f"{stem}_request.json"
     response_path = raw_dir / f"{stem}_response.txt"
     response_json_path = raw_dir / f"{stem}_response.json"
@@ -2251,10 +2251,12 @@ def main():
     )
     client = ZenRowsClient(api_key) if api_key else None
     listing_session = ListingSessionState()
-    browser_page = create_browser_graphql_page() if LISTING_COLLECTION_MODE == "browser_graphql" else None
-    if browser_page is not None:
-        atexit.register(close_browser_graphql_page, browser_page)
-        initialize_browser_graphql_session(browser_page)
+    if LISTING_COLLECTION_MODE == "browser_graphql":
+        from .step00_collection_recovery import atomic_json
+        atomic_json(RUN_ROOT / "collection_status.json", {
+            "status": "running", "reason": "browser_bootstrap", "organic_count": 0
+        })
+    browser_page = None  # Recovery owns bootstrap, restart and cleanup.
 
     rows_by_page = {}
     page_benchmarks = []
@@ -2272,89 +2274,97 @@ def main():
     )
     print(f"benchmark_start={run_started_at}")
 
-    page = 0
-    organic_collected = 0
-    consecutive_dry = 0
-    while True:
-        page += 1
-        if LISTING_ORGANIC_TARGET > 0:
-            if organic_collected >= LISTING_ORGANIC_TARGET:
-                break
-            if page > LISTING_MAX_PAGES:
-                print(
-                    f"[listing_dynamic] stop max_pages={LISTING_MAX_PAGES} "
-                    f"organic={organic_collected}/{LISTING_ORGANIC_TARGET}",
-                    flush=True,
-                )
-                break
-        elif page > SEARCH_PAGES:
-            break
-        if page > 1 and LISTING_PAGE_SLEEP_SECONDS > 0:
-            print(f"[listing_page_sleep] before_page={page:03d} sleep={LISTING_PAGE_SLEEP_SECONDS:g}s", flush=True)
-            time.sleep(LISTING_PAGE_SLEEP_SECONDS)
-        cached = load_cached_page(page) if LISTING_COLLECTION_MODE == "graphql" else None
-        if cached:
-            response_json, meta, rows = cached
-            source = "cache"
-        else:
-            response_json, meta, rows = collect_listing_page(
-                page,
-                operation,
-                client,
-                listing_session,
-                bootstrap_attempts,
-                browser_page,
-            )
-            source = meta.get("transport") or "network"
-        rows_by_page[page] = rows
-        summary = page_summary(page, rows, meta, response_json)
-        summary["source"] = source
-        summary.update(capture_listing_debug_screenshot(client, page, summary, source))
-        page_benchmarks.append(summary)
-        append_csv(realtime_benchmarks_path, summary, list(summary.keys()))
-        raw_search.append(
-            {
-                "page": page,
-                "url": build_search_url(page),
-                "meta": meta,
-                "summary": summary,
-            }
+    recovery_report = None
+    if LISTING_COLLECTION_MODE == "browser_graphql":
+        import sys
+        from .step01_listing_recovery import collect
+        rows_by_page, page_benchmarks, raw_search, recovery_report = collect(
+            sys.modules[__name__], operation, browser_page
         )
-        print(
-            f"page={page:03d} source={source} status={meta['status_code']} elapsed={meta['elapsed_seconds']}s "
-            f"cost={meta['x_request_cost']} organic={summary['organic_count']} "
-            f"ingrid={summary['sponsored_ingrid_count']} carousel={summary['sponsored_carousel_count']} "
-            f"rows={summary['total_occurrence_count']} "
-            f"response_fulfillment={summary['response_fulfillment_product_count']}/{summary['response_product_count']} "
-            f"rows_any_availability={summary['rows_with_any_availability']}",
-            flush=True,
-        )
-        if LISTING_ORGANIC_TARGET > 0:
-            organic_this = int(summary.get("organic_count") or 0)
-            organic_collected += organic_this
-            if organic_this <= 0:
-                consecutive_dry += 1
-                if consecutive_dry >= LISTING_ORGANIC_TARGET_DRY_PAGES:
+    else:
+        page = 0
+        organic_collected = 0
+        consecutive_dry = 0
+        while True:
+            page += 1
+            if LISTING_ORGANIC_TARGET > 0:
+                if organic_collected >= LISTING_ORGANIC_TARGET:
+                    break
+                if page > LISTING_MAX_PAGES:
                     print(
-                        f"[listing_dynamic] stop dry_pages={consecutive_dry} "
+                        f"[listing_dynamic] stop max_pages={LISTING_MAX_PAGES} "
                         f"organic={organic_collected}/{LISTING_ORGANIC_TARGET}",
                         flush=True,
                     )
                     break
+            elif page > SEARCH_PAGES:
+                break
+            if page > 1 and LISTING_PAGE_SLEEP_SECONDS > 0:
+                print(f"[listing_page_sleep] before_page={page:03d} sleep={LISTING_PAGE_SLEEP_SECONDS:g}s", flush=True)
+                time.sleep(LISTING_PAGE_SLEEP_SECONDS)
+            cached = load_cached_page(page) if LISTING_COLLECTION_MODE == "graphql" else None
+            if cached:
+                response_json, meta, rows = cached
+                source = "cache"
             else:
-                consecutive_dry = 0
+                response_json, meta, rows = collect_listing_page(
+                    page,
+                    operation,
+                    client,
+                    listing_session,
+                    bootstrap_attempts,
+                    browser_page,
+                )
+                source = meta.get("transport") or "network"
+            rows_by_page[page] = rows
+            summary = page_summary(page, rows, meta, response_json)
+            summary["source"] = source
+            summary.update(capture_listing_debug_screenshot(client, page, summary, source))
+            page_benchmarks.append(summary)
+            append_csv(realtime_benchmarks_path, summary, list(summary.keys()))
+            raw_search.append(
+                {
+                    "page": page,
+                    "url": build_search_url(page),
+                    "meta": meta,
+                    "summary": summary,
+                }
+            )
+            print(
+                f"page={page:03d} source={source} status={meta['status_code']} elapsed={meta['elapsed_seconds']}s "
+                f"cost={meta['x_request_cost']} organic={summary['organic_count']} "
+                f"ingrid={summary['sponsored_ingrid_count']} carousel={summary['sponsored_carousel_count']} "
+                f"rows={summary['total_occurrence_count']} "
+                f"response_fulfillment={summary['response_fulfillment_product_count']}/{summary['response_product_count']} "
+                f"rows_any_availability={summary['rows_with_any_availability']}",
+                flush=True,
+            )
+            if LISTING_ORGANIC_TARGET > 0:
+                organic_this = int(summary.get("organic_count") or 0)
+                organic_collected += organic_this
+                if organic_this <= 0:
+                    consecutive_dry += 1
+                    if consecutive_dry >= LISTING_ORGANIC_TARGET_DRY_PAGES:
+                        print(
+                            f"[listing_dynamic] stop dry_pages={consecutive_dry} "
+                            f"organic={organic_collected}/{LISTING_ORGANIC_TARGET}",
+                            flush=True,
+                        )
+                        break
+                else:
+                    consecutive_dry = 0
 
-    retry_failed_pages_with_delay(
-        operation,
-        client,
-        listing_session,
-        bootstrap_attempts,
-        browser_page,
-        rows_by_page,
-        page_benchmarks,
-        raw_search,
-        realtime_benchmarks_path,
-    )
+        retry_failed_pages_with_delay(
+            operation,
+            client,
+            listing_session,
+            bootstrap_attempts,
+            browser_page,
+            rows_by_page,
+            page_benchmarks,
+            raw_search,
+            realtime_benchmarks_path,
+        )
     page_benchmarks.sort(key=lambda summary: int(summary.get("page") or 0))
     raw_search.sort(key=lambda item: int(item.get("page") or 0))
     all_rows = [
@@ -2392,6 +2402,9 @@ def main():
                 pass
     listing_request_calls = sum(int(summary.get("attempt_count") or 1) for summary in page_benchmarks)
     offer_graphql_calls = sum(int(item["meta"].get("offer_graphql_request_count") or 0) for item in raw_search)
+    if recovery_report:
+        listing_request_calls = recovery_report["listing_request_calls"]
+        offer_graphql_calls = recovery_report["offer_request_calls"]
     graphql_post_calls = listing_request_calls if LISTING_COLLECTION_MODE in {"graphql", "browser_graphql"} else 0
     graphql_post_calls += offer_graphql_calls
     bootstrap_call_count = len(bootstrap_attempts)
@@ -2538,8 +2551,19 @@ def main():
             "main_page_summary": rel_path(parsed_dir / "main_page_summary.json"),
         },
     }
+    if recovery_report:
+        manifest["collection_status"] = recovery_report
+        # Structural verification recognizes combo slots; a fixed row threshold
+        # must not relabel the accepted pass as failed (e.g. 17 products + 6 ads).
+        manifest["failed_pages"] = []
     (RUN_ROOT / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    if recovery_report:
+        recovery_report["status"] = "complete"
+        import hashlib
+        recovery_report["occurrences_csv"] = str((parsed_dir / "main_occurrences.csv").resolve())
+        recovery_report["occurrences_sha256"] = hashlib.sha256((parsed_dir / "main_occurrences.csv").read_bytes()).hexdigest()
+        atomic_json(RUN_ROOT / "collection_status.json", recovery_report)
     print("=" * 80)
     print(f"benchmark_end={manifest['run_finished_at']}")
     print(

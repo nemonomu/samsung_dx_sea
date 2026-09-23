@@ -1,0 +1,369 @@
+"""Offline regression scenarios for the September 22 intermittent failures."""
+
+import io
+import csv
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+os.environ.setdefault("BESTBUY_CATEGORY", "TV")
+os.environ.setdefault("BESTBUY_URL_SOURCE", "default")
+try:
+    import zenrows
+except ModuleNotFoundError:
+    sys.modules.setdefault("zenrows", types.SimpleNamespace(ZenRowsClient=object))
+
+from bestbuy import step00_collection_recovery as common
+from bestbuy import step01_listing_recovery as listing
+from bestbuy import step08_collection_recovery as recovery
+from bestbuy import step08_detail_enrichment as detail
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0
+        self.delays = []
+
+    def sleep(self, value):
+        self.now += value
+        self.delays.append(value)
+
+    def budget(self, evidence):
+        return common.RecoveryBudget(evidence, clock=lambda: self.now, sleep=self.sleep)
+
+
+def page_data(sku):
+    docs = [] if sku is None else [{"product": {"skuId": sku}}]
+    graph = {"data": {"detailedProductSearch": {"documents": docs}}}
+    rows = [] if sku is None else [dict(sku_id=sku, organic_rank=1, container_type="organic_product")]
+    return graph, {"status_code": 200}, rows
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.output = io.StringIO()
+        self.redirect = redirect_stdout(self.output)
+        self.redirect.__enter__()
+        self.addCleanup(self.redirect.__exit__, None, None, None)
+
+    def fake_listing(self, responses):
+        calls = []
+        def fetch(page, payload, browser):
+            calls.append(page)
+            result = next(responses)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        api = types.SimpleNamespace(RUN_ROOT=self.root / "bsr", SEARCH_TERM="refrigerator",
+            SEARCH_SORT="Best-Selling", SEARCH_PAGES=3, LISTING_ORGANIC_TARGET=3,
+            LISTING_MAX_PAGES=8, ORGANIC_OFFSET=1,
+            prepare_product_list_payload=lambda operation, page: {"page": page},
+            browser_graphql_fetch_once=fetch, browser_graphql_local_port=lambda: 1234,
+            page_summary=lambda page, rows, meta, graph: {"page": page},
+            close_browser_graphql_page=Mock(), create_browser_graphql_page=Mock(return_value=object()),
+            initialize_browser_graphql_session=Mock())
+        return api, calls
+
+    def test_failed_page_is_probed_then_new_pass_no_splicing(self):
+        api, calls = self.fake_listing(iter([page_data("old"), RuntimeError("Failed to fetch"),
+            page_data("probe"), page_data("new1"), page_data("new2"), page_data("new3")]))
+        rows, _, _, report = listing.collect(api, {}, object(), budget_factory=Clock().budget)
+        self.assertEqual(calls, [1, 2, 2, 1, 2, 3])
+        self.assertEqual([r[0]["sku_id"] for r in rows.values()], ["new1", "new2", "new3"])
+        self.assertEqual(report["accepted_pass"], 2)
+        self.assertEqual(report["status"], "validated")  # CSV publication is a separate commit point.
+        evidence = list((self.root / "bsr/recovery").rglob("events.jsonl"))[0].read_text(encoding="utf-8")
+        self.assertIn('"old"', evidence)
+        self.assertIn("Failed to fetch", evidence)
+
+    def test_repeated_failure_caps_passes_and_does_not_reset_waits(self):
+        api, calls = self.fake_listing(iter([RuntimeError("offline"), page_data("probe"),
+            RuntimeError("offline"), page_data("probe"), RuntimeError("offline")]))
+        clock = Clock()
+        with self.assertRaisesRegex(common.CollectionIncomplete, "listing_pass_limit"):
+            listing.collect(api, {}, object(), budget_factory=clock.budget)
+        report = common.read_json(self.root / "bsr/collection_status.json")
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual([e["wait_seconds"] for e in report["recovery_history"] if e["event"] == "waiting"], [30, 120])
+        self.assertEqual(calls, [1, 1, 1, 1, 1])
+        with self.assertRaises(common.CollectionIncomplete):
+            common.assert_ready(self.root)
+
+    def test_transport_failure_never_becomes_verified_empty(self):
+        graph, meta, rows = page_data(None)
+        self.assertTrue(listing.validate_page(graph, meta, rows)[2])
+        meta["status_code"] = "ERR"
+        self.assertFalse(listing.validate_page(graph, meta, rows)[0])
+        self.assertFalse(listing.validate_page({"data": {}}, {"status_code": 200}, [])[0])
+
+    def test_combo_positions_allowed_but_missing_product_rejected(self):
+        graph, meta, rows = page_data("a")
+        graph["data"]["detailedProductSearch"]["documents"].append({"combo": {"id": "bundle"}})
+        self.assertTrue(listing.validate_page(graph, meta, rows)[0])
+        graph["data"]["detailedProductSearch"]["documents"][1] = {"product": None}
+        self.assertFalse(listing.validate_page(graph, meta, rows)[0])
+
+    def test_budget_checks_elapsed_time_and_never_sleeps_past_limit(self):
+        clock = Clock()
+        budget = common.RecoveryBudget(Mock(), seconds=40, clock=lambda: clock.now, sleep=clock.sleep)
+        self.assertTrue(budget.wait())
+        self.assertFalse(budget.wait())
+        self.assertEqual(clock.now, 30)
+        self.assertEqual(budget.reason, "recovery_time_limit")
+
+    def test_journal_redacts_sensitive_values_without_losing_error_paths(self):
+        evidence = common.Evidence(self.root, "test")
+        event = evidence.request({"token": "fake-key", "sku": "A"},
+            {"errors": [{"path": ["product", "price"], "message": "Bearer fake-key"}], "email": "fake@example.com"})
+        text = Path(event["evidence_path"]).read_text(encoding="utf-8")
+        self.assertNotIn("fake-key", text)
+        self.assertNotIn("fake@example.com", text)
+        self.assertIn('"price"', text)
+
+    def install_detail(self):
+        base = self.root / "detail"
+        changes = dict(OUTPUT_ROOT=self.root / "output", DETAIL_ROOT=base,
+            RAW_DETAIL_DIR=base / "raw/detail_html", RAW_REVIEW_DIR=base / "raw/review20",
+            RAW_COMPARE_DIR=base / "raw/compare", PARSED_DIR=base / "parsed", BENCHMARKS_DIR=base / "benchmarks",
+            DETAIL_ROWS_CSV=base / "parsed/detail_enriched_rows.csv", FAILURES_CSV=base / "parsed/detail_failures.csv",
+            MANIFEST_PATH=base / "manifest_detail_enrichment.json", FINAL_OUTPUT_CSV=self.root / "output/final_output.csv",
+            PRODUCT_LIST_CSV=self.root / "output/bestbuy_product_list.csv", FORCE_REFRESH=False,
+            FETCH_COMPARE=True, FETCH_FULFILLMENT_DYNAMIC=False, FETCH_GET_IT_FAST=False,
+            CATEGORY="TV", DETAIL_SKU_BATCH_SIZE=5, STAGE="detail")
+        patcher = patch.multiple(detail, **changes)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, replacement in {
+            "detail_selector_values": lambda text: {},
+            "sample_fields": lambda: ["sku_id", "main_rank", "bsr_rank", "retailer_sku_name", "final_sku_price", "retailer_sku_name_similar"],
+            "update_product_list_from_detail_rows": Mock(),
+            "preserve_existing_availability": Mock(),
+            "close_detail_browser_page": Mock(),
+        }.items():
+            patcher = patch.object(detail, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def response(payload, compare_failure=False):
+        sku = str(payload["variables"]["skuId"])
+        if payload["operationName"] == "GetCompareProduct":
+            if compare_failure:
+                return {"errors": [{"message": "unavailable", "path": ["recommendations"], "extensions": {"code": "500"}}]}
+            return {"data": {"productBySkuId": {"skuId": sku}, "recommendations": {"subPlacements": []}}}
+        return {"data": {"productBySkuId": {"skuId": sku, "name": {"short": "Product " + sku},
+            "price": {"customerPrice": 999, "displayableCustomerPrice": "$999.00"},
+            "reviewInfo": {"reviewCount": 0}, "reviews": {"results": []}}}}
+
+    def test_compare_error_keeps_detail_and_rank_null_and_blocks_final_then_resume_only_compare(self):
+        self.install_detail()
+        target = dict(sku_id="12345", main_rank="15", bsr_rank="7", product_name="Example", review_count="0")
+        requests = []
+        def post(payload, *args):
+            requests.append(payload)
+            return 200, "", [self.response(p, compare_failure=True) for p in payload], {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            with self.assertRaises(common.CollectionIncomplete):
+                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual([len(p) for p in requests], [3, 1, 1])
+        report = common.read_json(self.root / "output/collection_status.json")
+        self.assertEqual(report["items"]["12345"]["detail"]["status"], "success")
+        self.assertEqual(report["items"]["12345"]["review"]["status"], "empty")
+        row = common.read_json(self.root / "output/partial_output.json")[0]
+        self.assertEqual(row["main_rank"], "15")
+        self.assertIsNone(row["retailer_sku_name_similar"])
+        self.assertTrue(row["final_sku_price"])
+        self.assertFalse(detail.FINAL_OUTPUT_CSV.exists())
+        note = common.recovery_notification("TV", self.root, "failed")
+        self.assertIn("12345 | 15 | 7 | compare", note["body"])
+        self.assertIn("보류", note["body"])
+        requests.clear()
+        def recovered(payload, *args):
+            requests.append(payload)
+            return 200, "", [self.response(p) for p in payload], {}, 0
+        with patch.object(detail, "browser_graphql_post", recovered):
+            result = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][0]["operationName"], "GetCompareProduct")
+        self.assertEqual(result["items"]["12345"]["compare"]["status"], "empty")
+        with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
+            self.assertEqual(next(csv.reader(stream)), detail.sample_fields())
+        common.assert_ready(self.root)
+
+    def test_transport_outage_stops_remaining_chunks_and_preserves_old_final(self):
+        self.install_detail()
+        targets = [dict(sku_id=str(i), main_rank=str(i), review_count="0") for i in range(1, 8)]
+        detail.FINAL_OUTPUT_CSV.parent.mkdir(parents=True)
+        detail.FINAL_OUTPUT_CSV.write_text("old final", encoding="utf-8")
+        post = Mock(side_effect=RuntimeError("TypeError: Failed to fetch"))
+        with patch.object(detail, "browser_graphql_post", post):
+            with self.assertRaises(common.CollectionIncomplete):
+                recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+        self.assertEqual(post.call_count, 5)
+        self.assertEqual(detail.FINAL_OUTPUT_CSV.read_text(encoding="utf-8"), "old final")
+        report = common.read_json(self.root / "output/collection_status.json")
+        self.assertEqual(report["items"]["7"]["detail"]["status"], "pending")
+        with self.assertRaises(common.CollectionIncomplete):
+            common.assert_ready(self.root)
+
+    def test_graphql_error_and_missing_compare_shape_not_empty(self):
+        t = {"review_count": "0"}
+        self.assertEqual(recovery.validate_operation(detail, "compare", "A", {"data": {}}, t)[0], "failed")
+        item = {"data": {"recommendations": {"subPlacements": []}}, "errors": [{"message": "broken"}]}
+        self.assertEqual(recovery.validate_operation(detail, "compare", "A", item, t)[0], "failed")
+
+    def test_cross_page_duplicate_restarts_without_accepting_shifted_ranks(self):
+        api, calls = self.fake_listing(iter([page_data("same"), page_data("same"), page_data("probe"),
+                                           page_data("a"), page_data("b"), page_data("c")]))
+        rows, _, _, report = listing.collect(api, {}, object(), budget_factory=Clock().budget)
+        self.assertEqual(report["accepted_pass"], 2)
+        self.assertEqual(calls, [1, 2, 2, 1, 2, 3])
+        self.assertNotIn("same", [r[0]["sku_id"] for r in rows.values()])
+
+    def test_browser_bootstrap_failure_enters_same_recovery_budget(self):
+        api, calls = self.fake_listing(iter([page_data("probe"), page_data("a"), page_data("b"), page_data("c")]))
+        api.initialize_browser_graphql_session.side_effect = [RuntimeError("bootstrap failed"), None]
+        _, _, _, report = listing.collect(api, {}, None, budget_factory=Clock().budget)
+        self.assertEqual(report["accepted_pass"], 2)
+        self.assertEqual(calls, [1, 1, 2, 3])
+
+    def test_successful_response_after_deadline_is_not_accepted(self):
+        api, calls = self.fake_listing(iter([RuntimeError("offline"), page_data("a")]))
+        clock = Clock()
+        original = api.browser_graphql_fetch_once
+        def fetch(*args):
+            result = original(*args)
+            clock.now += 1800
+            return result
+        api.browser_graphql_fetch_once = fetch
+        with self.assertRaisesRegex(common.CollectionIncomplete, "recovery_time_limit"):
+            listing.collect(api, {}, object(), budget_factory=clock.budget)
+        self.assertEqual(calls, [1, 1])
+
+    def test_permanent_query_error_does_not_retry_three_times(self):
+        self.install_detail()
+        target = dict(sku_id="12345", main_rank="15", review_count="0")
+        def post(payload, *args):
+            return 200, "", [{"errors": [{"extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}]} for _ in payload], {}, 0
+        with patch.object(detail, "browser_graphql_post", side_effect=post) as call:
+            with self.assertRaises(common.CollectionIncomplete):
+                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(call.call_count, 1)
+
+    def test_wrong_product_identity_is_never_stored_as_success(self):
+        self.install_detail()
+        target = dict(sku_id="12345", review_count="0")
+        payload = detail.fallback_review20_payload("different")
+        outcome, reason = recovery.validate_operation(detail, "detail", "12345", self.response(payload), target)
+        self.assertEqual((outcome, reason), ("failed", "product_identity_mismatch_or_missing"))
+
+    def test_fresh_transport_failure_does_not_relabel_old_cached_price_as_current(self):
+        self.install_detail()
+        target = dict(sku_id="12345", main_rank="15", product_name="New listing", review_count="0")
+        payload = detail.fallback_review20_payload("12345")
+        recovery.store_operation(detail, target, "detail", payload, self.response(payload),
+                                 dict(status="success", reason="verified", attempt=1))
+        with patch.object(detail, "browser_graphql_post", side_effect=RuntimeError("offline")):
+            with self.assertRaises(common.CollectionIncomplete):
+                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        row = common.read_json(self.root / "output/partial_output.json")[0]
+        self.assertIsNone(row["final_sku_price"])
+        self.assertEqual(row["main_rank"], "15")
+        self.assertEqual(row["retailer_sku_name"], "New listing")
+
+    def test_email_build_notification_uses_partial_summary_and_real_request_counts(self):
+        from bestbuy import step16_email_notify as notify
+        report = dict(status="partial", target_count=300, completed_skus=298,
+            failures=[dict(sku_id="A", main_rank=15, bsr_rank=7, stage="detail", status="failed",
+                           request_attempt=3, reason="timeout")], reason="item_attempt_limit")
+        common.atomic_json(self.root / "output/collection_status.json", report)
+        common.atomic_json(self.root / "main/collection_status.json", dict(status="complete", listing_request_calls=20))
+        common.atomic_json(self.root / "detail/manifest_detail_enrichment.json",
+                           dict(runs_by_stage={"one": {"detail_calls": 8}}))
+        result = notify.build_notification("REF", self.root, status="failed", failed_step_name="detail_html")
+        self.assertIn("298/300", result["subject"])
+        self.assertIn("부분 완료", result["subject"])
+        self.assertIn("A | 15 | 7 | detail | failed | 3", result["body"])
+        self.assertIn("실행 결과: failed", result["body"])
+        self.assertNotIn("총 수집 0", result["body"])
+        self.assertEqual(result["metrics"]["call_counts"]["total"], 28)
+
+    def test_list_targets_main_blocks_before_loading_stale_rows(self):
+        from bestbuy import step02_main_targets as targets
+        common.atomic_json(self.root / "main/collection_status.json", dict(status="incomplete"))
+        with patch.object(targets, "RUN_ROOT", self.root / "main"), patch.object(targets, "load_rows") as read:
+            with self.assertRaises(common.CollectionIncomplete):
+                targets.main()
+        read.assert_not_called()
+
+    def test_publication_rejects_changed_target_list_even_when_status_says_complete(self):
+        path = self.root / "targets.csv"
+        rows = [{"sku_id": "A", "main_rank": "1"}]
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        final = self.root / "final.csv"
+        final.write_text("existing result", encoding="utf-8")
+        common.atomic_json(self.root / "output/collection_status.json", dict(status="complete",
+            target_csv=str(path), target_hash=common.fingerprint(rows), final_output_csv=str(final)))
+        common.assert_ready(self.root)
+        path.write_text("sku_id,main_rank\nB,1\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.CollectionIncomplete, "target_list_changed"):
+            common.assert_ready(self.root)
+
+    def test_listing_only_success_does_not_allow_stale_final_publication(self):
+        common.atomic_json(self.root / "main/collection_status.json", dict(status="complete"))
+        with self.assertRaisesRegex(common.CollectionIncomplete, "detail_not_collected"):
+            common.assert_ready(self.root)
+        common.assert_ready(self.root, listing="main")
+
+    def test_output_write_failure_does_not_mark_collection_complete(self):
+        self.install_detail()
+        target = dict(sku_id="12345", main_rank="15", review_count="0")
+        def post(payload, *args):
+            return 200, "", [self.response(p) for p in payload], {}, 0
+        with patch.object(detail, "browser_graphql_post", post), patch.object(detail, "write_csv", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        report = common.read_json(self.root / "output/collection_status.json")
+        self.assertNotEqual(report["status"], "complete")
+        with self.assertRaises(common.CollectionIncomplete):
+            common.assert_ready(self.root)
+
+    def test_listing_main_publishes_verified_combo_page_without_false_failed_page(self):
+        from bestbuy import step01_main_list as production
+        root = self.root / "main"
+        rows = [dict(sku_id=str(i), container_type="organic_product" if i < 17 else "sponsored_ingrid") for i in range(23)]
+        summary = dict(page=1, status_code=200, total_occurrence_count=23, attempt_count=1, x_request_cost=0)
+        report = dict(status="validated", accepted_pass=1, listing_request_calls=1, offer_request_calls=0,
+                      evidence_path="synthetic", organic_count=17)
+        def make_dirs():
+            (root / "parsed").mkdir(parents=True)
+            (root / "benchmarks").mkdir(parents=True)
+        with patch.multiple(production, RUN_ROOT=root, LISTING_COLLECTION_MODE="browser_graphql", SEARCH_PAGES=1,
+                            LISTING_ORGANIC_TARGET=0, LISTING_PAGE_COMPLETE_MIN_ROWS=24), \
+             patch.object(production, "make_dirs", make_dirs), \
+             patch.object(production, "load_product_list_operation", return_value={"source_path": "fixture", "source_type": "payload"}), \
+             patch.object(listing, "collect", return_value=({1: rows}, [summary], [{"page": 1, "meta": {}}], report)), \
+             patch.dict(os.environ, {"ZENROWS_API_KEY": ""}):
+            production.main()
+        status = common.read_json(root / "collection_status.json")
+        manifest = common.read_json(root / "manifest.json")
+        self.assertEqual(status["status"], "complete")
+        self.assertEqual(manifest["failed_pages"], [])
+        common.assert_ready(self.root, listing="main")
+
+
+if __name__ == "__main__":
+    unittest.main()
