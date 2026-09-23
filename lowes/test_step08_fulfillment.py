@@ -294,11 +294,43 @@ def hisense_cards():
 
 
 class DisplayIntegrationTests(unittest.TestCase):
+    def test_only_fast_delivery_header_allows_its_own_date(self):
+        for title, expected in (
+            ('Delivery to 99503', ''),
+            ('Delivery to\u00a0 99503', ''),
+            ('FAST Delivery to 99503', 'Get it by Fri, Oct 2'),
+            ('FAST\nDelivery\u00a0to 99503', 'Get it by Fri, Oct 2'),
+            ('fast delivery to', 'Get it by Fri, Oct 2'),
+        ):
+            with self.subTest(title=title):
+                result = display.displayed_fields(
+                    [{'title': title, 'date': 'Get it by Fri, Oct 2'}], 'Get it Today')
+                self.assertEqual(result['fastest_delivery'], expected)
+                self.assertEqual(result['available_quantity_for_purchase_fastdelivery'], '')
+
+    def test_hidden_disabled_and_unavailable_fast_cards_are_excluded(self):
+        for fields in ({'visible': False}, {'disabled': True}, {'date': 'Unavailable'}, {'date': 'Out of stock'}):
+            with self.subTest(fields=fields):
+                card = {'title': 'FAST Delivery to 99503', 'date': 'Tomorrow', **fields}
+                self.assertEqual(display.displayed_fields([card], 'Get it Today'), display.empty_display())
+
+    def test_fast_date_must_belong_to_fast_card(self):
+        result = display.displayed_fields([
+            {'title': 'Delivery to 99503', 'date': 'Get it by Fri, Oct 2'},
+            {'title': 'FAST Delivery to 99503', 'date': 'Tomorrow'},
+        ], 'Get it by Fri, Oct 2')
+        self.assertEqual(result['fastest_delivery'], 'Get it Tomorrow')
+        self.assertEqual(result['delivery_availability'], 'Delivery Get it by Fri, Oct 2')
+        self.assertIsNone(display.displayed_fields([
+            {'title': 'FAST Delivery to 99503', 'date': ''}], 'Get it Today'))
+        self.assertIsNone(display.displayed_fields([
+            {'title': 'Not FAST Delivery to 99503', 'date': 'Tomorrow'}]))
+
     def test_fast_quantity_is_disabled_while_shipping_quantity_is_preserved(self):
         result = display.displayed_fields(hisense_cards())
         self.assertEqual(result, {
             'delivery_availability': 'Shipping Wed, Sep 16',
-            'fastest_delivery': '',
+            'fastest_delivery': 'Get it Tomorrow',
             'available_quantity_for_purchase_delivery': 1236,
             'available_quantity_for_purchase_fastdelivery': '',
         })
@@ -318,11 +350,11 @@ class DisplayIntegrationTests(unittest.TestCase):
         ]))
         self.assertEqual(display.displayed_fields([{'title': 'Delivery', 'date': 'Unavailable'}]), display.empty_display())
 
-    def test_legacy_fast_message_does_not_invent_separate_quantity(self):
+    def test_regular_card_cannot_use_legacy_fast_message(self):
         result = display.displayed_fields(
             [{'title': 'Delivery', 'date': 'Tomorrow', 'stock': '50 Available'}], 'Get it Tomorrow',
         )
-        self.assertEqual(result['fastest_delivery'], 'Get it Tomorrow')
+        self.assertEqual(result['fastest_delivery'], '')
         self.assertEqual(result['available_quantity_for_purchase_fastdelivery'], '')
 
     def test_unresolved_screen_overwrites_stale_listing_values(self):

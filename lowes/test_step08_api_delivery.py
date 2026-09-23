@@ -75,7 +75,7 @@ def observed_options(second_selected=False):
 
 
 class CapturedDisplayTests(unittest.TestCase):
-    def test_mini_cards_do_not_prove_field_45_radio_selection(self):
+    def test_fast_card_supplies_date_without_radio_selection(self):
         node = mini()
         values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
         pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, NOW)
@@ -83,7 +83,7 @@ class CapturedDisplayTests(unittest.TestCase):
         self.assertEqual(values | pickup, {
             'pick_up_availability': 'Pickup 9am Tomorrow',
             'delivery_availability': 'Shipping Wed, Sep 23',
-            'fastest_delivery': '',
+            'fastest_delivery': 'Get it Tomorrow',
             'available_quantity_for_purchase_pickup': 9,
             'available_quantity_for_purchase_delivery': 1225,
             'available_quantity_for_purchase_fastdelivery': '',
@@ -93,11 +93,11 @@ class CapturedDisplayTests(unittest.TestCase):
         node = washer()
         values, reason = display.api_display(node, FLAGS, NOW, RTF, observed_options())
         pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, NOW)
-        self.assertEqual((reason, pickup_reason), ('', ''))
+        self.assertEqual((reason, pickup_reason), ('fast_delivery_title_not_verified', ''))
         self.assertEqual(values | pickup, {
             'pick_up_availability': 'Pickup Ready by Mon, Sep 28 (Est.)',
             'delivery_availability': 'Delivery w/FREE Installation',
-            'fastest_delivery': 'Get it by Wed, Sep 23',
+            'fastest_delivery': '',
             'available_quantity_for_purchase_pickup': 91,
             'available_quantity_for_purchase_delivery': 14,
             'available_quantity_for_purchase_fastdelivery': '',
@@ -152,12 +152,11 @@ class CapturedDisplayTests(unittest.TestCase):
     def test_calendar_relative_to_destination_and_store_not_korean_clock(self):
         node = mini()
         now = datetime.fromisoformat('2026-09-22T04:01:00+00:00')
-        # A candidate date still uses destination time, but is not evidence of
-        # a checked radio and must not enter field 45 without that evidence.
+        # The verified FAST card uses destination time without a checked radio.
         candidate, _ = display._candidate_display(node, FLAGS, now, NO_SERVICES)
         self.assertEqual(candidate['fastest_delivery'], 'Get it Today')
         values, reason = display.api_display(node, FLAGS, now, NO_SERVICES)
-        self.assertEqual(values['fastest_delivery'], '')
+        self.assertEqual(values['fastest_delivery'], 'Get it Today')
         self.assertEqual(reason, '')
         pickup, _ = display.pickup_display(node, STORE, FLAGS, now)
         self.assertEqual(pickup['pick_up_availability'], 'Pickup 9am Tomorrow')
@@ -177,8 +176,9 @@ class CapturedDisplayTests(unittest.TestCase):
         node = washer()
         node['product'] = {'merchandisingHierarchy': {'productGroup': '517402'}}
         values, reason = display.api_display(node, FLAGS, NOW, RTF)
-        self.assertEqual(reason, '')
+        self.assertEqual(reason, 'fast_delivery_title_not_verified')
         self.assertEqual(values['delivery_availability'], 'Delivery w/FREE Installation')
+        self.assertEqual(values['fastest_delivery'], '')
 
     def test_display_status_does_not_replace_card_eligibility(self):
         node = mini()
@@ -189,13 +189,53 @@ class CapturedDisplayTests(unittest.TestCase):
 
 
 class SelectedOptionTests(unittest.TestCase):
-    def test_rtf_default_order_wins_over_api_priority(self):
+    def test_fast_card_date_cannot_be_overwritten_by_unrelated_radio(self):
+        for options in (None, [], observed_options(), observed_options(True)):
+            with self.subTest(options=options):
+                values, reason = display.api_display(mini(), FLAGS, NOW, NO_SERVICES, options)
+                self.assertEqual(reason, '')
+                self.assertEqual(values['fastest_delivery'], 'Get it Tomorrow')
+                self.assertEqual(values['delivery_availability'], 'Shipping Wed, Sep 23')
+
+    def test_fast_inventory_name_alone_cannot_prove_legacy_fast_header(self):
+        for kind in ('FAST_TRUCK', 'ExpeditedDelivery'):
+            node = washer()
+            node['additionalServices'] = False
+            node['location']['itemInventory']['itemAvailList'] = [
+                item(kind, 14, 1, itmConsolidationApptDate='2026-10-02T07:00:00-04:00')]
+            with self.subTest(kind=kind):
+                values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
+                self.assertEqual(values['fastest_delivery'], '')
+                self.assertEqual(reason, 'fast_delivery_title_not_verified')
+                self.assertEqual(values['delivery_availability'], 'Delivery Fri, Oct 2')
+                self.assertEqual(values['available_quantity_for_purchase_delivery'], 14)
+
+    def test_unverified_three_tile_title_remains_blank(self):
+        for case in ('promotion', 'later_date', 'installation', 'unknown_flags', 'unavailable'):
+            node, flags, services = mini(), dict(FLAGS), NO_SERVICES
+            fast = node['location']['itemInventory']['itemAvailList'][-1]
+            if case == 'promotion':
+                node['location']['promotion'] = {'productLevelPromotions': [{'description': 'Free delivery'}]}
+            elif case == 'later_date':
+                fast['fullPath'][0]['promiseDate'] = '2026-10-02T07:00:00-04:00'
+            elif case == 'installation':
+                services = {'rtf': True, 'eligible_methods': ['parcel', 'expediteddelivery']}
+            elif case == 'unknown_flags':
+                flags = {}
+            else:
+                fast['isAvlSts'] = False
+            with self.subTest(case=case):
+                values, reason = display.api_display(node, flags, NOW, services, observed_options())
+                self.assertEqual(values['fastest_delivery'], '')
+                self.assertTrue(reason)
+
+    def test_rtf_does_not_promote_regular_delivery_to_fast(self):
         node = washer()
         slots = node['location']['itemInventory']['itemAvailList']
         slots[1]['priority'], slots[2]['priority'] = 2, 4
         values, reason = display.api_display(node, FLAGS, NOW, RTF)
         self.assertEqual(reason, '')
-        self.assertEqual(values['fastest_delivery'], 'Get it by Wed, Sep 23')
+        self.assertEqual(values['fastest_delivery'], '')
 
     def test_no_service_default_includes_pickup(self):
         node = washer()
@@ -203,13 +243,14 @@ class SelectedOptionTests(unittest.TestCase):
         self.assertEqual(values['fastest_delivery'], '')
         self.assertIn('pickup_selected', reason)
 
-    def test_no_service_default_can_select_later_regular_truck(self):
+    def test_selected_regular_truck_is_not_fast_delivery(self):
         node = washer()
         slots = node['location']['itemInventory']['itemAvailList']
         slots[0]['priority'], slots[1]['priority'], slots[2]['priority'] = 5, 2, 3
         values, reason = display.api_display(node, FLAGS, NOW, NO_SERVICES)
         self.assertEqual(reason, '')
-        self.assertEqual(values['fastest_delivery'], 'Get it by Thu, Sep 24')
+        self.assertEqual(values['fastest_delivery'], '')
+        self.assertEqual(values['delivery_availability'], 'Delivery Thu, Sep 24')
 
     def test_missing_selected_date_does_not_use_unselected_fast_date(self):
         node = washer()
@@ -220,8 +261,8 @@ class SelectedOptionTests(unittest.TestCase):
         self.assertEqual(values['fastest_delivery'], '')
         self.assertIn('missing_', reason)
 
-    def test_rdp_midea_has_fast_card_but_no_field_45_options(self):
-        # 2026-09-22 05:20 UTC user probe: options=[], field45=null.
+    def test_rdp_midea_fast_card_date_without_options(self):
+        # The FAST card supplies its date even when no radio options exist.
         cards = [
             {'title': 'Pickup', 'date': 'Tomorrow', 'stock': '9 available'},
             {'title': 'Shipping', 'date': 'Tomorrow', 'stock': '1,141 available'},
@@ -230,7 +271,7 @@ class SelectedOptionTests(unittest.TestCase):
         values = display.displayed_fields(cards)
         self.assertEqual(values, {
             'delivery_availability': 'Shipping Tomorrow',
-            'fastest_delivery': '',
+            'fastest_delivery': 'Get it Today',
             'available_quantity_for_purchase_delivery': 1141,
             'available_quantity_for_purchase_fastdelivery': '',
         })
@@ -246,7 +287,7 @@ class SelectedOptionTests(unittest.TestCase):
         self.assertEqual(values, {'pick_up_availability': 'Pickup Tomorrow',
                                   'available_quantity_for_purchase_pickup': 9})
 
-    def test_rdp_whirlpool_preserves_est_and_checked_tomorrow(self):
+    def test_rdp_whirlpool_preserves_pickup_and_excludes_unverified_fast_date(self):
         node = washer()
         node['location']['itemInventory']['itemAvailList'][0]['totalQty'] = 90
         options = observed_options()
@@ -254,24 +295,23 @@ class SelectedOptionTests(unittest.TestCase):
         now = datetime.fromisoformat('2026-09-22T05:19:21+00:00')
         values, reason = display.api_display(node, FLAGS, now, RTF, options)
         pickup, pickup_reason = display.pickup_display(node, STORE, FLAGS, now)
-        self.assertEqual((reason, pickup_reason), ('', ''))
+        self.assertEqual((reason, pickup_reason), ('fast_delivery_title_not_verified', ''))
         self.assertEqual(values | pickup, {
             'delivery_availability': 'Delivery w/FREE Installation',
-            'fastest_delivery': 'Get it Tomorrow',
+            'fastest_delivery': '',
             'available_quantity_for_purchase_delivery': 14,
             'available_quantity_for_purchase_fastdelivery': '',
             'pick_up_availability': 'Pickup Ready by Mon, Sep 28 (Est.)',
             'available_quantity_for_purchase_pickup': 90,
         })
 
-    def test_checked_second_option_wins_over_fastest_priority_and_date(self):
+    def test_checked_option_cannot_bypass_fast_header_requirement(self):
         node = washer()
         original = copy.deepcopy(node)
-        for second, expected in ((False, 'Get it by Wed, Sep 23'),
-                                 (True, 'Get it by Thu, Sep 24')):
+        for second in (False, True):
             values, reason = display.api_display(node, FLAGS, NOW, RTF, observed_options(second))
-            self.assertEqual(reason, '')
-            self.assertEqual(values['fastest_delivery'], expected)
+            self.assertEqual(reason, 'fast_delivery_title_not_verified')
+            self.assertEqual(values['fastest_delivery'], '')
             self.assertEqual(values['available_quantity_for_purchase_delivery'], 14)
             self.assertEqual(values['available_quantity_for_purchase_fastdelivery'], '')
         self.assertEqual(node, original)
@@ -322,13 +362,29 @@ class SelectedOptionTests(unittest.TestCase):
 
 
 class ServiceAndCollectorTests(unittest.TestCase):
+    def test_collector_and_row_preserve_only_verified_fast_card_dates(self):
+        for category in ('REF', 'LDY'):
+            for node, expected in ((mini(), 'Get it Tomorrow'), (washer(), '')):
+                with self.subTest(category=category, expected=expected):
+                    namespace = parser_functions(category)
+                    namespace['run_xhr_get'] = lambda *args, **kwargs: rdp_service_response()
+                    namespace['api_display'] = lambda node, flags, services=None: display.api_display(node, flags, NOW, services)
+                    namespace['pickup_display'] = lambda node, store, flags: display.pickup_display(node, store, flags, NOW)
+                    namespace['print'] = lambda *args, **kwargs: None
+                    response = {'status': 200, 'body': json.dumps({'productDetails': {'sample': node}, 'storeDetails': STORE})}
+                    evidence = namespace['collect_fulfillment_display'](None, 'sample', response, '0289', {})
+                    row = namespace['build_row']({'fastest_delivery': 'STALE'}, 'sample', {
+                        'productdetail': response, 'fulfillment_display': evidence})
+                    self.assertEqual(row['fastest_delivery'], expected)
+                    self.assertEqual(row['available_quantity_for_purchase_fastdelivery'], '')
+
     def test_rdp_null_selection_uses_verified_page_default_not_api_boolean(self):
         selection, reason = display.service_selection(rdp_service_response())
         self.assertEqual((selection, reason), (RTF, ''))
         values, reason = display.api_display(washer(), FLAGS, NOW, selection)
-        self.assertEqual(reason, '')
+        self.assertEqual(reason, 'fast_delivery_title_not_verified')
         self.assertEqual(values['delivery_availability'], 'Delivery w/FREE Installation')
-        self.assertEqual(values['fastest_delivery'], 'Get it by Wed, Sep 23')
+        self.assertEqual(values['fastest_delivery'], '')
         self.assertNotIn('$43.48', json.dumps(values))
 
     def test_collector_uses_verified_guest_default_selection_without_dom(self):
@@ -342,13 +398,13 @@ class ServiceAndCollectorTests(unittest.TestCase):
         namespace['pickup_display'] = lambda node, store, flags: display.pickup_display(node, store, flags, NOW)
         response = {'status': 200, 'body': json.dumps({'productDetails': {'sample': washer()}, 'storeDetails': STORE})}
         evidence = json.loads(namespace['collect_fulfillment_display'](None, 'sample', response, '0289', {})['body'])
-        self.assertEqual(evidence['status'], 'ok')
-        self.assertEqual(evidence['reason'], '')
+        self.assertEqual(evidence['status'], 'partial')
+        self.assertEqual(evidence['reason'], 'fast_delivery_title_not_verified')
         self.assertEqual(evidence['source'], 'api')
         self.assertEqual(evidence['values'], {
             'pick_up_availability': 'Pickup Ready by Mon, Sep 28 (Est.)',
             'delivery_availability': 'Delivery w/FREE Installation',
-            'fastest_delivery': 'Get it by Wed, Sep 23',
+            'fastest_delivery': '',
             'available_quantity_for_purchase_pickup': 91,
             'available_quantity_for_purchase_delivery': 14,
             'available_quantity_for_purchase_fastdelivery': '',

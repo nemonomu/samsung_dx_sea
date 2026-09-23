@@ -17,7 +17,7 @@ FIELDS = (
     'available_quantity_for_purchase_fastdelivery',
 )
 # Fast-delivery quantity collection is discontinued; retain its blank column.
-# Delivery/pickup quantities and the selected delivery date remain active.
+# Delivery/pickup quantities and verified FAST Delivery dates remain active.
 FLAG_NAMES = ('enableThreeTileDesign', 'enableNetworkStock', 'isApplianceSwimLaneEnabled')
 # select_inventory_display 0_302_0, fulfillment constants / isMajorAppliance.
 APPLIANCE_GROUPS = {
@@ -401,17 +401,15 @@ def _candidate_display(node, flags=None, now=None, services=None):
                 label = calendar(chosen, kind)
                 if label:
                     result['delivery_availability'] = 'Delivery ' + label
-            # A legacy option has no separate stock card. Never copy truck stock
-            # into the fast quantity column merely because an option is selected.
+            # FAST_TRUCK/ExpeditedDelivery inventory does not prove that the
+            # legacy header says FAST Delivery to rather than Delivery to.
             if kind in ('fasttruck', 'expediteddelivery'):
-                label = calendar(chosen, kind)
-                if label:
-                    result['fastest_delivery'] = ('Get it ' if label in ('Today', 'Tomorrow') else 'Get it by ') + label
+                issues.append('fast_delivery_title_not_verified')
     return result, ';'.join(dict.fromkeys(issues))
 
 
 def selected_delivery_text(options):
-    """Field 45 is the visible checked option's text, never a ranked date.
+    """Read a checked option's text; this alone does not prove FAST Delivery.
 
     Input is an explicit observation of delivery options, not inventory slots.
     None means selection has not been verified; [] means no options are shown.
@@ -438,93 +436,34 @@ def selected_delivery_text(options):
     return text.strip(), ''
 
 
-def default_delivery_text(node, flags, now, services):
-    """Field 45 for the verified fresh guest profile, using API inputs only.
-
-    select_inventory_display 0_304_0 uses its selectedFulfilment state for the
-    radio. With default CUSTOM_RTF, ServiceDiscovery 0_124_0 supplies the order
-    Parcel, Pickup, FAST_TRUCK, Delivery, ExpeditedDelivery; unavailable methods
-    are removed (BG/bi). Without a service, initial selection uses all available
-    methods' priorities, including Pickup, rather than delivery methods alone.
-    Saved/manual selections and other layouts are not inferred by this rule.
-    """
-    items = inventory_items(node)
-    product = node.get('product') or {}
-    if items is None or any(k not in (flags or {}) for k in FLAG_NAMES):
-        return '', 'selected_delivery_option_not_verified'
-    if (flags['isApplianceSwimLaneEnabled'] or product.get('groupType')
-            or product.get('marketplaceSeller')):
-        return '', 'selected_delivery_option_not_verified'
-    if flags['enableThreeTileDesign'] and not is_major(product):
-        # Confirmed Midea probe: Fast Delivery card exists, options=[].
-        return '', ''
-    active = [x for x in items if eligible(x)]
-    kinds = [method(x) for x in active]
-    if len(kinds) != len(set(kinds)) or any(k not in (
-            'parcel', 'pickup', 'fasttruck', 'delivery', 'expediteddelivery') for k in kinds):
-        return '', 'selected_delivery_option_not_verified'
-    if not any(k in kinds for k in ('fasttruck', 'expediteddelivery')):
-        return '', ''
-    if services is None and node.get('additionalServices') is False:
-        services = {'rtf': False, 'eligible_methods': None}
-    if services is None:
-        return '', 'selected_delivery_option_not_verified'
-    if services.get('rtf'):
-        allowed = services.get('eligible_methods')
-        if not allowed:
-            return '', 'selected_delivery_option_not_verified'
-        order = ('parcel', 'pickup', 'fasttruck', 'delivery', 'expediteddelivery')
-        selected = next((x for kind in order for x in active
-                         if method(x) == kind and kind in allowed), None)
-    else:
-        # Nearby pickup may also be the initial selection; do not exclude it
-        # silently and select a delivery option that is not checked on screen.
-        pickup = next((x for x in items if method(x) == 'pickup'), {})
-        if not eligible(pickup) and any(x.get('isAvlSts') for x in pickup.get('nearestStores') or []):
-            return '', 'selected_delivery_option_not_verified'
-        priorities = [x.get('priority') for x in active]
-        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or x <= 0 for x in priorities):
-            return '', 'selected_delivery_option_not_verified'
-        first = min(priorities)
-        if priorities.count(first) != 1:
-            return '', 'selected_delivery_option_not_verified'
-        selected = active[priorities.index(first)]
-    if selected is None or method(selected) == 'pickup':
-        return '', ''
-    kind = method(selected)
-    if kind not in ('delivery', 'fasttruck', 'expediteddelivery'):
-        return '', 'selected_delivery_option_not_verified'
-    value = (selected.get('itmConsolidationApptDate') or selected.get('itmConsolidationDate')) \
-        if kind in ('delivery', 'fasttruck') else promise_date(selected)
-    label = date_label(value, now=now, relative=True)
-    if not label:
-        return '', 'missing_selected_delivery_date'
-    return ('Get it ' if label in ('Today', 'Tomorrow') else 'Get it by ') + label, ''
-
-
 def api_display(node, flags=None, now=None, services=None, delivery_options=None):
-    """API default selection; optional checked observations are for tests only."""
-    result, reason = _candidate_display(node, flags, now, services)
-    if delivery_options is None:
-        result['fastest_delivery'], selection_reason = default_delivery_text(node, flags, now, services)
-    else:
-        result['fastest_delivery'], selection_reason = selected_delivery_text(delivery_options)
-    if selection_reason and not reason:
-        reason = selection_reason
-    return result, reason
+    """Use only verified FAST Delivery card dates for fastest_delivery.
+
+    Keep delivery_options for call compatibility. A checked option carries no
+    header evidence and must neither populate nor overwrite a FAST card date.
+    """
+    return _candidate_display(node, flags, now, services)
 
 
 def displayed_fields(cards, fast_message=''):
-    """Project visible cards; fast_message must be the checked option's label."""
+    """Project dates from their own cards, gated by the FAST Delivery header.
+
+    The legacy fast_message argument has no card association and is ignored.
+    """
     result = empty_display()
     normal, fast = [], []
     for card in cards:
         title = ' '.join(str(card.get('title') or '').split())
+        # The title may be captured with its destination, including NBSP/newlines
+        # between the FAST badge, Delivery, and to. Do not substring-match it.
+        header = re.fullmatch(r'(fast delivery|delivery) to(?: .*)?', title, re.I)
+        if header:
+            title = 'Fast Delivery' if header[1].lower() == 'fast delivery' else 'Delivery'
         if title.lower() == 'pickup':
             continue
         if title.lower() not in ('shipping', 'delivery', 'appliance delivery', 'fast delivery'):
             return None
-        if card.get('disabled') or re.search(r'\bunavailable\b|\bout of stock\b', str(card.get('date') or ''), re.I):
+        if card.get('visible') is False or card.get('disabled') or re.search(r'\bunavailable\b|\bout of stock\b', str(card.get('date') or ''), re.I):
             continue
         date = ' '.join(str(card.get('date') or '').split())
         if not date:
@@ -544,8 +483,9 @@ def displayed_fields(cards, fast_message=''):
         title, date, qty = normal[0]
         result['delivery_availability'] = f'{title} {date}'
         result['available_quantity_for_purchase_delivery'] = qty
-    if fast_message:
-        # Field 45 is separate from a Fast Delivery card's date/quantity.
-        # Never invent "Get it" for a page with no such selected option.
-        result['fastest_delivery'] = fast_message
+    if fast:
+        _, date, _ = fast[0]
+        result['fastest_delivery'] = date if date.lower().startswith('get it ') else (
+            ('Get it ' if date in ('Today', 'Tomorrow') else 'Get it by ') + date
+        )
     return result
