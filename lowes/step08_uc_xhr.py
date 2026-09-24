@@ -77,7 +77,7 @@ ZIP = os.getenv('LOWES_API_STORE_ZIP', '10010')
 STATE = os.getenv('LOWES_API_STORE_STATE', 'NY')
 NEARBY_STORE = os.getenv('LOWES_API_NEARBY_STORE', '1674')
 
-# Alt-store fallback: used only when primary returns productdetail != 200.
+# Alt-store fallback: used when primary productdetail fails HTTP/payload validation.
 # Verified 2026-06-01: store=1854 (Zephyrhills FL) services SKUs that 0289 (Brooklyn NY) refuses.
 # URL kept the same ZIP/state/nearby as primary (verified working combination).
 ALT_STORE = os.getenv('LOWES_API_ALT_STORE_ID', '1854').lstrip('0') or '1854'
@@ -298,6 +298,58 @@ def review_total_results_from_body(body):
         return None
 
 
+def response_problem(label, response, sku='', offset=0):
+    """Validate API data, including HTTP-200 error/empty payloads."""
+    if not isinstance(response, dict):
+        return 'invalid_response'
+    if response.get('status') != 200:
+        if label == 'compare' and isinstance(response, dict) and response.get('status') == 204:
+            return ''  # Explicitly no recommendations.
+        return 'http_' + str((response or {}).get('status', 'missing'))
+    try:
+        obj = json.loads(response.get('body') or '')
+    except (ValueError, TypeError):
+        return 'invalid_json'
+    if not isinstance(obj, dict):
+        return 'invalid_payload'
+    if label == 'productdetail':
+        root = obj.get('productDetails')
+        node = root.get(str(sku)) if isinstance(root, dict) else None
+        if not isinstance(node, dict) or not isinstance(node.get('product'), dict) or not node['product']:
+            return 'missing_productdetail'
+    elif label.startswith('reviews_p'):
+        results = obj.get('results')
+        if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
+            return 'missing_review_results'
+        total = review_total_results_from_body(response.get('body'))
+        if total is not None and len(results) < min(REVIEW_PAGE_SIZE, max(0, total - offset)):
+            return 'incomplete_review_page'
+    elif label == 'compare':
+        recommendations = obj.get('recommendationResponse')
+        if not isinstance(recommendations, list):
+            return 'missing_recommendationResponse'
+        for group in recommendations:
+            if not isinstance(group, dict) or not isinstance(group.get('products'), list):
+                return 'missing_comparison_products'
+            if any(not isinstance(p, dict) for p in group['products']):
+                return 'invalid_comparison_product'
+    return ''
+
+
+def request_with_retry(request, label, sku='', offset=0):
+    """Exactly two attempts at a failed endpoint; retain diagnostic metadata."""
+    history = []
+    for attempt in (1, 2):
+        response = request()
+        if not isinstance(response, dict):
+            response = {'status': 'err', 'error': 'invalid_response'}
+        problem = response_problem(label, response, sku, offset)
+        history.append({'status': response.get('status'), 'problem': problem})
+        if not problem:
+            break
+    return dict(response, attempts=attempt, problem=problem, attempt_history=history)
+
+
 def fetch_reviews_until_target(driver, sku):
     responses = {}
     collected_reviews = 0
@@ -307,9 +359,11 @@ def fetch_reviews_until_target(driver, sku):
 
     while True:
         label = f'reviews_p{page_index}'
-        response = run_xhr_get(driver, review_path(sku, offset))
+        response = request_with_retry(
+            lambda: run_xhr_get(driver, review_path(sku, offset)), label, sku, offset,
+        )
         responses[label] = response
-        if response.get('status') != 200:
+        if response.get('problem'):
             break
 
         body = response.get('body', '') or ''
@@ -381,13 +435,20 @@ def collect_fulfillment_display(driver, sku, response, store, flag_cache):
     return {'status': status, 'body': json.dumps(evidence, ensure_ascii=False)}
 
 
-def fetch_sku(driver, sku, category_id, parent_category, store=None, flag_cache=None):
+def fetch_sku(driver, sku, category_id, parent_category, store=None, flag_cache=None, previous=None):
     """Fetch API data; `store` overrides productdetail and compare store context."""
     store = store or STORE_FMT
-    out = {}
+    out = dict(previous or {})
     out['productdetail'] = run_xhr_get(driver, f'/wpd/{sku}/productdetail/{store}/Guest/{ZIP}?nearByStore={NEARBY_STORE}&zipState={STATE}')
+    if not isinstance(out['productdetail'], dict):
+        out['productdetail'] = {'status': 'err', 'error': 'invalid_response'}
+    problem = response_problem('productdetail', out['productdetail'], sku)
+    history = list((previous or {}).get('productdetail', {}).get('attempt_history', []))
+    history.append({'status': out['productdetail'].get('status'), 'problem': problem, 'store': store})
+    out['productdetail'].update(problem=problem, attempts=len(history), attempt_history=history)
     out['productdetail']['request_context'] = {'store': store, 'zip': ZIP, 'state': STATE, 'nearby_store': NEARBY_STORE}
-    out.update(fetch_reviews_until_target(driver, sku))
+    if previous is None:
+        out.update(fetch_reviews_until_target(driver, sku))
     body = {
         "anchors": [{
             "omniItemId": sku, "attrId": sku,
@@ -403,8 +464,12 @@ def fetch_sku(driver, sku, category_id, parent_category, store=None, flag_cache=
         "channel": "desktop",
         "version": "default_fabrik",
     }
-    out['compare'] = run_xhr_post(driver, '/pythia-recs-svc/v2/compare?version=default_fabrik&source=product-display', body)
-    if out['productdetail'].get('status') == 200:
+    if previous is None:
+        out['compare'] = request_with_retry(
+            lambda: run_xhr_post(driver, '/pythia-recs-svc/v2/compare?version=default_fabrik&source=product-display', body),
+            'compare', sku,
+        )
+    if not problem:
         out['fulfillment_display'] = collect_fulfillment_display(
             driver, sku, out['productdetail'], store, flag_cache if flag_cache is not None else {},
         )
@@ -740,8 +805,8 @@ def parse_compare(sku, body):
     return out
 
 
-def save_raw_artifacts(rank, sku, responses, success):
-    name = f'{rank:03d}_{sku}_{"success" if success else "fail"}'
+def save_raw_artifacts(rank, sku, responses, success, prefix=''):
+    name = f'{prefix}{rank:03d}_{sku}_{"success" if success else "fail"}'
     folder = RAW_DIR / name
     folder.mkdir(parents=True, exist_ok=True)
     for label, r in responses.items():
@@ -777,16 +842,21 @@ def reviews_success(responses):
     labels = review_response_labels(responses)
     if not labels:
         return False
-    # Keep the original baseline strictness for the first two review pages.
-    # Supplemental pages are best-effort so a late pagination hiccup does not drop the SKU.
-    required_labels = labels[:2]
-    return all((responses.get(label) or {}).get('status') == 200 for label in required_labels)
+    return all((responses.get(label) or {}).get('status') == 200
+               and not responses[label].get('problem') for label in labels)
 
 
 def build_row(src, sku, responses, serving_store=None):
     row = dict(src)
     row['omni_item_id'] = sku
-    if has_body(responses.get('productdetail')):
+    if (responses.get('productdetail') or {}).get('problem'):
+        # Listing identity/prices/ranks are independent evidence and stay intact.
+        row['sku'] = src.get('sku') or src.get('model_id', '')
+        fields = (*empty_display(), 'pick_up_availability', 'available_quantity_for_purchase_pickup',
+                  'number_of_units_purchased_past_week', 'ref_capacity', 'ref_refrigerator_type',
+                  'ldy_capacity', 'ldy_loading_type')
+        row.update(dict.fromkeys(fields, ''))
+    elif has_body(responses.get('productdetail')):
         evidence = json.loads((responses.get('fulfillment_display') or {}).get('body') or '{}')
         row.update(parse_productdetail(sku, responses['productdetail']['body'], evidence.get('flags')))
         if evidence:
@@ -801,11 +871,15 @@ def build_row(src, sku, responses, serving_store=None):
             row['fulfillment_display_reason'] = evidence.get('reason', '')
             row['fulfillment_display_elapsed_seconds'] = evidence.get('elapsed_seconds', 0)
     review_bodies = [
-        responses.get(label, {}).get('body', '') if has_body(responses.get(label)) else ''
+        responses.get(label, {}).get('body', '')
+        if has_body(responses.get(label)) and responses[label].get('problem') in (None, '', 'incomplete_review_page') else ''
         for label in review_response_labels(responses)
     ]
     row.update(parse_reviews(sku, *review_bodies))
-    if has_body(responses.get('compare')):
+    if any(responses[label].get('problem') for label in review_response_labels(responses)):
+        # Keep first-page summary/statistics if only a later text page failed.
+        row['detailed_review_content'] = ''
+    if has_body(responses.get('compare')) and not responses['compare'].get('problem'):
         row.update(parse_compare(sku, responses['compare']['body']))
     else:
         row['retailer_sku_name_similar'] = ''
@@ -818,6 +892,49 @@ def build_row(src, sku, responses, serving_store=None):
         # Also discard the discontinued value from cached display evidence.
         row['available_quantity_for_purchase_fastdelivery'] = ''
     return row
+
+
+def detail_warnings(rank, sku, responses, row):
+    """Warnings describe retained rows, never excluded products."""
+    warnings = []
+    for label, response in responses.items():
+        problem = response.get('problem')
+        if not problem:
+            continue
+        if label == 'compare':
+            columns = ['retailer_sku_name_similar']
+        elif label.startswith('reviews_p'):
+            columns = ['detailed_review_content']
+            if label == 'reviews_p1' and problem != 'incomplete_review_page':
+                columns += ['recommendation_intent', 'summarized_review_content']
+        else:
+            columns = ['sku', 'number_of_units_purchased_past_week', 'pick_up_availability',
+                       'delivery_availability', 'fastest_delivery',
+                       'available_quantity_for_purchase_pickup', 'available_quantity_for_purchase_delivery']
+            columns += (['ldy_capacity', 'ldy_loading_type'] if lowes_product_type().upper() == 'LDY'
+                        else ['ref_capacity', 'ref_refrigerator_type'])
+        # Prices and ratings can still be supplied by the successful listing/API.
+        if label in ('productdetail', 'reviews_p1'):
+            fallbacks = {
+                'star_rating': ('_pdp_average_rating', 'star_rating', 'rating'),
+                'count_of_reviews': ('_pdp_total_reviews', 'count_of_reviews', 'review_count'),
+                'count_of_star_ratings': ('_pdp_total_reviews', 'count_of_reviews', 'review_count'),
+            }
+            if label == 'productdetail':
+                fallbacks.update({
+                    'final_sku_price': ('selling_price', 'final_sku_price'),
+                    'original_sku_price': ('was_price', 'original_sku_price'),
+                    'savings': ('total_saving', 'savings'),
+                })
+            columns += [col for col, keys in fallbacks.items()
+                        if all(row.get(key) in ('', None) for key in keys)]
+        warnings.append({
+            'rank': rank, 'omni_item_id': sku, 'endpoint': label,
+            'attempts': response.get('attempts', 2), 'status': response.get('status'),
+            'reason': problem, 'retry_result': 'failed', 'action': 'loaded_with_nulls',
+            'null_columns': [col for col in columns if row.get(col) in ('', None)],
+        })
+    return warnings
 
 
 def write_csv(path, rows, preferred=None):
@@ -855,78 +972,55 @@ def main():
     seed_elapsed = 0
     success_rows = []
     failure_rows = []
-    alt_pending = []  # productdetail-failed candidates for alt-store retry: (rank, src, sku)
+    warning_rows = []
+    warning_skus = set()
+    alt_pending = []  # (rank, source row, SKU, first responses)
     alt_recovered_count = 0
     alt_still_failed_count = 0
     display_flag_cache = {}
+
+    def retain(rank, src, sku, responses, store):
+        row = build_row(src, sku, responses, serving_store=store)
+        warnings = detail_warnings(rank, sku, responses, row)
+        success_rows.append(row)
+        warning_rows.extend(warnings)
+        if warnings:
+            warning_skus.add(sku)
+        prefix = ('alt_' if ALT_STORE_ENABLED else 'retry_') if responses['productdetail'].get('attempts', 1) > 1 else ''
+        save_raw_artifacts(rank, sku, responses, not warnings, prefix=prefix)
+        print(f'[{rank:>3}/{len(targets)}] sku={sku} '
+              f'{"WARNING retained with NULLs" if warnings else "OK"}')
+
     try:
         seed_elapsed = seed_session(driver)
         for i, src in enumerate(targets, 1):
             sku = (src.get('omni_item_id') or src.get('item_number') or '').strip()
             if not sku:
-                continue
-            t0 = time.time()
+                raise ValueError(f'Detail target {i} has no SKU')
             responses = fetch_sku(driver, sku, category_id, parent_category, flag_cache=display_flag_cache)
-            elapsed = round(time.time() - t0, 2)
-            statuses = {k: v.get('status') for k, v in responses.items()}
-            success = (
-                statuses.get('productdetail') == 200
-                and reviews_success(responses)
-                and statuses.get('compare') in OK_STATUSES
-            )
-            save_raw_artifacts(i, sku, responses, success)
-            if success:
-                success_rows.append(build_row(src, sku, responses, serving_store=STORE_FMT))
-                print(f'[{i:>3}/{len(targets)}] sku={sku} OK  elapsed={elapsed}s')
+            if responses['productdetail'].get('problem'):
+                save_raw_artifacts(i, sku, responses, False)
+                alt_pending.append((i, src, sku, responses))
             else:
-                failure_rows.append({
-                    'rank': i, 'omni_item_id': sku,
-                    'statuses': json.dumps(statuses),
-                    'elapsed_seconds': elapsed,
-                })
-                print(f'[{i:>3}/{len(targets)}] sku={sku} FAIL {statuses}  elapsed={elapsed}s')
-                # Queue for alt-store retry only when productdetail itself failed
-                # (other endpoint failures are unrelated to store routing).
-                if ALT_STORE_ENABLED and statuses.get('productdetail') != 200:
-                    alt_pending.append((i, src, sku))
+                retain(i, src, sku, responses, STORE_FMT)
             if SLEEP_BETWEEN > 0:
                 time.sleep(SLEEP_BETWEEN)
 
-        # ---- Alt-store fallback pass ----
-        if ALT_STORE_ENABLED and alt_pending:
-            print('-' * 80)
-            print(f'[alt] productdetail-failed candidates for retry: {len(alt_pending)}  alt_store={ALT_STORE_FMT}')
-            reseed_for_alt(driver)
-            for ai, (orig_rank, src, sku) in enumerate(alt_pending, 1):
-                t0 = time.time()
-                responses = fetch_sku(driver, sku, category_id, parent_category, store=ALT_STORE_FMT, flag_cache=display_flag_cache)
-                elapsed = round(time.time() - t0, 2)
-                statuses = {k: v.get('status') for k, v in responses.items()}
-                success = (
-                    statuses.get('productdetail') == 200
-                    and reviews_success(responses)
-                    and statuses.get('compare') in OK_STATUSES
-                )
-                # save under alt_ prefix so primary fail marker is preserved
-                alt_name = f'alt_{orig_rank:03d}_{sku}_{"success" if success else "fail"}'
-                alt_folder = RAW_DIR / alt_name
-                alt_folder.mkdir(parents=True, exist_ok=True)
-                for label, r in responses.items():
-                    body = (r or {}).get('body', '') or ''
-                    body = redact_sensitive(body)
-                    (alt_folder / f'{label}.json').write_text(body[:500000], encoding='utf-8', errors='replace')
-                meta = {label: {k: v for k, v in (r or {}).items() if k != 'body'} for label, r in responses.items()}
-                (alt_folder / 'meta.json').write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
-
-                if success:
-                    success_rows.append(build_row(src, sku, responses, serving_store=ALT_STORE_FMT))
-                    # remove from failure_rows (matched by rank+sku)
-                    failure_rows = [f for f in failure_rows if not (f.get('rank') == orig_rank and f.get('omni_item_id') == sku)]
-                    alt_recovered_count += 1
-                    print(f'[alt {ai:>2}/{len(alt_pending)}] sku={sku} OK (rank {orig_rank})  elapsed={elapsed}s')
-                else:
-                    alt_still_failed_count += 1
-                    print(f'[alt {ai:>2}/{len(alt_pending)}] sku={sku} STILL FAIL {statuses}  elapsed={elapsed}s')
+        # Productdetail gets one retry. Preserve already collected reviews/compare.
+        # Keep the proven alternate-store recovery when it is enabled.
+        if alt_pending:
+            retry_store = ALT_STORE_FMT if ALT_STORE_ENABLED else STORE_FMT
+            if ALT_STORE_ENABLED:
+                reseed_for_alt(driver)
+            for orig_rank, src, sku, previous in alt_pending:
+                responses = fetch_sku(driver, sku, category_id, parent_category,
+                                      store=retry_store, flag_cache=display_flag_cache, previous=previous)
+                if ALT_STORE_ENABLED:
+                    if responses['productdetail'].get('problem'):
+                        alt_still_failed_count += 1
+                    else:
+                        alt_recovered_count += 1
+                retain(orig_rank, src, sku, responses, retry_store)
                 if SLEEP_BETWEEN > 0:
                     time.sleep(SLEEP_BETWEEN)
     finally:
@@ -962,7 +1056,10 @@ def main():
         'overall_elapsed_seconds': overall_elapsed,
         'seed_elapsed_seconds': round(seed_elapsed, 2),
         'targets': len(targets),
-        'success': len(success_rows),
+        'success': len(success_rows) - len(warning_skus),
+        'output_rows': len(success_rows),
+        'warning_sku_count': len(warning_skus),
+        'warnings': warning_rows,
         'failure': len(failure_rows),
         'input_csv': str(INPUT_CSV),
         'detail_csv': str(DETAIL_CSV),
