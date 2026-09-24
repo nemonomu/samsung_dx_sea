@@ -23,6 +23,7 @@ def parser_functions(category='REF'):
         '_format_lead_date', '_fulfillment_slot', '_slot_text', '_slot_qty',
         'parse_productdetail',
         'build_row', 'has_body', 'collect_fulfillment_display', 'fetch_sku',
+        'response_problem', 'request_with_retry', 'review_total_results_from_body',
     }
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {
@@ -47,6 +48,7 @@ def parser_functions(category='REF'):
         'parse_reviews': lambda *args: {},
         'now_iso': lambda: '2026-09-15T04:25:00',
         'ZIP': '10010', 'STATE': 'NY', 'NEARBY_STORE': '1674', 'STORE_FMT': '0289',
+        'REVIEW_PAGE_SIZE': 10,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
