@@ -131,13 +131,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('"price"', text)
 
     def install_detail(self):
+        for name in ("main", "bsr"):
+            common.atomic_json(self.root / name / "collection_status.json", dict(status="complete"))
         base = self.root / "detail"
         changes = dict(OUTPUT_ROOT=self.root / "output", DETAIL_ROOT=base,
             RAW_DETAIL_DIR=base / "raw/detail_html", RAW_REVIEW_DIR=base / "raw/review20",
             RAW_COMPARE_DIR=base / "raw/compare", PARSED_DIR=base / "parsed", BENCHMARKS_DIR=base / "benchmarks",
             DETAIL_ROWS_CSV=base / "parsed/detail_enriched_rows.csv", FAILURES_CSV=base / "parsed/detail_failures.csv",
             MANIFEST_PATH=base / "manifest_detail_enrichment.json", FINAL_OUTPUT_CSV=self.root / "output/final_output.csv",
-            PRODUCT_LIST_CSV=self.root / "output/bestbuy_product_list.csv", FORCE_REFRESH=False,
+            PRODUCT_LIST_CSV=self.root / "output/bestbuy_product_list.csv", TARGET_CSV=self.root / "output/bestbuy_final_targets.csv", FORCE_REFRESH=False,
             FETCH_COMPARE=True, FETCH_FULFILLMENT_DYNAMIC=False, FETCH_GET_IT_FAST=False,
             CATEGORY="TV", DETAIL_SKU_BATCH_SIZE=5, STAGE="detail")
         patcher = patch.multiple(detail, **changes)
@@ -145,7 +147,7 @@ class RecoveryTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for name, replacement in {
             "detail_selector_values": lambda text: {},
-            "sample_fields": lambda: ["sku_id", "main_rank", "bsr_rank", "retailer_sku_name", "final_sku_price", "retailer_sku_name_similar"],
+            "sample_fields": lambda: ["sku_id", "main_rank", "bsr_rank", "retailer_sku_name", "final_sku_price", "original_sku_price", "savings", "detailed_review_content", "count_of_reviews", "retailer_sku_name_similar"],
             "update_product_list_from_detail_rows": Mock(),
             "preserve_existing_availability": Mock(),
             "close_detail_browser_page": Mock(),
@@ -165,7 +167,7 @@ class RecoveryTests(unittest.TestCase):
             "price": {"customerPrice": 999, "displayableCustomerPrice": "$999.00"},
             "reviewInfo": {"reviewCount": 0}, "reviews": {"results": []}}}}
 
-    def test_compare_error_keeps_detail_and_rank_null_and_blocks_final_then_resume_only_compare(self):
+    def test_compare_error_publishes_null_with_warning_then_resume_only_compare(self):
         self.install_detail()
         target = dict(sku_id="12345", main_rank="15", bsr_rank="7", product_name="Example", review_count="0")
         requests = []
@@ -173,9 +175,8 @@ class RecoveryTests(unittest.TestCase):
             requests.append(payload)
             return 200, "", [self.response(p, compare_failure=True) for p in payload], {}, 0
         with patch.object(detail, "browser_graphql_post", post):
-            with self.assertRaises(common.CollectionIncomplete):
-                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
-        self.assertEqual([len(p) for p in requests], [3, 1, 1])
+            recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual([len(p) for p in requests], [3, 1])
         report = common.read_json(self.root / "output/collection_status.json")
         self.assertEqual(report["items"]["12345"]["detail"]["status"], "success")
         self.assertEqual(report["items"]["12345"]["review"]["status"], "empty")
@@ -183,10 +184,13 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(row["main_rank"], "15")
         self.assertIsNone(row["retailer_sku_name_similar"])
         self.assertTrue(row["final_sku_price"])
-        self.assertFalse(detail.FINAL_OUTPUT_CSV.exists())
-        note = common.recovery_notification("TV", self.root, "failed")
+        self.assertTrue(detail.FINAL_OUTPUT_CSV.exists())
+        self.assertEqual(report["status"], "complete_with_warnings")
+        common.assert_ready(self.root)
+        note = common.recovery_notification("TV", self.root)
         self.assertIn("12345 | 15 | 7 | compare", note["body"])
-        self.assertIn("보류", note["body"])
+        self.assertIn("NULL 컬럼: retailer_sku_name_similar", note["body"])
+        self.assertIn("적재 허용", note["body"])
         requests.clear()
         def recovered(payload, *args):
             requests.append(payload)
@@ -201,21 +205,31 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(next(csv.reader(stream)), detail.sample_fields())
         common.assert_ready(self.root)
 
-    def test_transport_outage_stops_remaining_chunks_and_preserves_old_final(self):
+    def test_transport_outage_retries_each_chunk_once_and_publishes_listing_values(self):
         self.install_detail()
-        targets = [dict(sku_id=str(i), main_rank=str(i), review_count="0") for i in range(1, 8)]
-        detail.FINAL_OUTPUT_CSV.parent.mkdir(parents=True)
+        targets = [dict(sku_id=str(i), main_rank=str(i), product_name="Listing " + str(i),
+                        customer_price="12", regular_price="15", total_savings="3", review_count="0")
+                   for i in range(1, 8)]
+        detail.FINAL_OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
         detail.FINAL_OUTPUT_CSV.write_text("old final", encoding="utf-8")
         post = Mock(side_effect=RuntimeError("TypeError: Failed to fetch"))
         with patch.object(detail, "browser_graphql_post", post):
-            with self.assertRaises(common.CollectionIncomplete):
-                recovery.run(detail, targets, targets, budget_factory=Clock().budget)
-        self.assertEqual(post.call_count, 5)
-        self.assertEqual(detail.FINAL_OUTPUT_CSV.read_text(encoding="utf-8"), "old final")
+            recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+        self.assertEqual(post.call_count, 4)
         report = common.read_json(self.root / "output/collection_status.json")
-        self.assertEqual(report["items"]["7"]["detail"]["status"], "pending")
-        with self.assertRaises(common.CollectionIncomplete):
-            common.assert_ready(self.root)
+        self.assertEqual(report["status"], "complete_with_warnings")
+        for item in report["items"].values():
+            for state in item.values():
+                self.assertEqual(state["request_attempt"], 2)
+                self.assertEqual(state["attempt"], 0)
+        with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(rows[0]["final_sku_price"], "12")
+        self.assertEqual(rows[0]["original_sku_price"], "15")
+        self.assertEqual(rows[0]["savings"], "3")
+        self.assertEqual(rows[0]["detailed_review_content"], "")
+        common.assert_ready(self.root)
 
     def test_graphql_error_and_missing_compare_shape_not_empty(self):
         t = {"review_count": "0"}
@@ -287,9 +301,8 @@ class RecoveryTests(unittest.TestCase):
                     responses.append(self.response(payload, compare_failure=True))
             return 200, "", responses, {}, 0
         with patch.object(detail, "browser_graphql_post", post):
-            with self.assertRaises(common.CollectionIncomplete):
-                recovery.run(detail, targets, targets, budget_factory=Clock().budget)
-        self.assertEqual([len(p) for p in requests], [6, 1, 1])
+            recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+        self.assertEqual([len(p) for p in requests], [6, 1])
         self.assertTrue(all(p["variables"]["skuId"] == "67890" for batch in requests[1:] for p in batch))
         report = common.read_json(self.root / "output/collection_status.json")
         self.assertEqual(report["completed_skus"], 1)
@@ -319,7 +332,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(final[0]["retailer_sku_name_similar"], "Current ||| Similar")
         self.assertEqual((final[0]["main_rank"], final[0]["bsr_rank"]), ("15", "7"))
 
-    def test_cross_page_duplicate_restarts_without_accepting_shifted_ranks(self):
+    def test_entire_repeated_page_still_restarts_without_accepting_shifted_ranks(self):
         api, calls = self.fake_listing(iter([page_data("same"), page_data("same"), page_data("probe"),
                                            page_data("a"), page_data("b"), page_data("c")]))
         rows, _, _, report = listing.collect(api, {}, object(), budget_factory=Clock().budget)
@@ -347,15 +360,16 @@ class RecoveryTests(unittest.TestCase):
             listing.collect(api, {}, object(), budget_factory=clock.budget)
         self.assertEqual(calls, [1, 1])
 
-    def test_permanent_query_error_does_not_retry_three_times(self):
+    def test_query_error_retries_once_then_publishes_nulls(self):
         self.install_detail()
         target = dict(sku_id="12345", main_rank="15", review_count="0")
         def post(payload, *args):
             return 200, "", [{"errors": [{"extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}]} for _ in payload], {}, 0
         with patch.object(detail, "browser_graphql_post", side_effect=post) as call:
-            with self.assertRaises(common.CollectionIncomplete):
-                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
-        self.assertEqual(call.call_count, 1)
+            result = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(result["status"], "complete_with_warnings")
+        common.assert_ready(self.root)
 
     def test_wrong_product_identity_is_never_stored_as_success(self):
         self.install_detail()
@@ -371,8 +385,7 @@ class RecoveryTests(unittest.TestCase):
         recovery.store_operation(detail, target, "detail", payload, self.response(payload),
                                  dict(status="success", reason="verified", attempt=1))
         with patch.object(detail, "browser_graphql_post", side_effect=RuntimeError("offline")):
-            with self.assertRaises(common.CollectionIncomplete):
-                recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+            recovery.run(detail, [target], [target], budget_factory=Clock().budget)
         row = common.read_json(self.root / "output/partial_output.json")[0]
         self.assertIsNone(row["final_sku_price"])
         self.assertEqual(row["main_rank"], "15")
@@ -438,6 +451,187 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotEqual(report["status"], "complete")
         with self.assertRaises(common.CollectionIncomplete):
             common.assert_ready(self.root)
+
+    def test_observed_null_compare_response_is_retried_then_inserted_as_db_null(self):
+        from bestbuy import step14_db_load as db
+        from bestbuy import bestbuy_orchestrator as orchestrator
+        self.install_detail()
+        target = dict(sku_id="6672730", main_rank="251", review_count="0")
+        calls = []
+        def post(payloads, *args):
+            calls.append(payloads)
+            responses = [self.response(p) for p in payloads]
+            for p, response in zip(payloads, responses):
+                if p["operationName"] == "GetCompareProduct":
+                    response["data"]["recommendations"]["subPlacements"] = None
+            return 200, "", responses, {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            report = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual([len(batch) for batch in calls], [3, 1])
+        self.assertEqual(report["failures"][0]["null_columns"], ["retailer_sku_name_similar"])
+        with patch.object(orchestrator, "run_root", return_value=self.root):
+            self.assertTrue(orchestrator.detail_html_complete()[0])
+            self.assertTrue(orchestrator.review20_complete()[0])
+        with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        cursor = Mock()
+        with patch.object(db, "validate_insert_columns", return_value=[]), patch.object(db, "delete_existing_batch", return_value=0):
+            db.insert_rows(cursor, "test_output", [("sku_id", "text"), ("final_sku_price", "text"),
+                           ("retailer_sku_name_similar", "text")], rows)
+        self.assertEqual(cursor.executemany.call_args.args[1], [("6672730", "$999", None)])
+        for name in ("main", "bsr"):
+            common.atomic_json(self.root / name / "collection_status.json", dict(status="incomplete", failed_page=2))
+            with self.assertRaises(common.CollectionIncomplete):
+                common.assert_ready(self.root)
+            common.atomic_json(self.root / name / "collection_status.json", dict(status="complete"))
+
+    def test_observed_short_review_is_null_but_review_total_and_prices_survive(self):
+        self.install_detail()
+        target = dict(sku_id="6668726", main_rank="16", bsr_rank="8", review_count="15")
+        def post(payloads, *args):
+            responses = [self.response(p) for p in payloads]
+            for p, response in zip(payloads, responses):
+                if p["operationName"] != "GetCompareProduct":
+                    product = response["data"]["productBySkuId"]
+                    product["reviewInfo"] = {"reviewCount": 15, "averageRating": 4.8}
+                    product["reviews"]["results"] = [{"text": "Review " + str(i)} for i in range(14)]
+            return 200, "", responses, {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            report = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(report["failures"][0]["reason"], "review_partial_14_of_15")
+        self.assertEqual(report["failures"][0]["request_attempt"], 2)
+        row = common.read_json(self.root / "output/partial_output.json")[0]
+        self.assertIsNone(row["detailed_review_content"])
+        self.assertEqual(row["count_of_reviews"], "15")
+        self.assertEqual(row["final_sku_price"], "$999")
+        self.assertIn("NULL 컬럼: detailed_review_content", common.recovery_notification("LDY", self.root)["body"])
+
+    def test_observed_buying_options_error_preserves_listing_prices_and_nulls_review(self):
+        self.install_detail()
+        target = dict(sku_id="6563821", main_rank="114", review_count="514", customer_price="404.99",
+                      regular_price="674.99", total_savings="270", product_name="Whirlpool washer")
+        def post(payloads, *args):
+            responses = [self.response(p) for p in payloads]
+            for p, response in zip(payloads, responses):
+                if p["operationName"] != "GetCompareProduct":
+                    product = response["data"]["productBySkuId"]
+                    product.pop("price")
+                    product["buyingOptions"] = None
+                    product["manufacturer"] = {"modelNumber": "WTW4957PW"}
+                    product["reviewInfo"] = {"reviewCount": 514, "averageRating": 4.3}
+                    product["reviews"]["results"] = [{"text": "Review " + str(i)} for i in range(20)]
+                    response["errors"] = [{"path": ["productBySkuId", "buyingOptions"],
+                                           "extensions": {"code": "NOT_FOUND"}}]
+            return 200, "", responses, {}, 0
+        with patch.object(detail, "CATEGORY", "LDY"), patch.object(detail, "browser_graphql_post", post):
+            report = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(report["status"], "complete_with_warnings")
+        self.assertEqual({f["stage"] for f in report["failures"]}, {"detail", "review"})
+        row = common.read_json(self.root / "output/partial_output.json")[0]
+        self.assertEqual([row[k] for k in ("final_sku_price", "original_sku_price", "savings")],
+                         ["$404.99", "$674.99", "$270"])
+        self.assertIsNone(row["detailed_review_content"])
+        note = common.recovery_notification("LDY", self.root)
+        self.assertIn("productBySkuId.buyingOptions", note["body"])
+        self.assertIn("detailed_review_content", note["body"])
+        common.assert_ready(self.root)
+
+    def test_failed_operation_recovers_on_second_request_without_retrying_successes(self):
+        self.install_detail()
+        target = dict(sku_id="12345", review_count="0")
+        calls = []
+        def post(payloads, *args):
+            calls.append(payloads)
+            return 200, "", [self.response(p, compare_failure=len(calls) == 1) for p in payloads], {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            report = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual([len(batch) for batch in calls], [3, 1])
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["failures"], [])
+
+    def test_malformed_and_wrong_sku_data_cannot_leak_into_final_output(self):
+        self.install_detail()
+        target = dict(sku_id="12345", product_name="Verified listing", main_rank="1", customer_price="12")
+        def post(payloads, *args):
+            responses = [self.response(p) for p in payloads]
+            for item in responses:
+                item["data"]["productBySkuId"]["skuId"] = "another-sku"
+            return 200, "", responses, {}, 0
+        with patch.object(detail, "browser_graphql_post", post):
+            recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        row = common.read_json(self.root / "output/partial_output.json")[0]
+        self.assertEqual(row["retailer_sku_name"], "Verified listing")
+        self.assertEqual(row["final_sku_price"], "$12")
+        self.assertIsNone(row["detailed_review_content"])
+        self.assertIsNone(row["retailer_sku_name_similar"])
+        with patch.object(detail, "browser_graphql_post", return_value=(200, "", [None, [], None], {}, 0)):
+            result = recovery.run(detail, [target], [target], budget_factory=Clock().budget)
+        self.assertEqual(result["status"], "complete_with_warnings")
+
+    def test_missing_listing_blocks_detail_requests_and_warning_publication(self):
+        self.install_detail()
+        for name in ("main", "bsr"):
+            common.atomic_json(self.root / name / "collection_status.json", dict(status="incomplete", failed_page=2))
+            with patch.object(detail, "browser_graphql_post") as post:
+                with self.assertRaises(common.CollectionIncomplete):
+                    recovery.run(detail, [dict(sku_id="1")], [dict(sku_id="1")])
+                post.assert_not_called()
+            common.atomic_json(self.root / name / "collection_status.json", dict(status="complete"))
+        common.atomic_json(self.root / "output/collection_status.json", dict(status="complete_with_warnings"))
+        with self.assertRaisesRegex(common.CollectionIncomplete, "unverified_warning_output"):
+            common.assert_ready(self.root)
+
+    def test_boundary_duplicate_keeps_first_position_and_collects_rest_of_page(self):
+        responses = []
+        for page in range(1, 17):
+            skus = [str((page - 1) * 18 + i) for i in range(1, 19)]
+            if page == 15:
+                skus[-1] = "12372812"
+            elif page == 16:
+                skus[0] = "12372812"
+            graph = {"data": {"detailedProductSearch": {"documents": [{"product": {"skuId": sku}} for sku in skus]}}}
+            rows = [dict(sku_id=sku, organic_rank=i, page=page, container_type="organic_product") for i, sku in enumerate(skus, 1)]
+            responses.append((graph, {"status_code": 200}, rows))
+        api, calls = self.fake_listing(iter(responses))
+        api.SEARCH_PAGES, api.LISTING_ORGANIC_TARGET, api.ORGANIC_OFFSET = 16, 0, 18
+        rows, _, _, report = listing.collect(api, {}, object(), budget_factory=Clock().budget)
+        self.assertEqual(calls, list(range(1, 17)))
+        self.assertEqual(report["accepted_pass"], 1)
+        self.assertEqual(report["organic_count"], 287)
+        self.assertEqual(rows[15][-1]["sku_id"], "12372812")
+        self.assertEqual(rows[16][0]["organic_rank"], 2)
+        self.assertEqual(len(rows[16]), 17)
+        self.assertEqual(report["duplicates"], [dict(sku_id="12372812", first_page=15, first_position=18, page=16, position=1)])
+        note = common.recovery_notification("REF", self.root)
+        self.assertIn("15페이지 18번째 / 16페이지 1번째 중복, 첫 등장 채택", note["body"])
+
+    def test_email_reports_warning_columns_and_actual_db_counts(self):
+        from bestbuy import step16_email_notify as notify
+        self.install_detail()
+        common.atomic_json(self.root / "output/collection_status.json", dict(status="complete_with_warnings",
+            finalization_ready=True, target_count=313, completed_skus=312, failures=[dict(sku_id="6672730",
+                main_rank="251", stage="compare", status="failed", request_attempt=2, attempt=2,
+                reason="recommendations_shape_missing", null_columns=["retailer_sku_name_similar"])]))
+        common.atomic_json(self.root / "output/db_load_manifest.json", dict(dry_run=False,
+            final_output=dict(inserted=313, csv_rows=313)))
+        result = notify.build_notification("TV", self.root, status="success")
+        self.assertIn("검수 필요", result["subject"])
+        self.assertIn("DB 적재 기록: 신규 313개 / 갱신 0개", result["body"])
+        self.assertIn("NULL 컬럼: retailer_sku_name_similar", result["body"])
+        self.assertNotIn("collection_incomplete", result["issues"])
+        common.atomic_json(self.root / "output/db_load_manifest.json", dict(dry_run=True,
+            final_output=dict(inserted=313)))
+        self.assertIn("모의 실행 — 실제 반영 아님", notify.build_notification("TV", self.root)["body"])
+
+    def test_fullrun_review_step_does_not_start_a_second_retry_cycle(self):
+        from bestbuy import bestbuy_orchestrator as orchestrator
+        self.install_detail()
+        common.atomic_json(self.root / "output/collection_status.json",
+                           dict(status="complete_with_warnings", finalization_ready=True))
+        with patch.object(orchestrator, "run_root", return_value=self.root), \
+             patch.object(orchestrator, "apply_run_path_env"), patch.object(orchestrator.subprocess, "run") as execute:
+            orchestrator.run_step(orchestrator.step_by_key("review20"))
+        execute.assert_not_called()
 
     def test_listing_main_publishes_verified_combo_page_without_false_failed_page(self):
         from bestbuy import step01_main_list as production

@@ -98,8 +98,9 @@ def store_operation(d, target, stage, payload, item, state):
                     finished_at=utc_now(), transport="browser_graphql", x_request_cost=0)
     body = json.dumps(sanitized(item), ensure_ascii=False)
     # Do not persist a mismatched product into the product parser's cache.
-    product = ((item.get("data") or {}).get("productBySkuId") or {}) if isinstance(item, dict) else {}
-    safe_item = item if not product or str(product.get("skuId") or "") == sku else {}
+    data = item.get("data") if isinstance(item, dict) else None
+    product = data.get("productBySkuId") if isinstance(data, dict) else None
+    safe_item = item if isinstance(product, dict) and str(product.get("skuId") or "") == sku else {}
     if stage == "detail":
         paths = d.detail_paths_for_status(sku, target, ok)
         d.write_direct_detail_artifacts(paths, [payload], [sanitized(safe_item)], body, {})
@@ -134,7 +135,7 @@ def make_report(targets, states, evidence, reason="", status="running"):
         complete += all(s["status"] in SUCCESS_STATES for s in stages.values() if s.get("required"))
         for stage, state in stages.items():
             counts.setdefault(stage, Counter())[state["status"]] += 1
-            if state.get("required") and state["status"] not in SUCCESS_STATES:
+            if state["status"] not in SUCCESS_STATES:
                 failures.append(dict(sku_id=sku, main_rank=target.get("main_rank", ""),
                     bsr_rank=target.get("bsr_rank", ""), stage=stage, **state))
             if state["status"] in SUCCESS_STATES and state.get("warnings"):
@@ -152,7 +153,7 @@ def safe_output_row(d, target, states):
     detail_state = states.get("detail", {})
     if not detail_state.get("response_received") and not detail_state.get("reused"):
         metadata = {k: row.get(k) for k in ("id", "product", "account_name", "page_type", "batch_id",
-                    "calendar_week", "crawl_datetime", "crawl_date", "retailer_sku_name", "product_url", "item")}
+                    "calendar_week", "crawl_datetime", "crawl_strdatetime", "crawl_date", "country")}
         observed_review = row.get("detailed_review_content")
         observed_compare = row.get("retailer_sku_name_similar")
         row = {k: target.get(k) if target.get(k) not in (None, "") else None for k in row}
@@ -163,6 +164,12 @@ def safe_output_row(d, target, states):
         row["sku_id"] = str(target["sku_id"])
         row["main_rank"], row["bsr_rank"] = target.get("main_rank"), target.get("bsr_rank")
         row["final_sku_price"] = target.get("final_sku_price") or target.get("customer_price")
+        row["original_sku_price"] = target.get("original_sku_price") or target.get("regular_price")
+        row["savings"] = target.get("savings") or target.get("total_savings")
+        row["sku"] = target.get("sku") or target.get("model_number")
+        row["star_rating"] = target.get("star_rating") or target.get("rating")
+        row["count_of_reviews"] = target.get("count_of_reviews", target.get("review_count"))
+        row["count_of_star_ratings"] = target.get("count_of_star_ratings", target.get("review_count"))
         row["detailed_review_content"] = observed_review
         row["retailer_sku_name_similar"] = observed_compare
     # Retain observed listing values; avoid synthetic zero/not-reviewed values after failed detail.
@@ -178,12 +185,37 @@ def safe_output_row(d, target, states):
         row["detailed_review_content"] = None
     if states.get("compare", {}).get("status") not in SUCCESS_STATES:
         row["retailer_sku_name_similar"] = None
+    auxiliary_fields = {
+        "compare_v2": (), "trade_in": ("trade_in",),
+        "fulfillment_dynamic": ("pick_up_availability", "fastest_delivery", "delivery_availability",
+                                "available_quantity_for_purchase", "inventory_status", "shipping_info"),
+        "get_it_fast": ("pick_up_availability", "fastest_delivery", "delivery_availability"),
+    }
+    for stage, fields in auxiliary_fields.items():
+        if stage in states and states[stage]["status"] not in SUCCESS_STATES:
+            for field in fields:
+                row[field] = target.get(field) if target.get(field) not in (None, "") else None
+    # Match DB NULL normalization, and record exactly which output columns need review.
+    row = {key: None if value == "" else value for key, value in row.items()}
+    output_fields = set(d.sample_fields())
+    for stage, state in states.items():
+        if state["status"] in SUCCESS_STATES:
+            continue
+        fields = ({"detailed_review_content"} if stage == "review" else
+                  {"retailer_sku_name_similar"} if stage in {"compare", "compare_v2"} else
+                  set(auxiliary_fields[stage]) if stage in auxiliary_fields else
+                  output_fields - {"id", "main_rank", "bsr_rank", "detailed_review_content", "retailer_sku_name_similar"})
+        state["null_columns"] = sorted(key for key in fields & output_fields if row.get(key) is None)
     return row
 
 
 def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
     assert_ready(d.OUTPUT_ROOT.parent, listing="main")
     assert_ready(d.OUTPUT_ROOT.parent, listing="bsr")
+    listing_reports = {name: read_json(d.OUTPUT_ROOT.parent / name / "collection_status.json")
+                       for name in ("main", "bsr")}
+    if any(report.get("status") != "complete" for report in listing_reports.values()):
+        raise CollectionIncomplete("verified_main_and_bsr_required")
     evidence = Evidence(d.DETAIL_ROOT, "detail", dict(category=d.CATEGORY, stage=d.STAGE,
         batch_size=d.DETAIL_SKU_BATCH_SIZE, item_attempts=MAX_ITEM_ATTEMPTS))
     budget = budget_factory(evidence)
@@ -225,25 +257,24 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
             report["target_csv"] = str(d.TARGET_CSV.resolve())
             report["final_output_csv"] = str(d.FINAL_OUTPUT_CSV.resolve())
         report["listing_sources"] = {
-            name: source["evidence_path"] for name in ("main", "bsr")
-            if (source := read_json(d.OUTPUT_ROOT.parent / name / "collection_status.json")) and source.get("evidence_path")
+            name: source["evidence_path"] for name, source in listing_reports.items() if source.get("evidence_path")
         }
         atomic_json(status_path, report)
         return report
 
     checkpoint()
     reason = ""
-    restarted = False
     old_recoveries = d.BROWSER_GRAPHQL_MAX_RECOVERIES
     d.BROWSER_GRAPHQL_MAX_RECOVERIES = 0  # One shared recovery owner; no nested retry multiplication.
     fatal = None
+    aborted = False
     try:
         if previous.get("collected_date") and previous["collected_date"] != str(date.today()):
             raise CollectionIncomplete("stale_run_requires_new_listing_collection")
         for round_number in range(MAX_ITEM_ATTEMPTS):
             pending = [t for t in output_targets if str(t["sku_id"]) in selected and any(
-                s["status"] not in SUCCESS_STATES and s.get("reason") != "permanent_graphql_error"
-                and s["attempt"] < MAX_ITEM_ATTEMPTS for s in states[str(t["sku_id"])].values())]
+                s["status"] not in SUCCESS_STATES
+                and s["request_attempt"] < MAX_ITEM_ATTEMPTS for s in states[str(t["sku_id"])].values())]
             if not pending:
                 break
             if round_number and not budget.wait(reason="retry_incomplete_operations"):
@@ -255,57 +286,61 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                 for target in chunk:
                     sku = str(target["sku_id"])
                     for stage, state in states[sku].items():
-                        if state["status"] in SUCCESS_STATES or state["reason"] == "permanent_graphql_error" or state["attempt"] >= MAX_ITEM_ATTEMPTS:
+                        if state["status"] in SUCCESS_STATES or state["request_attempt"] >= MAX_ITEM_ATTEMPTS:
                             continue
                         entries.append((target, sku, stage, operations[sku][stage]))
                         requests.append(operations[sku][stage])
                 if not entries:
                     continue
-                while True:
-                    if budget.expired():
-                        raise CollectionIncomplete(budget.reason)
-                    start = time.monotonic()
-                    request_started_at = utc_now()
-                    for _, sku, stage, _ in entries:
-                        states[sku][stage]["request_attempt"] += 1
-                    error, code, response, response_text = "", "ERR", {}, ""
-                    try:
-                        code, response_text, response, _, _ = d.browser_graphql_post(
-                            requests, d.target_url(chunk[0], str(chunk[0]["sku_id"])), str(chunk[0]["sku_id"]))
-                    except (RuntimeError, d.RequestException) as exc:
-                        error = str(exc)
-                    calls += 1
-                    if isinstance(response, dict) and len(requests) == 1 and "data" in response:
-                        response = [response]
-                    transport_ok = str(code) == "200" and isinstance(response, list) and len(response) == len(requests)
-                    event = evidence.request(requests, response, status_code=code, error=error,
-                        started_at=request_started_at, finished_at=utc_now(),
-                        unparsed_response=sanitized(response_text[:8000]) if not response else "",
-                        elapsed_seconds=round(time.monotonic() - start, 3),
-                        session_generation=d.BROWSER_GRAPHQL_PROCESS_GENERATION,
-                        browser_version=d.BROWSER_GRAPHQL_META.get("browser_version", "unknown"),
-                        targets=[dict(sku_id=sku, operation=stage) for _, sku, stage, _ in entries],
-                        status="response_received" if transport_ok else "transport_failed")
-                    if transport_ok and not budget.expired():
-                        break
+                if budget.expired():
+                    raise CollectionIncomplete(budget.reason)
+                start = time.monotonic()
+                request_started_at = utc_now()
+                for _, sku, stage, _ in entries:
+                    states[sku][stage]["request_attempt"] += 1
+                error, code, response, response_text = "", "ERR", {}, ""
+                try:
+                    code, response_text, response, _, _ = d.browser_graphql_post(
+                        requests, d.target_url(chunk[0], str(chunk[0]["sku_id"])), str(chunk[0]["sku_id"]))
+                except (RuntimeError, d.RequestException) as exc:
+                    error = str(exc)
+                calls += 1
+                if isinstance(response, dict) and len(requests) == 1 and "data" in response:
+                    response = [response]
+                transport_ok = str(code) == "200" and isinstance(response, list) and len(response) == len(requests)
+                event = evidence.request(requests, response, status_code=code, error=error,
+                    started_at=request_started_at, finished_at=utc_now(),
+                    unparsed_response=sanitized(response_text[:8000]) if not response else "",
+                    elapsed_seconds=round(time.monotonic() - start, 3),
+                    session_generation=d.BROWSER_GRAPHQL_PROCESS_GENERATION,
+                    browser_version=d.BROWSER_GRAPHQL_META.get("browser_version", "unknown"),
+                    targets=[dict(sku_id=sku, operation=stage) for _, sku, stage, _ in entries],
+                    status="response_received" if transport_ok else "transport_failed")
+                if not transport_ok:
                     for target, sku, stage, payload in entries:
-                        states[sku][stage].update(status="failed", reason=error or f"http_{code}_or_batch_shape",
-                            status_code=code, evidence_path=event["evidence_path"])
+                        state = states[sku][stage]
+                        state.update(status="failed", reason=error or f"http_{code}_or_batch_shape",
+                            status_code=code, evidence_path=event["evidence_path"], collected_at=utc_now())
+                        # Clear stale caches on a fresh failure; retain data observed in this invocation.
+                        if not state.get("response_received"):
+                            store_operation(d, target, stage, payload, {}, state)
+                        evidence.emit("operation_result", sku_id=sku, operation=stage,
+                            main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
+                    if budget.started is None:
+                        budget.started = budget.clock()
                     checkpoint()
-                    top_errors = response.get("errors", []) if isinstance(response, dict) else []
-                    if str(code) in {"400", "404"} or permanent_errors(top_errors) or not budget.wait(reason=error or f"http_{code}"):
-                        raise CollectionIncomplete(budget.reason or "non_retryable_transport_error")
-                    if budget.index >= 2 and not restarted:
-                        d.close_detail_browser_page()
-                        restarted = True
-                        evidence.emit("browser_restart", reason="repeated_transport_failure")
+                    continue
                 for index, (target, sku, stage, payload) in enumerate(entries):
                     state = states[sku][stage]
                     state["attempt"] += 1
                     outcome, why = validate_operation(d, stage, sku, response[index], target)
                     state.update(status=outcome, reason=why, status_code=code,
                                  evidence_path=event["evidence_path"], collected_at=utc_now(), response_received=True)
-                    state["warnings"] = sanitized(response[index].get("errors") or []) if (
+                    item = response[index]
+                    errors = item.get("errors") if isinstance(item, dict) else []
+                    state["error_paths"] = [".".join(map(str, e["path"])) for e in errors or []
+                                            if isinstance(e, dict) and isinstance(e.get("path"), list)] if isinstance(errors, list) else []
+                    state["warnings"] = sanitized(item.get("errors") or []) if (
                         outcome in SUCCESS_STATES and isinstance(response[index], dict)) else []
                     if outcome not in SUCCESS_STATES and budget.started is None:
                         budget.started = budget.clock()
@@ -316,6 +351,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         reason = reason or "item_attempt_limit"
     except CollectionIncomplete as exc:
         reason = str(exc)
+        aborted = True
     except BaseException as exc:
         reason = type(exc).__name__ + ": " + str(exc)
         fatal = exc
@@ -325,8 +361,20 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
 
     try:
         report = checkpoint(reason)
-        complete = not report["failures"] and bool(output_targets) and fatal is None
+        complete = not report["failures"] and bool(output_targets) and fatal is None and not aborted
+        ready = bool(output_targets) and fatal is None and not aborted and all(
+            state["status"] in SUCCESS_STATES or (
+                state["status"] == "failed" and state["request_attempt"] >= MAX_ITEM_ATTEMPTS)
+            for stages in states.values() for state in stages.values())
         rows = [safe_output_row(d, target, states[str(target["sku_id"])]) for target in output_targets]
+        if ready:
+            # A concurrent/replaced listing must still block every downstream write.
+            assert_ready(d.OUTPUT_ROOT.parent, listing="main")
+            assert_ready(d.OUTPUT_ROOT.parent, listing="bsr")
+            if any(read_json(d.OUTPUT_ROOT.parent / name / "collection_status.json") != source
+                   for name, source in listing_reports.items()):
+                raise CollectionIncomplete("listing_source_changed")
+        report = checkpoint(reason)
         for folder in (d.PARSED_DIR, d.BENCHMARKS_DIR, d.OUTPUT_ROOT):
             folder.mkdir(parents=True, exist_ok=True)
         atomic_csv(d.write_csv, d.DETAIL_ROWS_CSV, rows)
@@ -335,17 +383,22 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         for row in rows:
             for field in fields:
                 row.setdefault(field, None)
-        if complete:
-            d.preserve_existing_availability(rows)
+        if ready:
+            # Failed fields must remain NULL, not be refilled from an older final CSV.
+            d.preserve_existing_availability([row for target, row in zip(output_targets, rows)
+                if all(s["status"] in SUCCESS_STATES for s in states[str(target["sku_id"])].values())])
             final_rows = [{field: row.get(field) for field in fields} for row in rows]
             atomic_csv(d.write_csv, d.FINAL_OUTPUT_CSV, final_rows, fields)
             d.update_product_list_from_detail_rows(rows)
-        else:
+        if not complete:
             atomic_csv(d.write_csv, d.OUTPUT_ROOT / "partial_output.csv", rows)
             atomic_json(d.OUTPUT_ROOT / "partial_output.json", rows)
-        evidence.emit("complete" if complete else "partial", reason="verified" if complete else reason,
+        final_status = "complete" if complete else "complete_with_warnings" if ready else "partial"
+        evidence.emit(final_status, reason="verified" if complete else reason,
                       completed_skus=report["completed_skus"], target_count=len(output_targets))
-        report = checkpoint("verified" if complete else reason, "complete" if complete else "partial")
+        report = checkpoint("verified" if complete else reason, final_status)
+        report["finalization_ready"] = ready
+        atomic_json(status_path, report)
         manifest = dict(run_type="step08_detail_enrichment", target_count=len(output_targets),
             success_count=report["completed_skus"], failure_count=len(report["failures"]),
             collection_status=report["status"], stage=d.STAGE, finished_at=utc_now(),
@@ -358,7 +411,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         atomic_json(d.MANIFEST_PATH, manifest)
         if fatal is not None:
             raise fatal
-        if not complete:
+        if not ready:
             raise CollectionIncomplete(f"Partial detail collection: {report['completed_skus']}/{len(output_targets)}; {reason}")
         return report
     except Exception as exc:

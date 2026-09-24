@@ -947,6 +947,14 @@ def build_notification(category, run_root, status="success", failed_step="", fai
         collected_count = recovery["collected_count"]
         execution = f"실행 결과: {status} / 중단 단계: {failed_step_name or failed_step or '-'}"
         body = recovery["body"] + "\n\n" + execution
+        if final_db and not recovery["incomplete"]:
+            if db_data.get("dry_run") or final_db.get("dry_run"):
+                body += "\nDB 적재: 모의 실행 — 실제 반영 아님"
+            else:
+                body += (f"\nDB 적재 기록: 신규 {as_int(final_db.get('inserted'))}개 / "
+                         f"갱신 {as_int(final_db.get('updated'))}개")
+        else:
+            body += "\nDB 적재: 이번 실행의 반영 완료를 확인할 수 없음"
         body += f"\n총 호출 {call_counts.get('total', 0)}회 / 비용 {cost_krw:,}원"
         issues = ["collection_incomplete"] if recovery["incomplete"] else issues
         if not recovery["incomplete"] and issues:

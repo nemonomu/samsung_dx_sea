@@ -111,7 +111,8 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
         for pass_number in range(1, MAX_LISTING_PASSES + 1):
             evidence.emit("pass_start", pass_number=pass_number)
             rows_by_page, summaries, raw = {}, [], []
-            seen = set()
+            seen = {}
+            report["duplicates"] = []
             organic = 0
             complete = False
             page_limit = listing.LISTING_MAX_PAGES if listing.LISTING_ORGANIC_TARGET else listing.SEARCH_PAGES
@@ -122,8 +123,9 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
                 if budget.expired():
                     raise CollectionIncomplete(budget.reason)
                 skus = [str(r.get("sku_id")) for r in rows if r.get("container_type") == "organic_product"]
-                if ok and seen.intersection(skus):
-                    ok, reason = False, "cross_page_duplicate_organic_sku"
+                if ok and skus and all(sku in seen for sku in skus):
+                    # A whole repeated page is not evidence of forward pagination.
+                    ok, reason = False, "repeated_organic_page"
                 if not ok:
                     report.update(failed_page=page, reason=reason, organic_count=organic)
                     evidence.emit("pass_abandoned", pass_number=pass_number, page=page, reason=reason)
@@ -150,8 +152,21 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
                     if not recovered:
                         raise CollectionIncomplete(budget.reason or "recovery_exhausted")
                     break
-                seen.update(skus)
-                organic += len(skus)
+                accepted_rows = []
+                for row in rows:
+                    if row.get("container_type") == "organic_product":
+                        sku = str(row["sku_id"])
+                        position = int(row["organic_rank"])
+                        if sku in seen:
+                            first_page, first_position = seen[sku]
+                            report["duplicates"].append(dict(sku_id=sku, first_page=first_page,
+                                first_position=first_position, page=page, position=position))
+                            continue
+                        seen[sku] = (page, position)
+                        organic += 1
+                    accepted_rows.append(row)
+                # The raw response/evidence retains every original position.
+                rows = accepted_rows
                 rows_by_page[page] = rows
                 summary = listing.page_summary(page, rows, meta, graph)
                 summary["source"] = "browser_graphql_verified"

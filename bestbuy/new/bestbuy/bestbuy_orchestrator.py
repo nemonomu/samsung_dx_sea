@@ -528,7 +528,7 @@ def detail_html_complete():
             assert_ready(root)
         except CollectionIncomplete as exc:
             return False, str(exc)
-        return recovery.get("status") == "complete", f"collection {recovery.get('status')}"
+        return True, f"collection {recovery.get('status')}"
     target_csv = root / "output" / "bestbuy_final_targets.csv"
     target_count = csv_unique_count(target_csv, "sku_id")
     detail_meta = list((root / "detail" / "raw" / "detail_html").rglob("*_meta.json"))
@@ -549,7 +549,7 @@ def review20_complete():
             assert_ready(root)
         except CollectionIncomplete as exc:
             return False, str(exc)
-        return recovery.get("status") == "complete", f"collection {recovery.get('status')}"
+        return True, f"collection {recovery.get('status')}"
     target_csv = root / "output" / "bestbuy_final_targets.csv"
     target_count = csv_unique_count(target_csv, "sku_id")
     output_count = csv_count(root / "output" / "final_output.csv")
@@ -670,6 +670,15 @@ def run_step(step, dry_run=False, resume=False):
         print("[env] " + " ".join(f"{key}={value}" for key, value in effective_env.items()))
     if dry_run:
         return
+    if step.name == "review20":
+        from .step00_collection_recovery import DETAIL_READY_STATES, assert_ready
+        recovery = read_json(run_root(env) / "output" / "collection_status.json")
+        if recovery.get("status") in DETAIL_READY_STATES:
+            assert_ready(run_root(env))
+            # The browser detail step already requested review and retried its failures once.
+            # Do not silently start a second retry cycle in the full-run review step.
+            print(f"[skip] step {step.key} {step.name}: already finalized by detail collection")
+            return
     if step.name in {"s3_sync", "db_prepare", "db_load", "item_mst_load", "local_cleanup"}:
         from .step00_collection_recovery import assert_ready
         assert_ready(run_root(env))

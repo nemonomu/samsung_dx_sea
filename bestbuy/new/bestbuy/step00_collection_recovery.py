@@ -13,10 +13,11 @@ from pathlib import Path
 DELAYS = (30, 120, 300, 600)
 RECOVERY_SECONDS = 1800
 MAX_LISTING_PASSES = 3
-MAX_ITEM_ATTEMPTS = 3
+MAX_ITEM_ATTEMPTS = 2  # Initial detail request plus one retry, including transport failures.
 SUCCESS_STATES = {"success", "empty", "not_required"}
+DETAIL_READY_STATES = {"complete", "complete_with_warnings"}
 RECOVERY_EVENTS = {"waiting", "browser_restart", "recovered", "pass_start", "pass_abandoned",
-                   "complete", "incomplete", "partial", "previous_invocation"}
+                   "complete", "complete_with_warnings", "incomplete", "partial", "previous_invocation"}
 
 
 class CollectionIncomplete(RuntimeError):
@@ -173,8 +174,15 @@ def assert_ready(run_root, *, listing=None):
             raise CollectionIncomplete("Finalization blocked: detail_not_collected")
     for path in paths:
         report = read_json(path)
-        if report and report.get("status") != "complete":
+        allowed = DETAIL_READY_STATES if path == root / "output" / "collection_status.json" else {"complete"}
+        if report and report.get("status") not in allowed:
             raise CollectionIncomplete(f"Finalization blocked: {path}: {report.get('status')}")
+        if report.get("status") == "complete_with_warnings":
+            if not report.get("finalization_ready") or any(
+                read_json(root / name / "collection_status.json").get("status") != "complete"
+                for name in ("main", "bsr")
+            ):
+                raise CollectionIncomplete("Finalization blocked: unverified_warning_output")
         if report.get("occurrences_csv"):
             csv_path = Path(report["occurrences_csv"])
             if not csv_path.exists() or hashlib.sha256(csv_path.read_bytes()).hexdigest() != report.get("occurrences_sha256"):
@@ -202,8 +210,13 @@ def recovery_notification(category, root, status="success"):
     reports = [r for r in [*listings.values(), detail] if r]
     if not reports:
         return None
-    incomplete = not detail or any(r.get("status") != "complete" for r in reports)
+    incomplete = (not detail or detail.get("status") not in DETAIL_READY_STATES
+                  or any(r.get("status") != "complete" for r in listings.values()))
+    duplicates = [(name, item) for name, report in listings.items() for item in report.get("duplicates", [])]
+    review_needed = detail.get("status") == "complete_with_warnings" or bool(duplicates)
     label = "부분 완료" if incomplete and detail.get("completed_skus", 0) else "미완료" if incomplete else "수집 완료"
+    if not incomplete and review_needed:
+        label = "검수 필요"
     if not incomplete and status != "success":
         label = "후속 단계 실패"
     lines = [f"수집 상태: {label}", "", "목록·순위"]
@@ -225,10 +238,20 @@ def recovery_notification(category, root, status="success"):
                      attempt=item.get("attempt", "미기록"))
         lines.append(" | ".join(str(shown.get(k, "")) for k in
                               ("sku_id", "main_rank", "bsr_rank", "stage", "status", "request_attempt", "attempt", "reason")))
+        if not incomplete:
+            columns = ", ".join(item.get("null_columns", [])) or "없음 — 확보한 값 유지"
+            lines.append(f"  재수집 후 미완료 / NULL 컬럼: {columns}")
+        if item.get("error_paths"):
+            lines.append("  응답 오류 위치: " + ", ".join(item["error_paths"]))
     if len(failures) > 50:
         lines.append(f"- 전체 {len(failures)}개 미완료 항목 중 50개 표시. 전체 내역: {root / 'detail/parsed/detail_failures.csv'}")
     if not failures:
         lines.append("- 없음" if detail else "- 상세 미실행")
+    if duplicates:
+        lines += ["", "목록 중복 — 첫 등장 채택"]
+        for name, item in duplicates:
+            lines.append(f"- {name} SKU {item['sku_id']}, {item['first_page']}페이지 {item['first_position']}번째 / "
+                         f"{item['page']}페이지 {item['position']}번째 중복, 첫 등장 채택")
     lines += ["", "복구 이력"]
     for report in reports:
         for event in report.get("recovery_history", []):
@@ -237,10 +260,12 @@ def recovery_notification(category, root, status="success"):
                          f"reason={event.get('reason', '')}")
     if detail.get("reason"):
         lines.append("- 상세 종료 사유: " + detail["reason"])
-    lines += ["", "최종 반영: " + ("보류 — 미완료 항목/목록 있음" if incomplete else
+    lines += ["", "최종 반영: " + ("보류 — 목록 미완료 또는 상세 처리 중단" if incomplete else
+                                  "적재 허용 — 상세 누락은 NULL 처리, 실제 DB 반영 결과는 아래 확인" if review_needed else
                                   "수집 검증 통과 — DB 반영 결과는 아래 실행 결과 확인"),
-              "실패로 생긴 null은 실제 정보 없음과 구분합니다. 기존 DB 값을 null로 덮어쓰지 않습니다.",
-              "후속 조치: " + ("미완료 목록/항목을 재수집하세요." if incomplete else "후속 단계 결과를 확인하세요."),
+              "실패로 인한 NULL은 실제 정보 없음과 구분하여 위 미완료 내역에 기록합니다.",
+              "후속 조치: " + ("미완료 목록/항목을 재수집하세요." if incomplete else
+                               "NULL 컬럼과 목록 중복 내역을 검수하세요." if review_needed else "후속 단계 결과를 확인하세요."),
               "", "진단 자료"]
     lines.extend(f"- {r.get('evidence_path', '')}" for r in reports)
     return {"subject": f"[SEA] [{label}] BBY {category} — {detail.get('completed_skus', 0)}/{detail.get('target_count', 0)}개",
