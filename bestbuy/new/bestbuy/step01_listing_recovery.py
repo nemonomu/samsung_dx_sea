@@ -4,6 +4,7 @@ from .step00_collection_recovery import (
     CollectionIncomplete, Evidence, MAX_LISTING_PASSES, RecoveryBudget,
     atomic_json, fingerprint, permanent_errors,
 )
+from .step01_stage_retry import listing_failure
 
 
 def validate_page(graph, meta, rows):
@@ -90,8 +91,11 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             graph, meta, rows = listing.browser_graphql_fetch_once(page, payload, browser_page)
         except Exception as exc:
             graph, rows = {}, []
-            meta = {"status_code": "ERR", "error": str(exc)}
+            meta = {"status_code": "ERR", "error": str(exc), "exception_type": type(exc).__name__,
+                    "browser_diagnostics": getattr(exc, "bestbuy_browser_diagnostics", {})}
         ok, reason, empty = validate_page(graph, meta, rows)
+        if not ok:
+            report["last_failure"] = listing_failure(graph, meta, reason)
         event = evidence.request(payload, graph, page=page, pass_number=pass_number, probe=probe,
             status="success" if ok else "failed", reason=reason,
             status_code=meta.get("status_code"), elapsed_seconds=meta.get("elapsed_seconds"),
@@ -100,7 +104,8 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             raw_response_path=meta.get("response_path", ""),
             sku_order=[r.get("sku_id") for r in rows],
             order_hash=fingerprint([(r.get("sku_id"), r.get("organic_rank"), r.get("container_type")) for r in rows]),
-            graphql_errors=graph.get("errors", []) if isinstance(graph, dict) else [])
+            graphql_errors=graph.get("errors", []) if isinstance(graph, dict) else [],
+            browser_diagnostics=meta.get("browser_diagnostics", {}))
         meta["recovery_evidence"] = event["evidence_path"]
         report["listing_request_calls"] += 1
         report["offer_request_calls"] += int(meta.get("offer_graphql_request_count") or 0)
@@ -127,6 +132,7 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
                     # A whole repeated page is not evidence of forward pagination.
                     ok, reason = False, "repeated_organic_page"
                 if not ok:
+                    report["last_failure"] = listing_failure(graph, meta, reason)
                     report.update(failed_page=page, reason=reason, organic_count=organic)
                     evidence.emit("pass_abandoned", pass_number=pass_number, page=page, reason=reason)
                     checkpoint()

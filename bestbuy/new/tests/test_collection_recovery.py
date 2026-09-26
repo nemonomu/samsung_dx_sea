@@ -656,6 +656,37 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(manifest["failed_pages"], [])
         common.assert_ready(self.root, listing="main")
 
+    def test_listing_fetch_persists_chrome_diagnostics_with_original_error(self):
+        from bestbuy import step01_main_list as production
+        browser = types.SimpleNamespace(url="https://www.bestbuy.com/site/searchpage.jsp",
+            run_js=Mock(side_effect=[json.dumps({"error": "TypeError: Failed to fetch"}),
+                                    {"ready_state": "complete", "online": True}]),
+            listen=Mock(listening=False))
+        browser.listen.wait.return_value = [types.SimpleNamespace(is_failed=True,
+            fail_info=types.SimpleNamespace(errorText="net::ERR_CONNECTION_RESET", canceled=False,
+                                           blockedReason="", corsErrorStatus=None))]
+        with patch.multiple(production, RUN_ROOT=self.root, BROWSER_GRAPHQL_NAVIGATE_EACH_PAGE=False):
+            _, meta, rows = production.browser_graphql_fetch_once(1, {"query": "fixture"}, browser)
+        self.assertEqual(meta["error"], "TypeError: Failed to fetch")
+        self.assertEqual(meta["status_code"], "ERR")
+        self.assertEqual(rows, [])
+        disk_meta = json.loads(next(self.root.rglob("*_meta.json")).read_text(encoding="utf-8"))
+        self.assertEqual(disk_meta["browser_diagnostics"]["network_events"][0]["errorText"],
+                         "net::ERR_CONNECTION_RESET")
+        self.assertTrue(disk_meta["browser_diagnostics"]["online"])
+
+    def test_navigation_failure_preserves_exception_and_diagnostics(self):
+        from bestbuy import step01_main_list as production
+        original = TimeoutError("navigation timed out")
+        browser = types.SimpleNamespace(url="https://www.bestbuy.com/", get=Mock(side_effect=original),
+            run_js=Mock(return_value={"ready_state": "loading", "online": False}), listen=Mock(listening=False))
+        browser.listen.wait.return_value = False
+        with self.assertRaises(TimeoutError) as caught:
+            production.initialize_browser_graphql_session(browser)
+        self.assertIs(caught.exception, original)
+        self.assertFalse(original.bestbuy_browser_diagnostics["online"])
+        browser.listen.stop.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

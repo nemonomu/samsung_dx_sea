@@ -24,6 +24,7 @@ from .step00_config import (
     url_for_page,
 )
 from .step00_graphql_query import sanitize_product_list_query
+from .step00_browser_diagnostics import BrowserDiagnostics
 from .step00_offer_graphql import add_sponsored_offer_fields, collect_graphql_offers, normalize_graphql_offer, uses_graphql_offers
 from .step00_parse_pdp import absolute_bestbuy_url, extract_apollo_payloads, first_nested, nested_get
 from .step00_parse_search import merge_dict, parse_product as parse_search_product
@@ -1793,9 +1794,26 @@ def initialize_browser_graphql_session(browser_page):
     if not browser_page:
         return
     session_url = build_search_url(1)
-    browser_page.get(session_url)
-    if BROWSER_GRAPHQL_WAIT_SECONDS > 0:
-        time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+    diagnostics = BrowserDiagnostics(
+        browser_page, r"^https://www\.bestbuy\.com/(?:site/searchpage\.jsp|gateway/graphql)(?:[?#]|$)")
+    try:
+        result = browser_page.get(session_url)
+        if BROWSER_GRAPHQL_WAIT_SECONDS > 0:
+            time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+    except Exception as exc:
+        info = diagnostics.finish(True)
+        try:
+            exc.bestbuy_browser_diagnostics = info
+        except Exception:
+            pass
+        raise
+    else:
+        info = diagnostics.finish(result is False)
+        info["navigation_returned_false"] = result is False
+        try:
+            browser_page._bestbuy_navigation_diagnostics = info
+        except Exception:
+            pass
 
 
 def status_code_ok(value):
@@ -1828,10 +1846,14 @@ def browser_graphql_fetch_once(page, payload, browser_page):
     error = ""
     parse_error = ""
     raw = ""
+    diagnostics = None
+    browser_diagnostics = {}
+    exception_type = ""
     try:
         if BROWSER_GRAPHQL_NAVIGATE_EACH_PAGE:
             browser_page.get(page_url)
             time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+        diagnostics = BrowserDiagnostics(browser_page)
         payload_json = json.dumps(payload, ensure_ascii=False)
         js = (
             "return fetch('/gateway/graphql', {"
@@ -1856,6 +1878,17 @@ def browser_graphql_fetch_once(page, payload, browser_page):
             response_json_path.write_text(json.dumps(graph, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
         error = str(exc)
+        exception_type = type(exc).__name__
+    finally:
+        if diagnostics is not None:
+            browser_diagnostics = diagnostics.finish(bool(error) or not status_code_ok(status_code))
+        if error or not status_code_ok(status_code):
+            try:
+                navigation = getattr(browser_page, "_bestbuy_navigation_diagnostics", None)
+            except Exception:
+                navigation = None
+            if isinstance(navigation, dict):
+                browser_diagnostics["navigation"] = navigation
     if raw:
         response_path.write_text(str(raw), encoding="utf-8", errors="replace")
     rows = []
@@ -1910,6 +1943,8 @@ def browser_graphql_fetch_once(page, payload, browser_page):
         "offer_graphql_verified_rows": offer_counts.get("verified", 0),
         "offer_graphql_unverified_rows": offer_counts.get("unverified", 0),
         "browser_graphql_context_url": getattr(browser_page, "url", "") or "",
+        "exception_type": exception_type,
+        "browser_diagnostics": browser_diagnostics,
     }
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return graph, meta, rows

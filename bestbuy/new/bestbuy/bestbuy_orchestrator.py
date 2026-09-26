@@ -683,7 +683,12 @@ def run_step(step, dry_run=False, resume=False):
         from .step00_collection_recovery import assert_ready
         assert_ready(run_root(env))
     try:
-        subprocess.run(command, check=True, env=env)
+        if step.name in {"main_list", "bsr_list"}:
+            from .step01_stage_retry import run_listing_step
+            run_listing_step(command, env, run_root(env) / env.get("BESTBUY_MAIN_RUN_ID", "main"),
+                             execute=subprocess.run)
+        else:
+            subprocess.run(command, check=True, env=env)
     except subprocess.CalledProcessError as exc:
         print(f"[fail] step {step.key} {step.name}: exit_code={exc.returncode}")
         if is_interrupt_exit_code(exc.returncode):
