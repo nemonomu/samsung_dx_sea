@@ -98,3 +98,6 @@ market/xml/
 
 # Claude Code project instructions (local only)
 CLAUDE.md
+
+# Walmart TV failed DB-save snapshots (not log retention)
+/recovery/walmart_tv/

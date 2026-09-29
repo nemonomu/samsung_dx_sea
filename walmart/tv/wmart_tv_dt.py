@@ -1,4 +1,4 @@
-﻿"""
+"""
 Walmart TV Detail 페이지 크롤러
 
 ================================================================================
@@ -197,6 +197,7 @@ WALMART_TV_BRAND_SKU_PATTERNS = [
 
 
 class WalmartTVDetailCrawler(WalmartBaseCrawler):
+    SAVE_OPERATION = 'insert_detail'
     REVIEW_BODY_XPATH = (
         "//div[@data-testid='enhanced-review-content']"
         "//span[contains(concat(' ', normalize-space(@class), ' '), ' tl-m ') "
@@ -486,8 +487,22 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             else:
                 self.parallel_miss_reasons = {}
 
+            # All normal and deferred products have been processed before this pass.
+            from walmart.tv.wmart_tv_save_recovery import recover_pending_saves, report_file_cleanup
+            for recovered_row, kind in recover_pending_saves(self):
+                total_saved += 1
+                self._record_saved(detail=kind != 'insert_listing')
+                self.detail_report['run_errors'] = [
+                    error for error in self.detail_report['run_errors']
+                    if not (
+                        error.get('stage') in {'detail_save_rejected', 'listing_fallback_save_failed'}
+                        and error.get('url') == recovered_row.get('product_url')
+                    )
+                ]
+
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
             print(f"[DONE] Processed: {len(product_list)}, Saved: {total_saved}, Table: {table_name}, batch_id: {self.batch_id}")
+            report_file_cleanup(self)
 
             # ===== SPEC DIFF 일괄 출력 (마스터 vs 페이지 추출 값이 다른 item들) =====
             if self.spec_diffs:
@@ -512,7 +527,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             else:
                 print(f"\n[SPEC DIFF] 마스터 vs 페이지 추출 값 불일치 없음")
 
-            return True
+            unsaved = len(product_list) - total_saved
+            self.detail_report['unsaved_records'] = unsaved
+            if unsaved:
+                print(f"[INCOMPLETE] Unsaved: {unsaved}; remaining products were all processed")
+            return unsaved == 0
 
         except Exception as e:
             print(f"[ERROR] Crawler failed: {e}")
@@ -1345,15 +1364,24 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         return fallback
 
     def save_listing_fallback(self, product, reason=None):
+        from walmart.tv.wmart_tv_save_recovery import complete_save, prepare_save, queue_failed_save
         fallback = self.build_listing_fallback_row(product)
         fallback['_listing_fallback_reason'] = reason
-        return self.save_to_retail_com(fallback)
+        fallback.setdefault('_save_crawl_datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        if not prepare_save(self, fallback, 'insert_listing'):
+            return False
+        saved = self.save_to_retail_com(fallback)
+        if saved:
+            self._last_file_cleanup_ok = complete_save(self, fallback, 'insert_listing')
+        else:
+            queue_failed_save(self, fallback, 'insert_listing')
+        return saved
 
     def save_detail_result(self, combined_data):
         if not combined_data:
             return False
 
-        review_mismatch = combined_data.pop('_review_mismatch', None)
+        review_mismatch = combined_data.get('_review_mismatch')
         self._apply_fast_artifacts(combined_data)
         raw_star_rating = ' '.join(str(combined_data.get('star_rating') or '').split())
         raw_star_match = re.search(r'\d+(?:\.(\d+))?', raw_star_rating)
@@ -1426,14 +1454,22 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 )
                 return False
 
+        from walmart.tv.wmart_tv_save_recovery import complete_save, prepare_save, queue_failed_save
+        combined_data.setdefault('_save_crawl_datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        kind = self.SAVE_OPERATION
+        if not prepare_save(self, combined_data, kind):
+            return False
         if not self.upsert_item_mst(combined_data):
             print(f"  [SAVE SKIP] tv_item_mst write failed: item={item}")
+            queue_failed_save(self, combined_data, kind)
             return False
         saved = self.save_to_retail_com(combined_data)
-        if saved and review_mismatch:
-            self.detail_report.setdefault('review_mismatches', []).append(
-                review_mismatch
-            )
+        if saved:
+            self._last_file_cleanup_ok = complete_save(self, combined_data, kind)
+            if review_mismatch:
+                self.detail_report.setdefault('review_mismatches', []).append(review_mismatch)
+        else:
+            queue_failed_save(self, combined_data, kind)
         return saved
 
     def collect_reviews_next_data(
@@ -1964,6 +2000,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 break
 
     def save_to_retail_com(self, product):
+        if not product:
+            return False
+        from walmart.tv.wmart_tv_save_recovery import retry_db_write
+        return retry_db_write(self, product, self._save_to_retail_com_once)
+
+    def _save_to_retail_com_once(self, product):
         """DB 저장: 1개씩 INSERT.
 
         컬럼 구성: EXTRACTED_FIELDS (추출) + PASSTHROUGH_FIELDS (전달) + SAVE_META_FIELDS (저장 메타)
@@ -1972,18 +2014,24 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not product:
             return False
 
+        cursor = None
         try:
-            if not self.ensure_db_connection():
-                return False
-
             cursor = self.db_conn.cursor()
-
-            self.apply_master_model_year(cursor, product)
 
             # 테스트 모드면 test_tv_retail_com, 통합 크롤러면 tv_retail_com
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
 
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Same logical row on reconnect/replay, including a lost COMMIT response.
+            identity_field = 'product_url' if product.get('product_url') else 'item'
+            identity = product.get(identity_field)
+            if not identity:
+                raise ValueError('Missing save identity')
+            lock_key = f'{table_name}:{self.account_name}:{self.batch_id}:{identity}'
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+            self.apply_master_model_year(cursor, product)
+
+            now = product.setdefault('_save_crawl_datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             save_meta = {
                 field: (
                     now if source == 'CURRENT_TIMESTAMP'
@@ -2000,23 +2048,36 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             columns = list(insert_data.keys())
             values = list(insert_data.values())
+            # PostgreSQL compares using each real column's type (including NULL
+            # and timestamps). Identity alone must never mark different data saved.
+            comparison = ' AND '.join(f'{field} IS NOT DISTINCT FROM %s' for field in columns)
+            cursor.execute(
+                f"SELECT ({comparison}) AS matches FROM {table_name} "
+                f"WHERE account_name = %s AND batch_id = %s AND {identity_field} = %s LIMIT 2",
+                [*values, self.account_name, self.batch_id, identity],
+            )
+            existing = cursor.fetchall()
+            if existing:
+                if len(existing) != 1 or existing[0][0] is not True:
+                    from walmart.tv.wmart_tv_save_recovery import SaveConflictError
+                    raise SaveConflictError('Existing row differs or identity is duplicated')
+                self.db_conn.commit()
+                print(f"[DB SAVE VERIFIED] item={product.get('item') or '-'}; identical values, no duplicate inserted")
+                return True
+
             placeholders = ', '.join(['%s'] * len(columns))
             insert_query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
 
             cursor.execute(insert_query, values)
             self.db_conn.commit()
-            cursor.close()
             return True
 
-        except Exception as e:
-            print(f"[ERROR] DB save failed: {product.get('item')}: {e}")
-            traceback.print_exc()
-            try:
-                if self.db_conn and not self.db_conn.closed:
-                    self.db_conn.rollback()
-            except Exception:
-                pass
-            return False
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     def get_tv_specs_from_mst(self, item):
         """마스터 테이블에서 TV 스펙 및 SKU 조회"""
@@ -2040,6 +2101,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return None, None
 
     def upsert_item_mst(self, product):
+        if not product or not product.get('item'):
+            return False
+        from walmart.tv.wmart_tv_save_recovery import retry_db_write
+        return retry_db_write(self, product, self._upsert_item_mst_once)
+
+    def _upsert_item_mst_once(self, product):
         """tv_item_mst 테이블에 INSERT 또는 UPDATE
         - 조회 결과 없음 → INSERT (sku, screen_size)
         - 조회 결과 있음 → SKU/화면 크기는 빈값만 보완
@@ -2049,10 +2116,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not item:
             return False
 
+        cursor = None
         try:
-            if not self.ensure_db_connection():
-                return False
-
             cursor = self.db_conn.cursor()
             new_sku = product.get('sku') or 'no sku'
             product_url = product.get('product_url')
@@ -2110,17 +2175,14 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 else:
                     pass  # ITEM_MST 업데이트할 필드 없음
 
-            cursor.close()
             return True
 
-        except Exception as e:
-            print(f"[ERROR] upsert_item_mst failed: {item}: {e}")
-            try:
-                if self.db_conn and not self.db_conn.closed:
-                    self.db_conn.rollback()
-            except Exception:
-                pass
-            return False
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     def extract_sku_by_brand(self, retailer_sku_name, product_url):
         """브랜드별 정규식으로 SKU 추출 (1차 retailer_sku_name → 2차 product_url)

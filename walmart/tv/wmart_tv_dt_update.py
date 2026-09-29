@@ -68,6 +68,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
     """
 
     MODE_ITEM_NULL = '1'
+    SAVE_OPERATION = 'update_detail'
     MODE_REVIEW_NULL = '2'
     MODE_BOTH = '3'
     UPDATE_META_FIELDS = {}
@@ -169,6 +170,12 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
             return []
 
     def save_to_retail_com(self, product):
+        if not product or not product.get('id'):
+            return False
+        from walmart.tv.wmart_tv_save_recovery import retry_db_write
+        return retry_db_write(self, product, self._save_to_retail_com_once)
+
+    def _save_to_retail_com_once(self, product):
         """DB 저장: id 기준 UPDATE (부모의 INSERT 대신).
 
         부모 클래스의 run()이 self.save_to_retail_com()을 polymorphic하게 호출하므로
@@ -182,6 +189,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
             print(f"[ERROR] DB update failed: id가 없음")
             return False
 
+        cursor = None
         try:
             cursor = self.db_conn.cursor()
 
@@ -210,19 +218,24 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                 for key in update_data
             ]
             params = list(update_data.values())
-            params.append(row_id)
-            update_query = f"UPDATE {self.target_table} SET {', '.join(updates)} WHERE id = %s"
+            params.extend([row_id, self.account_name, self.batch_id])
+            update_query = (
+                f"UPDATE {self.target_table} SET {', '.join(updates)} "
+                "WHERE id = %s AND account_name = %s AND batch_id = %s"
+            )
 
             cursor.execute(update_query, params)
+            if cursor.rowcount != 1:
+                raise ValueError('Expected one existing row to update')
             self.db_conn.commit()
-            cursor.close()
             return True
 
-        except Exception as e:
-            print(f"[ERROR] DB update failed: id={row_id}, {e}")
-            traceback.print_exc()
-            self.db_conn.rollback()
-            return False
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     def run(self):
         """UPDATE 모드 실행 — 에러 fallback save 안 함 (UPDATE만 가능하므로 의미 없음)"""
@@ -267,8 +280,12 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                     self._record_run_error('detail_update', product, e)
                     continue
 
+            from walmart.tv.wmart_tv_save_recovery import recover_pending_saves, report_file_cleanup
+            total_updated += len(recover_pending_saves(self))
+
             print(f"[DONE] Processed: {len(product_list)}, Updated: {total_updated}, Table: {self.target_table}, batch_id: {self.batch_id}")
-            return True
+            report_file_cleanup(self)
+            return total_updated == len(product_list)
 
         except Exception as e:
             print(f"[ERROR] Crawler failed: {e}")

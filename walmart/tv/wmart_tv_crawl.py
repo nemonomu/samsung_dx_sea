@@ -102,6 +102,10 @@ RUN_ERROR_STAGE_LABELS = {
     'detail_save_rejected': '검증된 상세 데이터 저장 실패',
     'detail_update': '상세 데이터 업데이트 실패',
     'listing_fallback_save_failed': '목록 데이터 대체 저장 실패',
+    'db_save_conflict': '기존 DB 값과 복구 대상 값 불일치',
+    'save_snapshot_conflict': '최초 보관값과 재시도 값 불일치',
+    'save_recovery_file': '실패 데이터 파일 보관 오류',
+    'recovery_file_cleanup': 'DB 적재 성공·복구 파일 정리 필요',
 }
 
 DETAIL_RECOVERY_REASON_LABELS = {
@@ -149,6 +153,7 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     redirects = detail_report.get('redirects') or []
     run_errors = detail_report.get('run_errors') or []
     review_mismatches = detail_report.get('review_mismatches') or []
+    file_pending = detail_report.get('recovery_file_pending', 0)
 
     main_result = crawl_results.get('main') if crawl_results else None
     bsr_result = crawl_results.get('bsr') if crawl_results else None
@@ -171,7 +176,7 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     missing_detail_records = max(target_records - detail_records, 0)
     detail_blocked = missing_detail_records > 0
     has_warning = bool(
-        redirects or run_errors or review_mismatches or detail_blocked
+        redirects or run_errors or review_mismatches or detail_blocked or file_pending
     )
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
@@ -195,6 +200,8 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
         lines.append(f'- 치명적 실행 오류 / fatal error: {error_message}')
     if failed_stages:
         lines.append(f"- 실패 단계 / failed stages: {', '.join(failed_stages)}")
+    if file_pending:
+        lines.append(f'- DB 적재 성공·복구 파일 정리 필요: {file_pending}건 (상품 미적재 건수와 별도)')
     if detail_blocked:
         lines.append(
             f"- 상세페이지 수집 누락 / detail missing: "
