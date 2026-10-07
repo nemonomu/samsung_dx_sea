@@ -328,6 +328,10 @@ def create_product_list_indexes(cur, table_name, crawl_column):
 
 
 def main():
+    from pathlib import Path
+    from .step00_config import DEFAULT_BESTBUY_RUN_ROOT
+    from .step00_collection_recovery import assert_ready
+    assert_ready(Path(os.getenv("BESTBUY_RUN_ROOT", DEFAULT_BESTBUY_RUN_ROOT)))
     import psycopg2
 
     config = db_config()

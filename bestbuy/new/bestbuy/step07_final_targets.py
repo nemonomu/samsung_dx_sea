@@ -673,6 +673,9 @@ def product_list_fields():
 
 
 def main():
+    from .step00_collection_recovery import assert_ready
+    assert_ready(RUN_ROOT, listing=MAIN_RUN_ID)
+    assert_ready(RUN_ROOT, listing=BSR_RUN_ID)
     started_at = now()
     main_input_rows = load_rows(MAIN_INPUT)
     bsr_rows = load_rows(BSR_INPUT)
