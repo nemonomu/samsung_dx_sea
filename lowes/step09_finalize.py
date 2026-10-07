@@ -157,6 +157,9 @@ def finalize_row(row, batch_id, crawl_dt):
 
     for col in CATEGORY_COLUMNS:
         o[col] = row.get(col, "")
+    if PRODUCT_TYPE in ("REF", "LDY"):
+        # Old detail CSVs must not reintroduce this discontinued field.
+        o["available_quantity_for_purchase_fastdelivery"] = ""
     return o
 
 

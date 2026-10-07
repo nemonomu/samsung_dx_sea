@@ -181,6 +181,8 @@ def detail_summary(run_root):
         "targets": as_int(manifest.get("targets")),
         "success": as_int(manifest.get("success")),
         "failure": as_int(manifest.get("failure")),
+        "warning_sku_count": as_int(manifest.get("warning_sku_count")),
+        "warnings": manifest.get("warnings") or [],
         "elapsed_seconds": as_float(manifest.get("overall_elapsed_seconds")),
     }
 
@@ -405,6 +407,19 @@ def detail_failure_issue(detail):
     return []
 
 
+def detail_warning_issues(detail):
+    issues = []
+    for warning in detail.get("warnings", []):
+        columns = ", ".join(warning.get("null_columns") or []) or "없음 (정상 수집값 유지)"
+        issues.append(
+            f"상세 항목 경고: SKU {warning.get('omni_item_id')} / {warning.get('endpoint')} "
+            f"/ 총 {warning.get('attempts')}회 요청 후 재시도 실패 "
+            f"({warning.get('reason')}, status={warning.get('status')}) "
+            f"/ NULL 컬럼: {columns} / 상품 유지·DB 적재 대상 포함"
+        )
+    return issues
+
+
 def db_count_issue(db, row_count):
     inserted = db.get("inserted", 0)
     csv_rows = db.get("csv_rows", row_count)
@@ -456,6 +471,8 @@ def build_body(collected_count, cost_krw, listing_breakdown, detail, db, issues,
         lines.append(f"  bsr_rank - {as_int(rank_counts.get('bsr_rank')):,}/100")
         lines.append("")
     lines.append(f"detail UC: success {detail.get('success')}/{detail.get('targets')}  ({detail.get('elapsed_seconds'):.0f}s)")
+    if detail.get("warning_sku_count"):
+        lines.append(f"detail UC: 일부 항목 NULL로 상품 유지 {detail['warning_sku_count']} SKU")
     lines.append(f"DB: {db.get('table')} inserted={db.get('inserted')}")
     lines.append("")
     if issues:
@@ -482,6 +499,7 @@ def build_notification(product_type, run_root, status="success", failed_step="",
     issues.extend(all_null_column_issues(rows))
     issues.extend(listing_count_issues(run_root, rows))
     issues.extend(detail_failure_issue(detail))
+    issues.extend(detail_warning_issues(detail))
     issues.extend(db_count_issue(db, len(rows)))
     issues.extend(collected_count_issues(product_type, collected_count))
 
