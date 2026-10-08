@@ -19,6 +19,7 @@ from bestbuy import step08_detail_enrichment as ldy
 from bestbuy import step01_main_list as listing
 from bestbuy import step00_dryer as rules
 from bestbuy import step17_dryer as runner
+from bestbuy import step00_dryer_log as diagnostics
 
 
 def product(sku_id="6471411", model="ELFE7637AT", capacity="8 cubic feet"):
@@ -498,6 +499,217 @@ class ApiFlowTests(unittest.TestCase):
             runtime.assert_not_called()
             import json
             self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), old)
+
+
+class LoggingTests(unittest.TestCase):
+    def test_legacy_first_import_stdout_rewrap_preserves_console_and_privacy(self):
+        import sys
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as console:
+            root=Path(directory)
+            with diagnostics.run_logging(root):
+                with diagnostics.safe_legacy_output():
+                    sys.stdout=io.TextIOWrapper(sys.stdout.buffer,encoding="utf-8")
+                    print("synthetic_private_value",flush=True)
+                    diagnostics.event("safe_marker",attempt=1)
+                diagnostics.event("console_after_import",status="ok")
+            text=(root/"logs/dryer.log").read_text(encoding="utf-8")
+            self.assertIn("console_after_import",console.getvalue())
+            self.assertNotIn("synthetic_private_value",console.getvalue()+text)
+
+    def test_final_failure_stage_tracks_last_retry_and_preserves_leaf(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with diagnostics.run_logging(Path(directory)) as logger:
+                try:
+                    with diagnostics.phase("chrome_start"):
+                        raise RuntimeError("initial synthetic failure")
+                except RuntimeError:
+                    pass
+                try:
+                    with diagnostics.phase("browser_api"):
+                        try:
+                            with diagnostics.phase("page_verification"):
+                                raise TimeoutError("later synthetic failure")
+                        except TimeoutError as cause:
+                            raise runner.DryerError("browser_api_unavailable") from cause
+                except runner.DryerError:
+                    pass
+                self.assertEqual(logger.failure_stage,"page_verification")
+
+    def test_console_text_and_json_report_failure_without_raw_message(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as console:
+            root = Path(directory)
+            with diagnostics.run_logging(root) as logger:
+                try:
+                    with diagnostics.phase("site_navigation"):
+                        raise RuntimeError("access denied; synthetic_private_value")
+                except RuntimeError:
+                    pass
+                self.assertEqual(logger.failure_stage, "site_navigation")
+            text = (root / "logs/dryer.log").read_text(encoding="utf-8")
+            events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            failure = next(e for e in events if e["event"] == "stage_failed")
+            self.assertEqual(failure["error_category"], "site_access_denied")
+            self.assertTrue(failure["trace"])
+            self.assertNotIn("synthetic_private_value", text + console.getvalue() + str(events))
+            self.assertIn("site_navigation", console.getvalue())
+
+    def test_waiting_heartbeat_appears_during_blocked_phase(self):
+        import threading
+        emitted = threading.Event()
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            logger = diagnostics.RunLogger(Path(directory), heartbeat_seconds=0.01)
+            original = logger.emit
+            def observe(name, **fields):
+                original(name, **fields)
+                if name == "waiting":
+                    emitted.set()
+            try:
+                with patch.object(diagnostics, "_LOGGER", logger), patch.object(logger, "emit", side_effect=observe):
+                    with diagnostics.phase("graphql_fetch"):
+                        self.assertTrue(emitted.wait(timeout=1))
+            finally:
+                logger.close()
+            import json
+            events = [json.loads(line) for line in logger.json_path.read_text(encoding="utf-8").splitlines()]
+            wait = next(e for e in events if e["event"] == "waiting")
+            self.assertEqual(wait["stage"], "graphql_fetch")
+            self.assertGreaterEqual(wait["wait_s"], 0)
+
+    def test_browser_instrumentation_restores_helper_after_exception(self):
+        def broken():
+            raise TimeoutError("synthetic_private_value")
+        helper = SimpleNamespace(fetch_detail_browser_graphql_envelope=broken)
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with diagnostics.run_logging(Path(directory)) as logger:
+                with self.assertRaises(TimeoutError), diagnostics.trace_browser_calls(helper):
+                    helper.fetch_detail_browser_graphql_envelope()
+                self.assertIs(helper.fetch_detail_browser_graphql_envelope, broken)
+                self.assertEqual(logger.failure_stage, "graphql_fetch")
+
+    def test_legacy_output_is_discarded_including_injected_progress_lines(self):
+        import sys
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as console:
+            root = Path(directory)
+            with diagnostics.run_logging(root), diagnostics.safe_legacy_output():
+                print("[detail:browser_bootstrap] attempt=123 error=synthetic_private_value")
+                print("synthetic_private_value", file=sys.stderr)
+                diagnostics.event("safe_marker", attempt=1)
+            output = console.getvalue() + (root / "logs/dryer.log").read_text(encoding="utf-8")
+            self.assertNotIn("synthetic_private_value", output)
+            self.assertNotIn("attempt=123", output)
+            self.assertIn("safe_marker", output)
+
+    def test_graphql_error_summary_has_only_known_categories_and_fields(self):
+        result = diagnostics.graphql_diagnostic([{"message":'Cannot query field "features" on type "Product". synthetic_private_value',
+                                                  "extensions":{"unexpected":"synthetic_private_value"}}])
+        self.assertEqual(result["graphql_error_categories"], ["unsupported_field"])
+        self.assertEqual(result["graphql_fields"], ["features"])
+        self.assertNotIn("synthetic_private_value", str(result))
+
+    def test_arbitrary_value_error_message_is_not_an_error_reason(self):
+        self.assertEqual(runner.safe_reason(ValueError("synthetic_private_value")), "ValueError")
+
+    def test_runtime_headless_matches_existing_ldy_visible_browser(self):
+        attributes = {"CATEGORY": listing.CATEGORY, "SEARCH_TERM": listing.SEARCH_TERM,
+                      "SEARCH_URL_TEMPLATE": listing.SEARCH_URL_TEMPLATE,
+                      "INCLUDE_SPONSORED_CAROUSEL": listing.INCLUDE_SPONSORED_CAROUSEL,
+                      "BROWSER_GRAPHQL_HEADLESS": listing.BROWSER_GRAPHQL_HEADLESS}
+        with patch.dict(os.environ, {}), patch.multiple(listing, **attributes), patch.object(ldy, "BROWSER_GRAPHQL_HEADLESS", True):
+            runtime = runner.load_runtime(Path("unused_offline_path"))
+            self.assertFalse(runtime[1].BROWSER_GRAPHQL_HEADLESS)
+            self.assertFalse(runtime[2].BROWSER_GRAPHQL_HEADLESS)
+            self.assertEqual(os.environ["BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS"], "0")
+
+    def test_inherited_existing_run_paths_and_explicit_ports_are_not_used(self):
+        attributes = {"CATEGORY": listing.CATEGORY, "SEARCH_TERM": listing.SEARCH_TERM,
+                      "SEARCH_URL_TEMPLATE": listing.SEARCH_URL_TEMPLATE,
+                      "INCLUDE_SPONSORED_CAROUSEL": listing.INCLUDE_SPONSORED_CAROUSEL,
+                      "BROWSER_GRAPHQL_HEADLESS": listing.BROWSER_GRAPHQL_HEADLESS}
+        root=Path("dedicated_dryer_run")
+        inherited={"BESTBUY_OUTPUT_ROOT":"existing_category_output","BESTBUY_DETAIL_RUN_ROOT":"existing_category_detail",
+                   "BESTBUY_FINAL_OUTPUT_CSV":"existing_category.csv","BESTBUY_DETAIL_TARGET_CSV":"existing_targets.csv",
+                   "BESTBUY_BROWSER_GRAPHQL_LOCAL_PORT":"1234","BESTBUY_DETAIL_BROWSER_GRAPHQL_LOCAL_PORT":"1234"}
+        with patch.dict(os.environ,inherited),patch.multiple(listing,**attributes),patch.object(ldy,"BROWSER_GRAPHQL_HEADLESS",True):
+            runner.load_runtime(root)
+            self.assertEqual(os.environ["BESTBUY_OUTPUT_ROOT"],str(root/"output"))
+            self.assertEqual(os.environ["BESTBUY_DETAIL_RUN_ROOT"],str(root/"detail"))
+            self.assertEqual(os.environ["BESTBUY_FINAL_OUTPUT_CSV"],str(root/"output/final_output.csv"))
+            self.assertEqual(os.environ["BESTBUY_DETAIL_TARGET_CSV"],str(root/"output/bestbuy_final_targets.csv"))
+            self.assertEqual(os.environ["BESTBUY_DETAIL_BROWSER_GRAPHQL_LOCAL_PORT"],"0")
+
+    def test_first_api_failure_records_real_stage_and_exception_chain(self):
+        import json
+        config = SimpleNamespace(bestbuy_zip_code=lambda:"10010", bestbuy_store_id=lambda:"482")
+        def fail_navigation(*args, **kwargs):
+            raise RuntimeError("navigation returned false: access denied synthetic_private_value")
+        def post(*args, **kwargs):
+            ldy.navigate_detail_browser("unused_public_url", "home")
+        def listing_failure(runtime, *args):
+            runner.api_post(runtime[2], {"operationName":"PublicProbe"})
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=(config, listing, ldy)), patch.object(runner, "collect_listing", side_effect=listing_failure), patch.object(ldy, "browser_graphql_post", side_effect=post), patch.object(ldy, "navigate_detail_browser", side_effect=fail_navigation), redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":2,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            original = ldy.navigate_detail_browser
+            self.assertEqual(runner.main(["--resume", str(root), "--no-load"]), 1)
+            self.assertIs(ldy.navigate_detail_browser, original)
+            result = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["failure_stage"], "site_navigation")
+            self.assertEqual(result["error"], "browser_api_unavailable")
+            self.assertEqual(result["error_diagnostics"]["error_category"], "site_access_denied")
+            self.assertFalse(result["db_loaded"])
+            self.assertNotIn("synthetic_private_value", (root / "logs/dryer.log").read_text(encoding="utf-8") + str(result))
+
+    def test_db_preflight_failure_is_separate_from_api_failure(self):
+        import json
+        config = SimpleNamespace(bestbuy_zip_code=lambda:"10010", bestbuy_store_id=lambda:"482")
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=(config, listing, ldy)), patch.object(runner, "connect_db", side_effect=RuntimeError("synthetic_private_value")), patch.object(runner, "collect_listing") as collect, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":2,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            self.assertEqual(runner.main(["--resume",str(root)]),1)
+            collect.assert_not_called()
+            result=json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["failure_stage"],"db_preflight")
+            self.assertNotIn("synthetic_private_value",str(result))
+
+    def test_required_column_failure_records_missing_field_names(self):
+        import json
+        config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
+        p=api_product(1)
+        p["price"]={}
+        captured={"collector_version":2,"product":p,"captured_at":"2026-10-08T10:00:00"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=[[list_row(1,1)],[]]), patch.object(runner,"collect_product_batch",return_value=({"1":captured},{})), patch.object(ldy,"MAX_ATTEMPTS",1), redirect_stdout(io.StringIO()):
+            root=Path(directory)
+            runner.write_json(root/"dryer_manifest.json",{"collector_version":2,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            self.assertEqual(runner.main(["--resume",str(root),"--no-load"]),1)
+            failures=json.loads((root/"output/failures.json").read_text(encoding="utf-8"))
+            self.assertEqual(failures[0]["missing_fields"],["final_sku_price"])
+            text=(root/"logs/dryer.log").read_text(encoding="utf-8")
+            self.assertIn("db_load_skipped",text)
+            self.assertIn("final_sku_price",text)
+
+    def test_progress_percentage_and_unknown_total(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root=Path(directory)
+            with diagnostics.run_logging(root):
+                runner.progress("detail",3,10)
+                runner.progress("main_list",8,0)
+            events=[json.loads(line) for line in (root/"logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            entries=[e for e in events if e["event"]=="progress"]
+            self.assertEqual(entries[0]["progress_pct"],30)
+            self.assertIsNone(entries[1]["progress_pct"])
+
+    def test_interruption_is_recorded_and_returns_130(self):
+        import json
+        config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
+            root=Path(directory)
+            runner.write_json(root/"dryer_manifest.json",{"collector_version":2,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            self.assertEqual(runner.main(["--resume",str(root),"--no-load"]),130)
+            result=json.loads((root/"dryer_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"],"interrupted")
+            self.assertEqual(result["failure_stage"],"main_listing")
 
 
 if __name__ == "__main__":

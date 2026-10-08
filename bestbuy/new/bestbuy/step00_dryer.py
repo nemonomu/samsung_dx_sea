@@ -207,8 +207,13 @@ def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
     # All price fields come from this product's primary offer, with no other-seller fallback.
     final, original, saving = helpers.price_output_fields(own_price, {}, {})
     loading, evidence = loading_type(product, feature_texts)
-    if not all((product.get("bsin"), model, name, url, final)):
-        raise ValueError("missing_required_product_fields")
+    required = {"item": product.get("bsin"), "sku": model, "retailer_sku_name": name,
+                "product_url": url, "final_sku_price": final}
+    missing = [field for field, value in required.items() if not value]
+    if missing:
+        error = ValueError("missing_required_product_fields")
+        error.missing_fields = missing
+        raise error
     if not is_laundry_dryer(product, capacity):
         raise ValueError("laundry_dryer_type_not_verified")
     row = dict.fromkeys(FIELDS, "")
