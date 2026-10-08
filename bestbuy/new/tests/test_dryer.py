@@ -429,10 +429,65 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(set(captured), {"1", "2"})
         payloads = legacy.call_args.args[0]
         self.assertEqual(len(payloads), 2)
+        import re
+        price_input = re.compile(r"\$productPriceInput\s*:\s*([A-Za-z_][A-Za-z0-9_]*!)")
+        self.assertEqual(price_input.search(payloads[0]["query"]).group(1),
+                         price_input.search(ldy.fulfillment_dynamic_payload("1")["query"]).group(1))
+        self.assertEqual(payloads[0]["variables"]["productPriceInput"], ldy.fulfillment_product_price_input())
         self.assertIn("features{description title}", payloads[0]["query"])
         for field in ("fulfillmentOptions", "reviews(", "buyingOptions", "GetCompareProduct"):
             self.assertNotIn(field, payloads[0]["query"])
         self.assertEqual(payloads[0]["variables"]["skuId"], "1")
+
+    def test_http400_stops_before_load_and_reports_detail_request_stage(self):
+        import json
+        main = [list_row(i, i) for i in range(1, 21)]
+        bsr = [list_row(i, n) for n, i in enumerate([*range(1, 10), 21], 1)]
+        body = {"errors": [{"message": 'Unknown type "ProductPriceInput". Did you mean "ProductItemPriceInput"? synthetic_private_value',
+                            "extensions": {"code": "GRAPHQL_VALIDATION_FAILED", "private": "synthetic_private_value"}}]}
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {"private": "synthetic_private_value"}, 0)) as post, patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()) as console:
+            root = Path(directory)
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":2, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
+            self.assertEqual(runner.main(["--resume", str(root)]), 1)
+            result = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+            failures = json.loads((root / "output/failures.json").read_text(encoding="utf-8"))
+            events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            rejected = next(e for e in events if e["event"] == "api_response_rejected")
+            self.assertEqual((result["target_count"], result["collected_count"], result["failure_count"], result["unattempted_count"]), (21, 0, 5, 16))
+            self.assertEqual(result["failure_stage"], "detail_request")
+            self.assertEqual({e["error_category"] for e in failures}, {"http_400"})
+            self.assertEqual(rejected["graphql_error_categories"], ["unknown_type"])
+            self.assertEqual(rejected["graphql_types"], ["ProductItemPriceInput", "ProductPriceInput"])
+            self.assertEqual(rejected["response_shape"], "object")
+            post.assert_called_once()
+            load.assert_not_called()
+            self.assertFalse(result["db_loaded"])
+            self.assertNotIn("synthetic_private_value", console.getvalue() + str(events) + str(result) + str(failures))
+
+    def test_http400_batch_errors_are_summarized_without_raw_response(self):
+        body = [{"errors": [{"message": 'Cannot query field "features" on type "Product". synthetic_private_value'}]},
+                {"errors": [{"message": 'Variable "$productPriceInput" of type "ProductPriceInput!" used in position expecting type "ProductItemPriceInput". synthetic_private_value'}]}]
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as console:
+            root = Path(directory)
+            with diagnostics.run_logging(root), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {}, 0)):
+                with self.assertRaisesRegex(runner.DryerError, "http_400"):
+                    runner.collect_product_batch(self.runtime, [list_row(1, 1), list_row(2, 2)])
+            import json
+            events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            rejected = next(e for e in events if e["event"] == "api_response_rejected")
+            self.assertEqual(rejected["graphql_error_count"], 2)
+            self.assertEqual(rejected["graphql_error_categories"], ["type_mismatch", "unsupported_field"])
+            self.assertEqual(rejected["graphql_fields"], ["features"])
+            self.assertEqual(rejected["response_shape"], "array")
+            self.assertNotIn("synthetic_private_value", console.getvalue() + str(events))
+
+    def test_non_json_http_error_does_not_print_body(self):
+        for body in ("synthetic_private_value", None, {"private": "synthetic_private_value"}, ["synthetic_private_value"]):
+            with self.subTest(shape=type(body).__name__), redirect_stdout(io.StringIO()) as console, patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {}, 0)):
+                status, _ = runner.api_post(ldy, {"operationName": "DryerDetail"})
+                self.assertEqual(status, 400)
+                self.assertIn("api_response_rejected", console.getvalue())
+                self.assertNotIn("synthetic_private_value", console.getvalue())
 
     def test_failed_listing_pass_does_not_splice_earlier_pages(self):
         graphs = [(200, api_graph([1, 2])), (200, {"data": {}}),
@@ -609,6 +664,17 @@ class LoggingTests(unittest.TestCase):
 
     def test_arbitrary_value_error_message_is_not_an_error_reason(self):
         self.assertEqual(runner.safe_reason(ValueError("synthetic_private_value")), "ValueError")
+
+    def test_graphql_variable_syntax_and_validation_codes_remain_safe(self):
+        errors = [{"message": 'Variable "$productPriceInput" got invalid value synthetic_private_value; Field "salesChannel" is invalid.'},
+                  {"message": "Syntax Error: synthetic_private_value"},
+                  {"message": "synthetic_private_value", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+                  {"message": "synthetic_private_value", "extensions": {"code": "BAD_USER_INPUT"}},
+                  {"message": 'Unknown argument "locationId". synthetic_private_value'}]
+        result = diagnostics.graphql_response_diagnostic({"errors": errors})
+        self.assertEqual(result["graphql_error_categories"], ["bad_user_input", "graphql_validation_failed", "invalid_variables", "syntax_error", "unsupported_argument"])
+        self.assertEqual(result["graphql_fields"], ["locationId", "salesChannel"])
+        self.assertNotIn("synthetic_private_value", str(result))
 
     def test_runtime_headless_matches_existing_ldy_visible_browser(self):
         attributes = {"CATEGORY": listing.CATEGORY, "SEARCH_TERM": listing.SEARCH_TERM,

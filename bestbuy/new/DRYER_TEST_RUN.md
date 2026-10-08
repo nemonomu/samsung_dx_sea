@@ -40,6 +40,7 @@ main_rank는 기본 정렬의 중복 제거 순서, bsr_rank는 Best-Selling 일
 각 순위는 제품 필터 전 위치를 유지하므로 숫자가 건너뛰거나 20/10보다 커질 수 있음.
 
 상세는 기본 5개씩 묶어 필요한 식별값·가격·리뷰 집계·스펙·설명·features{description title}만 요청.
+가격 입력 자료형은 기존 BBY와 동일한 ProductItemPriceInput을 사용.
 배송 상세, 리뷰 본문 20개, 비교 상품·다른 판매자, 상품 마스터, S3·메일은 요청하거나 실행하지 않음.
 성공 제품은 즉시 저장하고, 재시도에는 실패 제품만 포함. 식별값이 맞지 않는 응답은 적재하지 않음.
 
@@ -80,6 +81,10 @@ API 오류·누락과 정상 응답에 정보가 없는 경우는 구분. 대상
 브라우저 실패는 Chrome 시작·사이트 접속·페이지 확인·GraphQL 요청 단계를 구분.
 오류의 예외 종류, 고정 원인 분류, 코드 파일명·함수·줄 번호를 기록하고 원본 오류 문장·헤더·쿠키는 저장하지 않음.
 API 누락 필드, 식별값 불일치와 상품 필수 컬럼 누락을 구분. 미수집이 남으면 적재 생략 사유를 출력.
+HTTP 400 등 실패 응답은 api_response_rejected에서 응답 형태·GraphQL 오류 개수·고정 오류 분류를 확인.
+알 수 없는 자료형(unknown_type), 자료형 불일치(type_mismatch), 지원하지 않는 필드(unsupported_field), 잘못된 변수(invalid_variables) 등을 구분.
+graphql_fields/graphql_types는 허용된 이름만 기록하며 오류 원문·응답 본문·확장 정보는 출력하거나 저장하지 않음.
+첫 상세 묶음 요청에서 실패하면 stage_failed와 run_complete의 failure_stage=detail_request로 확인.
 loading_type/capacity의 정상 정보 부재는 attribute_missing으로 기록하며 통신 실패와 구분.
 
 첫 목록에서 browser_api_unavailable가 발생했다면 logs/dryer.log의 stage_failed, api_failed, run_complete 확인.

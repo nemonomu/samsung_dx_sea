@@ -50,6 +50,10 @@ def error_diagnostic(exc):
             category = matched
             break
         name = type(cause).__name__
+        http_error = re.fullmatch(r"http_[1-5][0-9]{2}", text)
+        if name == "DryerError" and http_error:
+            category = text
+            break
         if name in {"TimeoutError", "TimeoutException", "WaitTimeoutError"}:
             category = "timeout"
         elif name == "BrowserConnectError":
@@ -75,23 +79,50 @@ def error_diagnostic(exc):
 
 def graphql_diagnostic(errors):
     errors = errors if isinstance(errors, list) else []
-    categories, fields = set(), set()
+    categories, fields, types = set(), set(), set()
     allowed = {"skuId", "bsin", "name", "short", "description", "features", "title", "manufacturer", "modelNumber",
                "url", "pdp", "reviewInfo", "averageRating", "reviewCount", "specificationGroups", "specifications",
-               "displayName", "value", "price", "customerPrice", "regularPrice", "totalSavings"}
+               "displayName", "value", "price", "customerPrice", "regularPrice", "totalSavings",
+               "salesChannel", "locationId", "customerId", "customerAttributes", "planPaidMemberType", "ct", "isStoreAgent"}
+    allowed_types = {"ProductPriceInput", "ProductItemPriceInput", "String", "Boolean", "Int", "Float"}
     for error in errors:
         if not isinstance(error, dict):
             continue
         message = str(error.get("message") or "")
-        if "Cannot query field" in message:
+        if "Unknown type" in message:
+            categories.add("unknown_type")
+        elif "Cannot query field" in message:
             categories.add("unsupported_field")
+        elif "Unknown argument" in message:
+            categories.add("unsupported_argument")
+        elif "used in position expecting type" in message or "Expected value of type" in message:
+            categories.add("type_mismatch")
         elif "Variable" in message and ("invalid value" in message or "was not provided" in message):
             categories.add("invalid_variables")
+        elif "Syntax Error" in message:
+            categories.add("syntax_error")
         else:
-            categories.add("unclassified_graphql_error")
-        fields.update(field for field in allowed if f'"{field}"' in message)
+            extensions = error.get("extensions")
+            code = extensions.get("code") if isinstance(extensions, dict) else None
+            category = {"GRAPHQL_VALIDATION_FAILED": "graphql_validation_failed", "BAD_USER_INPUT": "bad_user_input"}.get(
+                code if isinstance(code, str) else "", "unclassified_graphql_error")
+            categories.add(category)
+        quoted = set(re.findall(r"[\"']([A-Za-z_][A-Za-z0-9_]*)!?[\"']", message))
+        fields.update(allowed.intersection(quoted))
+        types.update(allowed_types.intersection(quoted))
     return {"graphql_error_count": len(errors), "graphql_error_categories": sorted(categories),
-            "graphql_fields": sorted(fields)}
+            "graphql_fields": sorted(fields), "graphql_types": sorted(types)}
+
+
+def graphql_response_diagnostic(body):
+    """Summarize object/batch errors without exposing any response or message text."""
+    responses = body if isinstance(body, list) else [body]
+    errors = []
+    for response in responses:
+        if isinstance(response, dict) and isinstance(response.get("errors"), list):
+            errors.extend(response["errors"])
+    shape = "array" if isinstance(body, list) else "object" if isinstance(body, dict) else "other"
+    return {"response_shape": shape, **graphql_diagnostic(errors)}
 
 
 class RunLogger:

@@ -11,10 +11,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from .step00_dryer import FIELDS, TEST_TABLE, make_row, merge_targets, public_product
-from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
+from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
 COLLECTOR_VERSION = 2
-QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductPriceInput!){productBySkuId(skuId:$skuId){
+QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductItemPriceInput!){productBySkuId(skuId:$skuId){
 skuId bsin name{short}description{short}features{description title}manufacturer{modelNumber}url{pdp}
 reviewInfo{averageRating reviewCount}specificationGroups{specifications{displayName value}}
 price(input:$productPriceInput){customerPrice regularPrice totalSavings}}}"""
@@ -78,8 +78,12 @@ def api_post(helpers, payload):
     except Exception as exc:
         event("api_failed", operations=count, duration_s=round(time.perf_counter() - started, 2), **error_diagnostic(exc))
         raise DryerError("browser_api_unavailable") from exc
-    event("api_response", http_status=int(status or 0), operations=count, duration_s=round(time.perf_counter() - started, 2))
-    return int(status or 0), body
+    http_status = int(status or 0)
+    event("api_response", http_status=http_status, operations=count, duration_s=round(time.perf_counter() - started, 2))
+    if http_status != 200:
+        event("api_response_rejected", http_status=http_status, operations=count,
+              **graphql_response_diagnostic(body))
+    return http_status, body
 
 
 def progress(stage, completed, total=0, **fields):
@@ -242,7 +246,8 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                   max_attempts=max(1, helpers.MAX_ATTEMPTS), sku_ids=[str(t["sku_id"]) for t in remaining],
                   collected_count=len(successes), target_count=len(targets))
             try:
-                captures, errors = collect_product_batch(runtime, remaining)
+                with phase("detail_request", batch=start // batch_size + 1, attempt=attempt, operations=len(remaining)):
+                    captures, errors = collect_product_batch(runtime, remaining)
             except Exception as exc:
                 captures = {}
                 batch_error = safe_reason(exc)
@@ -482,6 +487,7 @@ def run(args, run_dir, logger):
         event("collection_summary", target_count=len(targets), collected_count=len(output), failure_count=len(failures),
               unattempted_count=manifest["unattempted_count"], null_counts=manifest["null_counts"])
         if failures or len(output) != len(targets):
+            logger.failure_stage = logger.failure_stage or "detail_collection"
             event("db_load_skipped", reason="incomplete_details", failure_count=len(failures),
                   unattempted_count=manifest["unattempted_count"])
             raise DryerError("incomplete_details_db_load_skipped")
