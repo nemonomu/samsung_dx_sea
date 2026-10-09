@@ -80,7 +80,7 @@ def error_diagnostic(exc):
 def graphql_diagnostic(errors):
     errors = errors if isinstance(errors, list) else []
     categories, fields, types = set(), set(), set()
-    allowed = {"skuId", "bsin", "name", "short", "description", "features", "title", "manufacturer", "modelNumber",
+    allowed = {"skuId", "bsin", "name", "short", "long", "description", "features", "title", "manufacturer", "modelNumber",
                "url", "pdp", "reviewInfo", "averageRating", "reviewCount", "specificationGroups", "specifications",
                "displayName", "value", "price", "customerPrice", "regularPrice", "totalSavings",
                "salesChannel", "locationId", "customerId", "customerAttributes", "planPaidMemberType", "ct", "isStoreAgent"}

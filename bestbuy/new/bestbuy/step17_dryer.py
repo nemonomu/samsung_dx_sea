@@ -13,9 +13,9 @@ from pathlib import Path
 from .step00_dryer import FIELDS, TEST_TABLE, make_row, merge_targets, public_product
 from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
-COLLECTOR_VERSION = 2
+COLLECTOR_VERSION = 3
 QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductItemPriceInput!){productBySkuId(skuId:$skuId){
-skuId bsin name{short}description{short}features{description title}manufacturer{modelNumber}url{pdp}
+skuId bsin name{short}description{short long}features{description title}manufacturer{modelNumber}url{pdp}
 reviewInfo{averageRating reviewCount}specificationGroups{specifications{displayName value}}
 price(input:$productPriceInput){customerPrice regularPrice totalSavings}}}"""
 
@@ -115,7 +115,7 @@ def collect_listing(runtime, run_dir, kind, max_pages, limit):
                 event("listing_page_start", listing=kind, page=page, attempt=pass_number)
                 payload = listing.prepare_product_list_payload(operation, page)
                 status, body = api_post(helpers, payload)
-                if status in {400, 401, 402, 403, 404}:
+                if status in {400, 401, 402, 403, 404, 429}:
                     raise DryerError(f"http_{status}")
                 parsed = listing.parse_page_rows(page, body) if isinstance(body, dict) else []
                 ok, reason, empty = validate_page(body,
@@ -201,6 +201,14 @@ def collect_product_batch(runtime, targets):
             event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id],
                   missing_fields=[key for key in ("features", "description", "specificationGroups") if key not in product])
             continue
+        description = product.get("description")
+        if description is not None:
+            missing = ["description." + key for key in ("short", "long")
+                       if not isinstance(description, dict) or key not in description]
+            if missing:
+                errors[sku_id] = "detail_attribute_response_incomplete"
+                event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id], missing_fields=missing)
+                continue
         captures[sku_id] = {"collector_version": COLLECTOR_VERSION, "product": public_product(product),
             "captured_at": datetime.now().isoformat(timespec="seconds"), "transport": "browser_graphql"}
     return captures, errors
@@ -274,7 +282,7 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
             remaining = retry
             if not remaining:
                 break
-            if batch_error in {"browser_api_unavailable", "http_400", "http_401", "http_402", "http_403", "http_404"}:
+            if batch_error in {"browser_api_unavailable", "http_400", "http_401", "http_402", "http_403", "http_404", "http_429"}:
                 stopped = True
                 event("detail_stopped", reason=batch_error, collected_count=len(successes), failure_count=len(failures),
                       unattempted_count=len(targets) - len(successes) - len(failures))
@@ -375,8 +383,8 @@ def load_test_table(config, rows, batch_id):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DRYER API only; public.ldy_dryer_retail_test only")
-    parser.add_argument("--main-limit", type=int, default=20, help="standalone dryers from default sort; 0=all")
-    parser.add_argument("--bsr-limit", type=int, default=10, help="standalone dryers from Best-Selling sort; 0=all")
+    parser.add_argument("--main-limit", type=int, default=300, help="standalone dryers from default sort; 0=all")
+    parser.add_argument("--bsr-limit", type=int, default=100, help="standalone dryers from Best-Selling sort; 0=all")
     parser.add_argument("--detail-batch-size", type=int, default=5, help="SKUs per browser API batch")
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--resume", type=Path, help="reuse captures and batch id from the same API run")

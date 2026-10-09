@@ -1,6 +1,7 @@
 """DRYER contract and public-product rules. No configuration or network I/O."""
 import html
 import re
+from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
 TEST_TABLE = "ldy_dryer_retail_test"
@@ -102,17 +103,29 @@ def loading_type(product, feature_texts=()):
     matches = {}
     for entry in list(owned_description_texts(product)) + list(feature_texts):
         for sentence in re.split(r"[.!?;]\s+", text(entry)):
+            mentions_washer = re.search(r"\b(?:washer|washing machine)\b", sentence, re.I)
             for kind in ("front", "top"):
                 term = rf"\b{kind}[ -]?load(?:ing)?\b"
-                own_dryer = re.search(term + r"(?:(?!\bwasher\b)[^.!?;]){0,70}\bdryer\b", sentence, re.I)
-                reverse = re.search(r"\bdryer\b[^.!?;]{0,70}" + term, sentence, re.I) if not re.search(r"\bwasher\b", sentence, re.I) else None
-                design = re.search(term + r"\s+design\b", sentence, re.I) if not re.search(r"\bwasher\b", sentence, re.I) else None
+                own_dryer = re.search(term + r"(?:(?!\b(?:washer|washing machine)\b)[^.!?;]){0,70}\bdryer\b", sentence, re.I)
+                reverse = re.search(r"\bdryer\b[^.!?;]{0,70}" + term, sentence, re.I) if not mentions_washer else None
+                design = re.search(term + r"\s+design\b", sentence, re.I) if not mentions_washer else None
                 if own_dryer or reverse or design:
                     matches[kind] = sentence[:300]
     if len(matches) == 1:
         kind = next(iter(matches))
         return kind.title() + "load", {"source": "own_description_or_features", "evidence": matches[kind]}
-    return "", {"source": "conflicting_features" if matches else "not_stated"}
+    if matches:
+        # A title must not override conflicting higher-priority own descriptions.
+        return "", {"source": "conflicting_features"}
+    name = text((product.get("name") or {}).get("short"))
+    if is_standalone_dryer(name):
+        kinds = [kind for kind in ("front", "top")
+                 if re.search(rf"\b{kind}[ -]?load(?:ing)?\b", name, re.I)]
+        if len(kinds) == 1:
+            return kinds[0].title() + "load", {"source": "own_product_name", "evidence": name[:300]}
+        if kinds:
+            return "", {"source": "conflicting_product_name"}
+    return "", {"source": "not_stated"}
 
 
 def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
@@ -158,17 +171,49 @@ def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
     return output
 
 
-def dryer_capacity(product, helpers):
+def dryer_capacity_with_evidence(product, helpers, feature_texts=()):
     # Use the same structured-spec lookup as LDY without washer-specific fallbacks.
     capacity = helpers.spec_value_by_names([product], ["Capacity"])
-    if capacity not in ("", None):
-        return capacity
+    if text(capacity):
+        return capacity, {"source": "specifications"}
     for group in product.get("specificationGroups") or []:
         for spec in group.get("specifications") or []:
-            if re.fullmatch(r"dryer\s+capacity(?:\s*\([^)]*\))?", text(spec.get("displayName")), re.I):
-                if spec.get("value") not in ("", None):
-                    return spec["value"]
-    return ""
+            label = text(spec.get("displayName"))
+            if label.casefold() == "capacity" or re.fullmatch(r"dryer\s+capacity(?:\s*\([^)]*\))?", label, re.I):
+                if text(spec.get("value")):
+                    return spec["value"], {"source": "specifications"}
+
+    def candidates(entries):
+        found = {}
+        for entry in entries:
+            entry = text(entry)
+            for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(?:cubic\s+(?:feet|foot)|cu\.?\s*ft\.?)\b\.?", entry, re.I):
+                # Keep the clause containing the volume; ignore matching washers.
+                left = max(entry.rfind(separator, 0, match.start()) + len(separator)
+                           if entry.rfind(separator, 0, match.start()) >= 0 else 0
+                           for separator in (". ", "! ", "? ", "; "))
+                ends = [entry.find(separator, match.end()) for separator in (". ", "! ", "? ", "; ")]
+                right = min((end for end in ends if end >= 0), default=len(entry))
+                clause = entry[left:right]
+                if re.search(r"\b(?:washer|washing machine|matching|compatible)\b", clause, re.I):
+                    continue
+                number = Decimal(match.group(1))
+                if number > 0:
+                    found.setdefault(number, (match.group(0), clause[:300]))
+        return found
+
+    found = candidates(list(owned_description_texts(product)) + list(feature_texts))
+    if len(found) == 1:
+        value, evidence = next(iter(found.values()))
+        return value, {"source": "own_description_or_features", "evidence": evidence}
+    if found:
+        return "", {"source": "conflicting_descriptions"}
+    name = text((product.get("name") or {}).get("short"))
+    found = candidates([name]) if is_standalone_dryer(name) else {}
+    if len(found) == 1:
+        value, evidence = next(iter(found.values()))
+        return value, {"source": "own_product_name", "evidence": evidence}
+    return "", {"source": "conflicting_product_name" if found else "not_stated"}
 
 
 def is_laundry_dryer(product, capacity):
@@ -189,6 +234,7 @@ def is_laundry_dryer(product, capacity):
 
 
 def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
+    feature_texts = tuple(feature_texts)
     sku_id = str(target["sku_id"])
     if str(product.get("skuId") or "") != sku_id:
         raise ValueError("product_identity_mismatch")
@@ -198,7 +244,7 @@ def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
     url = primary_url((product.get("url") or {}).get("pdp") or target.get("product_url"), sku_id)
     # Reuse the LDY model, capacity, rating/count and price formatters.
     model = helpers.product_model_number([product])
-    capacity = dryer_capacity(product, helpers)
+    capacity, capacity_evidence = dryer_capacity_with_evidence(product, helpers, feature_texts)
     review = product.get("reviewInfo") or {}
     count = helpers.review_count_number(review.get("reviewCount"))
     rating = review.get("averageRating")
@@ -226,5 +272,7 @@ def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
         crawl_datetime=crawl_time.strftime("%Y-%m-%d %H:%M:%S"), batch_id=batch_id,
         loading_type=loading, capacity=capacity)
     evidence["sku_id"] = sku_id
-    evidence["capacity_source"] = "specifications" if capacity else "not_stated"
+    evidence["capacity_source"] = capacity_evidence["source"]
+    if capacity_evidence.get("evidence"):
+        evidence["capacity_evidence"] = capacity_evidence["evidence"]
     return row, evidence

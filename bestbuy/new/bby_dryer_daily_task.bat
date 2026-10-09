@@ -12,7 +12,7 @@ set "PYTHONUNBUFFERED=1"
 set "DRYER_PYTHON=python"
 if defined BESTBUY_PYTHON set "DRYER_PYTHON=%BESTBUY_PYTHON%"
 if "%~1"=="" (
-    "%DRYER_PYTHON%" -B -m bestbuy.step17_dryer --main-limit 20 --bsr-limit 10
+    "%DRYER_PYTHON%" -B -m bestbuy.step17_dryer --main-limit 300 --bsr-limit 100
 ) else (
     "%DRYER_PYTHON%" -B -m bestbuy.step17_dryer %*
 )
