@@ -11,10 +11,10 @@ cd /d C:\samsung_dx_sea\bestbuy\new
 call bby_dryer_daily_task.bat
 ```
 
-기본값은 `DRYER` 검색의 기본 정렬에서 건조기 300개, Best-Selling 정렬에서 건조기 100개.
-각 목록의 건조기 개수가 부족하면 다음 페이지까지 API로 조회. 사이트에 그만큼 없으면 확인된 마지막 페이지까지 수집.
+기본값은 `DRYER` 검색 결과의 기본 정렬에서 최대 300개, Best-Selling 정렬의 1~100위.
+필요한 검색 결과를 확보할 때까지 다음 페이지를 API로 조회. 사이트에 그만큼 없으면 확인된 마지막 페이지까지 수집.
 두 목록의 중복을 합치므로 상세 수집·적재는 최대 400개이며, 중복 수만큼 줄어듦.
-세탁기·일체형·부품·헤어드라이어 등은 대상에서 제외하되 원래 검색 순위는 유지.
+기존 BBY처럼 본체 여부를 별도 판별하지 않음. 검색에 나온 부품·세탁기·일체형·헤어드라이어 등도 선정 범위에 포함될 수 있음.
 
 Python 경로가 다르면 `BESTBUY_PYTHON`에 실행 파일 경로를 지정.
 기존 설정 로더의 DB_CONFIG와 BESTBUY_ZIP_CODE/BESTBUY_STORE_ID를 사용. 기본 위치는 10010/482.
@@ -37,14 +37,17 @@ Chrome 표시 설정은 기존 LDY 실행기와 동일하게 HEADLESS=0 사용. 
 일반 목록에 있던 상품은 한 대상을 유지하고 bsr_rank를 연결. BSR에만 있던 상품만 추가.
 서로 다른 내부 SKU가 같은 상품으로 병합될 때 기존 대상의 정상 SKU를 자동 교체하지 않음.
 main_rank는 기본 정렬의 중복 제거 순서, bsr_rank는 Best-Selling 일반 상품의 중복 제거 순서.
-각 순위는 제품 필터 전 위치를 유지하므로 숫자가 건너뛰거나 300/100보다 커질 수 있음.
+상품 유형에 따른 순위 재정렬이나 실패 상품을 대체하는 추가 수집은 하지 않음.
+BSR의 동일 상품 식별 중복을 제거해도 100위 이후 상품으로 보충하지 않음.
 
 상세는 기본 5개씩 묶어 필요한 식별값·가격·리뷰 집계·스펙·description{short long}·features{description title}만 요청.
-short·long·Features는 같은 요청에서 함께 받으며 설명별 추가 API 왕복은 없음. long이 누락된 불완전 응답은 성공으로 처리하지 않음.
+short·long·Features는 같은 요청에서 함께 받으며 설명별 추가 API 왕복은 없음. 새 API 응답과 저장된 응답 모두 필드 누락을 검증. long 등이 누락된 저장 응답은 다시 요청하고, 명시된 NULL은 정상 정보 부재로 처리.
 별도 Syndigo Key Features 요청과 화면 렌더링 대체 수집은 추가하지 않음.
 가격 입력 자료형은 기존 BBY와 동일한 ProductItemPriceInput을 사용.
 배송 상세, 리뷰 본문 20개, 비교 상품·다른 판매자, 상품 마스터, S3·메일은 요청하거나 실행하지 않음.
-성공 제품은 즉시 저장하고, 재시도에는 실패 제품만 포함. 식별값이 맞지 않는 응답은 적재하지 않음.
+성공 제품은 즉시 저장하고, 재시도에는 실패 제품만 포함. 기존 BBY의 MAX_ITEM_ATTEMPTS(현재 총 2회)를 사용.
+식별값이 맞지 않는 응답은 사용하지 않음. 재시도를 마친 상품은 해당 상품의 목록에서 확인한 값으로 행을 유지.
+목록에는 상품 식별값·이름·모델·가격·리뷰 집계만 추가 보존하며 별도 API 호출은 늘리지 않음.
 HTTP 429(요청 과다 응답)은 목록·상세 모두 즉시 중단하며, 같은 실행에서 추가 묶음이나 재시도를 요청하지 않음. 상세가 불완전하면 DB 적재도 생략.
 
 ## 3. 컬럼과 적재 규칙
@@ -64,7 +67,11 @@ loading_type은 건조기 자체 스펙 → 자체 short·long 설명/Features �
 제품명과 스펙·설명의 값이 다르면 스펙·설명을 우선. 상위 근거 자체가 충돌하면 제목으로 덮지 않고 NULL과 충돌 사유를 남김.
 Matching Washer Type과 관련 세탁기의 washer/washing machine 설명에 있는 front/top load 표현은 제외. 사진으로 추정하지 않음.
 Features에서 추출한 값은 기존 합의된 Frontload/Topload로 정규화하고 근거를 따로 저장.
-API 오류·누락과 정상 응답에 정보가 없는 경우는 구분. 대상 실패가 남으면 DB 적재 중단.
+API 오류·누락과 정상 응답에 정보가 없는 경우는 구분. 가격·모델 등의 정상 빈 값 때문에 상품 행을 삭제하지 않음.
+상세 값이 있으면 우선 사용하고, 상세가 비어 있으면 같은 상품의 목록에서 확인한 이름·모델·가격·리뷰 값을 보존.
+상세 재시도를 모두 마친 실패 상품도 목록 값과 명시된 제품명 속성을 유지하고, 미수집 필드만 NULL로 둠.
+모든 대상 행이 있고 재시도 종료가 확인되면 complete_with_warnings 상태로 적재 허용.
+수집 중단·미시도 상품·목록 불완전·HTTP 429 등은 계속 DB 적재를 막음.
 같은 배치를 다시 적재할 때 해당 Bestbuy 배치만 트랜잭션으로 교체하여 중복 방지.
 
 ## 4. 결과 검수와 재실행
@@ -72,11 +79,14 @@ API 오류·누락과 정상 응답에 정보가 없는 경우는 구분. 대상
 콘솔의 run_dir 아래에서 다음 공개 결과를 확인:
 
 - output/final_output.csv: 지정한 20컬럼. id는 빈칸.
-- output/attribute_evidence.json: 로딩 타입·용량의 출처 근거와 정보 부재·충돌 구분.
-- output/failures.json: 실패 상품의 내부 SKU와 안전한 오류 코드.
-- dryer_manifest.json: 일반/BSR 개수, 중복 개수, 고유 대상·성공·실패 개수, 배치 아이디와 DB 적재 여부.
+- output/attribute_evidence.json: 로딩 타입·용량의 출처 근거와 정보 부재·충돌 구분. 실패 행은 detail_status=failed이며 미확인 속성은 detail_unavailable로 구분.
+- output/failures.json: 실패 상품의 내부 SKU·안전한 오류 코드·시도 횟수·retry_exhausted(재시도 종료 여부).
+- dryer_manifest.json: 일반/BSR·중복·대상 개수, collected_count(상세 성공), failure_count, fallback_count(목록으로 유지한 행), output_count(출력 행), 배치 아이디와 DB 적재 여부.
 - logs/dryer.log: 콘솔과 같은 단계·진행·재시도·오류 기록. 실행을 재개하면 이어서 기록.
 - logs/dryer_events.jsonl: 같은 내용을 항목별로 저장한 분석용 로그.
+
+예: 대상 313개에서 상세 293개 성공·20개 재시도 종료라면 output_count=313, collected_count=293, fallback_count=20.
+적재 검증을 통과하면 inserted_count=313, status=success_with_warnings, db_loaded=true. 이는 정상 성공과 구분하고 실패 파일을 확인.
 
 초기 준비 → DB 사전 확인 → 일반 목록 → BSR 목록 → 상세 수집 → DB 적재 순서로 시작·완료와 경과 시간을 표시.
 목록은 페이지·목표 대비 후보 개수, 상세는 성공 건수/전체 대상·진행률·실패·남은 개수를 표시.
@@ -84,7 +94,8 @@ API 오류·누락과 정상 응답에 정보가 없는 경우는 구분. 대상
 대기 중에는 10초마다 현재 단계와 대기 시간을 출력. 재시도 대상·횟수·대기 시간을 별도로 기록.
 브라우저 실패는 Chrome 시작·사이트 접속·페이지 확인·GraphQL 요청 단계를 구분.
 오류의 예외 종류, 고정 원인 분류, 코드 파일명·함수·줄 번호를 기록하고 원본 오류 문장·헤더·쿠키는 저장하지 않음.
-API 누락 필드, 식별값 불일치와 상품 필수 컬럼 누락을 구분. 미수집이 남으면 적재 생략 사유를 출력.
+API 누락 필드와 식별값 불일치를 구분. 재시도 종료 후 detail_listing_row_retained에서 유지한 상품과 NULL 필드를 확인.
+적재할 수 없는 중단·미완료 상태는 db_load_skipped의 사유를 확인.
 HTTP 400 등 실패 응답은 api_response_rejected에서 응답 형태·GraphQL 오류 개수·고정 오류 분류를 확인.
 알 수 없는 자료형(unknown_type), 자료형 불일치(type_mismatch), 지원하지 않는 필드(unsupported_field), 잘못된 변수(invalid_variables) 등을 구분.
 graphql_fields/graphql_types는 허용된 이름만 기록하며 오류 원문·응답 본문·확장 정보는 출력하거나 저장하지 않음.
@@ -110,7 +121,7 @@ call bby_dryer_daily_task.bat --main-limit 300 --bsr-limit 100 --resume "이전 
 ```
 
 재개 시 동일 위치·일반/BSR 제한과 기존 배치 아이디 유지. 성공 제품의 수집 시각도 유지.
-이전 렌더링 방식 및 short 전용 API 버전 2 실행 폴더는 재개하지 않음. short·long을 함께 받는 버전 3에서 새 실행 폴더를 생성해야 함.
+이전 버전 1~3 실행 폴더는 재개하지 않음. 목록 선정·실패 행 처리 규칙이 바뀐 버전 4에서 새 실행 폴더를 생성해야 함.
 새 실행은 새 목록·가격·리뷰를 수집하며 이전 배치의 상품 캐시를 재사용하지 않음.
 
 소규모 재검수는 목표 수량을 명시해서 실행:

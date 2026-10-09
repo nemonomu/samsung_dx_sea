@@ -17,21 +17,6 @@ def text(value):
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", str(value or "")))).strip()
 
 
-def is_standalone_dryer(name):
-    name = text(name).lower()
-    if not re.search(r"\bdryer\b", name):
-        return False
-    excluded = (
-        r"\b(?:washer|washing machine|laundry center|combo|combination|bundle)\b",
-        r"\b(?:hair|hand|shoe|boot|pet|food|nail|filament)[ -]+dryers?\b",
-        r"\b(?:kit|cord|cable|pedestal|vent|duct|hose|parts?|accessor(?:y|ies))\b",
-        r"\bdryer\s+rack\b|\brack\s+for\b.*\bdryer\b",
-        r"\b(?:installation|repair|protection plan|dryer sheets?)\b",
-        r"\bdryer\s+(?:cover|stand|adapter|outlet|connector|belt|filter|brush)\b",
-    )
-    return not any(re.search(pattern, name) for pattern in excluded)
-
-
 def primary_url(value, sku_id):
     """Only public Best Buy URLs with the same retailer identifier are accepted."""
     value = text(value)
@@ -118,7 +103,8 @@ def loading_type(product, feature_texts=()):
         # A title must not override conflicting higher-priority own descriptions.
         return "", {"source": "conflicting_features"}
     name = text((product.get("name") or {}).get("short"))
-    if is_standalone_dryer(name):
+    # This guards attribute ownership only; it does not remove a search result.
+    if not re.search(r"\b(?:washer|washing machine|matching|compatible)\b", name, re.I):
         kinds = [kind for kind in ("front", "top")
                  if re.search(rf"\b{kind}[ -]?load(?:ing)?\b", name, re.I)]
         if len(kinds) == 1:
@@ -129,12 +115,12 @@ def loading_type(product, feature_texts=()):
 
 
 def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
-    """Reuse LDY identity/rank rules; cap each dryer list before taking its union."""
+    """Reuse LDY search-result identity/rank rules without product-type filtering."""
     from . import step07_final_targets as legacy
     containers = {"organic_product", "sponsored_ingrid"}
     ranked_main = legacy.unique_main_rows([row for row in main_rows
         if row.get("container_type", "organic_product") in containers])
-    selected_main = [row for row in ranked_main if is_standalone_dryer(row.get("product_name"))]
+    selected_main = ranked_main
     if main_limit:
         selected_main = selected_main[:main_limit]
 
@@ -147,12 +133,12 @@ def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
             continue
         seen_skus.add(sku_id)
         rank = len(seen_skus)
-        if not is_standalone_dryer(row.get("product_name")) or legacy.row_seen(row, seen_items):
+        if bsr_limit and rank > bsr_limit:
+            break
+        if legacy.row_seen(row, seen_items):
             continue
         selected_bsr.append(dict(row, bsr_rank=rank))
         legacy.remember_row(row, seen_items)
-        if bsr_limit and len(selected_bsr) >= bsr_limit:
-            break
 
     bsr_by_sku = {str(row["sku_id"]): row for row in selected_bsr}
     bsr_identity = {}
@@ -209,28 +195,11 @@ def dryer_capacity_with_evidence(product, helpers, feature_texts=()):
     if found:
         return "", {"source": "conflicting_descriptions"}
     name = text((product.get("name") or {}).get("short"))
-    found = candidates([name]) if is_standalone_dryer(name) else {}
+    found = candidates([name])
     if len(found) == 1:
         value, evidence = next(iter(found.values()))
         return value, {"source": "own_product_name", "evidence": evidence}
     return "", {"source": "conflicting_product_name" if found else "not_stated"}
-
-
-def is_laundry_dryer(product, capacity):
-    name = text((product.get("name") or {}).get("short"))
-    # A bare "dryer" also matches hair dryers and unrelated goods. Require own
-    # laundry-appliance evidence before writing a candidate into the test table.
-    if re.search(r"\b(?:clothes|laundry|tumble)[ -]+dryer\b", name, re.I):
-        return True
-    volume = r"\b(?:cubic\s+feet|cu\.?\s*ft\.?)\b"
-    if re.search(volume, text(capacity), re.I) or re.search(volume, name, re.I):
-        return True
-    for group in product.get("specificationGroups") or []:
-        for spec in group.get("specifications") or []:
-            label = text(spec.get("displayName")).casefold()
-            if (label == "dryer heating source" or re.fullmatch(r"dryer capacity(?:\s*\([^)]*\))?", label)) and spec.get("value") not in ("",None):
-                return True
-    return False
 
 
 def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
@@ -238,32 +207,29 @@ def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
     sku_id = str(target["sku_id"])
     if str(product.get("skuId") or "") != sku_id:
         raise ValueError("product_identity_mismatch")
-    name = text((product.get("name") or {}).get("short"))
-    if not is_standalone_dryer(name):
-        raise ValueError("detail_is_not_standalone_dryer")
-    url = primary_url((product.get("url") or {}).get("pdp") or target.get("product_url"), sku_id)
+    expected_item = text(target.get("bsin") or target.get("item"))
+    if expected_item and text(product.get("bsin")).casefold() != expected_item.casefold():
+        raise ValueError("product_identity_mismatch")
+    name = text((product.get("name") or {}).get("short")) or text(target.get("product_name") or target.get("retailer_sku_name"))
+    product = dict(product, name={"short": name})
+    url = primary_url((product.get("url") or {}).get("pdp"), sku_id) or primary_url(target.get("product_url"), sku_id)
     # Reuse the LDY model, capacity, rating/count and price formatters.
-    model = helpers.product_model_number([product])
+    model = helpers.product_model_number([product]) or target.get("model_number") or ""
     capacity, capacity_evidence = dryer_capacity_with_evidence(product, helpers, feature_texts)
     review = product.get("reviewInfo") or {}
     count = helpers.review_count_number(review.get("reviewCount"))
+    if count is None:
+        count = helpers.review_count_number(target.get("review_count"))
     rating = review.get("averageRating")
+    if rating in (None, ""):
+        rating = target.get("rating")
     count_text = helpers.int_commas(count) if count is not None else ""
     own_price = product.get("price") or {}
     # All price fields come from this product's primary offer, with no other-seller fallback.
-    final, original, saving = helpers.price_output_fields(own_price, {}, {})
+    final, original, saving = helpers.price_output_fields(own_price, target, {})
     loading, evidence = loading_type(product, feature_texts)
-    required = {"item": product.get("bsin"), "sku": model, "retailer_sku_name": name,
-                "product_url": url, "final_sku_price": final}
-    missing = [field for field, value in required.items() if not value]
-    if missing:
-        error = ValueError("missing_required_product_fields")
-        error.missing_fields = missing
-        raise error
-    if not is_laundry_dryer(product, capacity):
-        raise ValueError("laundry_dryer_type_not_verified")
     row = dict.fromkeys(FIELDS, "")
-    row.update(country="SEA", account_name="Bestbuy", item=product["bsin"], sku=model,
+    row.update(country="SEA", account_name="Bestbuy", item=product.get("bsin") or "", sku=model,
         retailer_sku_name=name, product_url=url, count_of_reviews=count_text,
         star_rating="Not yet reviewed" if count == 0 else (rating if rating is not None else ""),
         count_of_star_ratings=count_text, final_sku_price=final, original_sku_price=original,
@@ -275,4 +241,30 @@ def make_row(target, product, helpers, batch_id, crawl_time, feature_texts=()):
     evidence["capacity_source"] = capacity_evidence["source"]
     if capacity_evidence.get("evidence"):
         evidence["capacity_evidence"] = capacity_evidence["evidence"]
+    return row, evidence
+
+
+def make_listing_row(target, helpers, batch_id, crawl_time, reason):
+    """Retain observed listing values after exhausted detail retries, like LDY."""
+    def observed(*keys):
+        return next((target[key] for key in keys if target.get(key) not in (None, "")), None)
+
+    listing_product = {
+        "skuId": str(target["sku_id"]), "bsin": observed("bsin", "item"),
+        "name": {"short": observed("product_name", "retailer_sku_name")},
+        "manufacturer": {"modelNumber": observed("model_number", "sku")},
+        "url": {"pdp": target.get("product_url")},
+        "reviewInfo": {"reviewCount": observed("review_count", "count_of_reviews", "count_of_star_ratings"),
+                       "averageRating": observed("rating", "star_rating")},
+        "price": {"customerPrice": observed("customer_price", "final_sku_price"),
+                  "regularPrice": observed("regular_price", "original_sku_price"),
+                  "totalSavings": observed("total_savings", "savings")},
+        "description": None, "features": [], "specificationGroups": [],
+    }
+    row, evidence = make_row(target, listing_product, helpers, batch_id, crawl_time)
+    evidence.update(detail_status="failed", detail_reason=reason)
+    if evidence["source"] == "not_stated":
+        evidence["source"] = "detail_unavailable"
+    if evidence["capacity_source"] == "not_stated":
+        evidence["capacity_source"] = "detail_unavailable"
     return row, evidence

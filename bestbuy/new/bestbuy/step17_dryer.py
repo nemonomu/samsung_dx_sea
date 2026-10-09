@@ -10,10 +10,11 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from .step00_dryer import FIELDS, TEST_TABLE, make_row, merge_targets, public_product
+from .step00_collection_recovery import MAX_ITEM_ATTEMPTS
+from .step00_dryer import FIELDS, TEST_TABLE, make_listing_row, make_row, merge_targets, primary_url, public_product
 from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
-COLLECTOR_VERSION = 3
+COLLECTOR_VERSION = 4
 QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductItemPriceInput!){productBySkuId(skuId:$skuId){
 skuId bsin name{short}description{short long}features{description title}manufacturer{modelNumber}url{pdp}
 reviewInfo{averageRating reviewCount}specificationGroups{specifications{displayName value}}
@@ -28,9 +29,7 @@ def safe_reason(exc):
     if isinstance(exc, DryerError):
         reason = str(exc)
         return reason if re.fullmatch(r"[a-zA-Z0-9_]+", reason) else "dryer_error"
-    if isinstance(exc, ValueError) and str(exc) in {
-        "product_identity_mismatch", "detail_is_not_standalone_dryer",
-        "missing_required_product_fields", "laundry_dryer_type_not_verified"}:
+    if isinstance(exc, ValueError) and str(exc) == "product_identity_mismatch":
         return str(exc)
     return type(exc).__name__
 
@@ -91,6 +90,25 @@ def progress(stage, completed, total=0, **fields):
           progress_pct=round(min(completed, total) * 100 / total, 1) if total else None, **fields)
 
 
+def listing_target(row, helpers):
+    """Save only own listing fields needed by the 20-column output and ranks."""
+    target = {key: row.get(key, "") for key in (
+        "sku_id", "bsin", "item", "product_name", "retailer_sku_name", "product_url",
+        "container_type", "is_sponsored", "page", "visual_rank", "global_visual_rank",
+        "organic_rank", "global_organic_rank", "customer_price", "regular_price", "total_savings",
+        "final_sku_price", "original_sku_price", "savings", "rating", "review_count")}
+    target["product_url"] = primary_url(target["product_url"], target["sku_id"])
+    # The shared parser's raw_product_json contains this listing product only.
+    # Read its model internally without retaining unrelated product fields.
+    try:
+        product = json.loads(row.get("raw_product_json") or "{}")
+    except (TypeError, ValueError):
+        product = {}
+    target["model_number"] = helpers.product_model_number([product]) if (
+        isinstance(product, dict) and str(product.get("skuId") or "") == str(target["sku_id"])) else ""
+    return target
+
+
 def collect_listing(runtime, run_dir, kind, max_pages, limit):
     _, listing, helpers = runtime
     from .step00_collection_recovery import MAX_LISTING_PASSES
@@ -141,17 +159,15 @@ def collect_listing(runtime, run_dir, kind, max_pages, limit):
                     break
                 seen_organic.update(organic)
                 # Keep public target data and original positions; no raw request/response logs.
-                rows.extend({key: row.get(key, "") for key in (
-                    "sku_id", "bsin", "product_name", "product_url", "container_type", "is_sponsored",
-                    "page", "visual_rank", "global_visual_rank", "organic_rank", "global_organic_rank")}
-                    for row in parsed)
+                rows.extend(listing_target(row, helpers) for row in parsed)
                 selected = merge_targets(rows, []) if kind == "main" else merge_targets([], rows)
-                reached = limit > 0 and len(selected) >= limit
+                ranked_count = len(selected) if kind == "main" else len(seen_organic)
+                reached = limit > 0 and ranked_count >= limit
                 write_json(cache, {"collector_version": COLLECTOR_VERSION, "limit": limit,
                     "rows": rows, "pages": page, "complete": empty, "limit_reached": reached,
                     "pass_number": pass_number})
-                progress(kind + "_list", min(len(selected), limit) if limit else len(selected), limit,
-                         page=page, parsed_rows=len(parsed), dryer_candidates=len(selected), complete=empty)
+                progress(kind + "_list", min(ranked_count, limit) if limit else ranked_count, limit,
+                         page=page, parsed_rows=len(parsed), candidate_count=len(selected), complete=empty)
                 if reached or empty:
                     return rows
                 if listing.LISTING_PAGE_SLEEP_SECONDS:
@@ -161,6 +177,16 @@ def collect_listing(runtime, run_dir, kind, max_pages, limit):
                 raise DryerError(f"{kind}_max_pages_reached_collection_incomplete")
     finally:
         listing.SEARCH_SORT = original_sort
+
+
+def missing_attribute_fields(product):
+    """Apply the same short/long/Features contract to API and saved products."""
+    missing = [key for key in ("features", "description", "specificationGroups") if key not in product]
+    description = product.get("description")
+    if description is not None:
+        missing.extend("description." + key for key in ("short", "long")
+                       if not isinstance(description, dict) or key not in description)
+    return missing
 
 
 def collect_product_batch(runtime, targets):
@@ -196,19 +222,11 @@ def collect_product_batch(runtime, targets):
             errors[sku_id] = "detail_product_identity_mismatch"
             event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id], identity_field="bsin")
             continue
-        if not all(key in product for key in ("features", "description", "specificationGroups")):
+        missing = missing_attribute_fields(product)
+        if missing:
             errors[sku_id] = "detail_attribute_response_incomplete"
-            event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id],
-                  missing_fields=[key for key in ("features", "description", "specificationGroups") if key not in product])
+            event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id], missing_fields=missing)
             continue
-        description = product.get("description")
-        if description is not None:
-            missing = ["description." + key for key in ("short", "long")
-                       if not isinstance(description, dict) or key not in description]
-            if missing:
-                errors[sku_id] = "detail_attribute_response_incomplete"
-                event("detail_response_rejected", sku_id=sku_id, reason=errors[sku_id], missing_fields=missing)
-                continue
         captures[sku_id] = {"collector_version": COLLECTOR_VERSION, "product": public_product(product),
             "captured_at": datetime.now().isoformat(timespec="seconds"), "transport": "browser_graphql"}
     return captures, errors
@@ -223,6 +241,8 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
         sku_id = str(target["sku_id"])
         if capture.get("collector_version") != COLLECTOR_VERSION:
             raise DryerError("capture_version_mismatch")
+        if missing_attribute_fields(capture["product"]):
+            raise DryerError("detail_attribute_response_incomplete")
         timestamp = datetime.fromisoformat(capture["captured_at"])
         row, evidence = make_row(target, capture["product"], helpers, batch_id, timestamp)
         write_json(run_dir / "products" / f"{sku_id}.json", capture)
@@ -242,16 +262,16 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                 event("detail_cache_reused", sku_id=str(target["sku_id"]))
                 continue
             except Exception as exc:
-                event("detail_cache_rejected", sku_id=str(target["sku_id"]), **error_diagnostic(exc))
+                event("detail_cache_rejected", sku_id=str(target["sku_id"]), reason=safe_reason(exc), **error_diagnostic(exc))
         pending.append(target)
     stopped = False
     for start in range(0, len(pending), batch_size):
         remaining = pending[start:start + batch_size]
-        for attempt in range(1, max(1, helpers.MAX_ATTEMPTS) + 1):
+        for attempt in range(1, MAX_ITEM_ATTEMPTS + 1):
             batch_error = ""
             diagnostics = {}
             event("detail_batch_start", batch=start // batch_size + 1, attempt=attempt,
-                  max_attempts=max(1, helpers.MAX_ATTEMPTS), sku_ids=[str(t["sku_id"]) for t in remaining],
+                  max_attempts=MAX_ITEM_ATTEMPTS, sku_ids=[str(t["sku_id"]) for t in remaining],
                   collected_count=len(successes), target_count=len(targets))
             try:
                 with phase("detail_request", batch=start // batch_size + 1, attempt=attempt, operations=len(remaining)):
@@ -272,11 +292,9 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                     except Exception as exc:
                         errors[sku_id] = safe_reason(exc)
                         sku_diagnostics = error_diagnostic(exc)
-                        missing = getattr(exc, "missing_fields", None)
-                        if isinstance(missing, list):
-                            sku_diagnostics["missing_fields"] = [field for field in FIELDS if field in missing]
                 failures[sku_id] = {"sku_id": sku_id, "stage": "detail", "reason": errors.get(sku_id, "detail_missing_response"),
-                                    "attempt": attempt, **sku_diagnostics}
+                    "attempt": attempt, "max_attempts": MAX_ITEM_ATTEMPTS, "retry_exhausted": False,
+                    "failed_at": datetime.now().isoformat(timespec="seconds"), **sku_diagnostics}
                 event("detail_failed", **failures[sku_id])
                 retry.append(target)
             remaining = retry
@@ -287,14 +305,32 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                 event("detail_stopped", reason=batch_error, collected_count=len(successes), failure_count=len(failures),
                       unattempted_count=len(targets) - len(successes) - len(failures))
                 break
-            if attempt < max(1, helpers.MAX_ATTEMPTS):
+            if attempt < MAX_ITEM_ATTEMPTS:
                 delay = helpers.detail_retry_sleep_seconds(attempt)
                 event("detail_retry", next_attempt=attempt + 1, sku_ids=[str(t["sku_id"]) for t in remaining], sleep_s=delay)
                 with phase("detail_retry_wait", sleep_s=delay):
                     time.sleep(delay)
         if stopped:
             break
-    ordered = [successes[str(t["sku_id"])] for t in targets if str(t["sku_id"]) in successes]
+        for target in remaining:
+            failures[str(target["sku_id"])]["retry_exhausted"] = True
+
+    ordered, fallback_count = [], 0
+    for target in targets:
+        sku_id = str(target["sku_id"])
+        if sku_id in successes:
+            ordered.append(successes[sku_id])
+        elif failures.get(sku_id, {}).get("retry_exhausted"):
+            failure = failures[sku_id]
+            row, evidence = make_listing_row(target, helpers, batch_id,
+                datetime.fromisoformat(failure["failed_at"]), failure["reason"])
+            ordered.append((row, evidence))
+            fallback_count += 1
+            event("detail_listing_row_retained", sku_id=sku_id, reason=failure["reason"],
+                  attempt=failure["attempt"], null_fields=[field for field in FIELDS if field != "id" and row[field] in (None, "")])
+            progress("detail", len(successes) + fallback_count, len(targets), sku_id=sku_id,
+                     collected_count=len(successes), failure_count=len(failures), fallback_count=fallback_count,
+                     pending_count=len(targets) - len(successes) - fallback_count, status="warning")
     return [row for row, _ in ordered], [e for _, e in ordered], list(failures.values())
 
 
@@ -350,7 +386,8 @@ def db_value(value, data_type, column_name=""):
 def load_test_table(config, rows, batch_id):
     if not rows or any(row.get("batch_id") != batch_id or row.get("account_name") != "Bestbuy" for row in rows):
         raise DryerError("invalid_test_batch")
-    keys = [(row["item"], row["sku"]) for row in rows]
+    # Missing optional identifiers are NULL, not a shared product identity.
+    keys = [str(row["item"]).casefold() for row in rows if row.get("item")]
     if len(keys) != len(set(keys)):
         raise DryerError("duplicate_product_identity_in_batch")
     connection = connect_db(config)
@@ -383,8 +420,8 @@ def load_test_table(config, rows, batch_id):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DRYER API only; public.ldy_dryer_retail_test only")
-    parser.add_argument("--main-limit", type=int, default=300, help="standalone dryers from default sort; 0=all")
-    parser.add_argument("--bsr-limit", type=int, default=100, help="standalone dryers from Best-Selling sort; 0=all")
+    parser.add_argument("--main-limit", type=int, default=300, help="search results from default sort; 0=all")
+    parser.add_argument("--bsr-limit", type=int, default=100, help="search results within Best-Selling ranks; 0=all")
     parser.add_argument("--detail-batch-size", type=int, default=5, help="SKUs per browser API batch")
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--resume", type=Path, help="reuse captures and batch id from the same API run")
@@ -469,7 +506,7 @@ def run(args, run_dir, logger):
         bsr_count = len(merge_targets([], bsr_rows, 0, args.bsr_limit))
         targets = merge_targets(main_rows, bsr_rows, args.main_limit, args.bsr_limit)
         if not targets:
-            raise DryerError("no_standalone_dryer_targets")
+            raise DryerError("no_search_targets")
         manifest.update(main_target_count=main_count, bsr_target_count=bsr_count,
             overlap_count=main_count + bsr_count - len(targets), target_count=len(targets))
         write_json(run_dir / "targets.json", targets)
@@ -478,7 +515,12 @@ def run(args, run_dir, logger):
               target_count=len(targets))
         with phase("detail_collection", target_count=len(targets)):
             output, evidence, failures = collect_details(runtime, run_dir, targets, batch_id, args.detail_batch_size)
-        if not failures:
+        fallback_count = sum(entry.get("detail_status") == "failed" for entry in evidence)
+        collected_count = len(output) - fallback_count
+        unattempted_count = len(targets) - collected_count - len(failures)
+        ready = len(output) == len(targets) and unattempted_count == 0 and all(
+            failure.get("retry_exhausted") for failure in failures)
+        if ready:
             logger.clear_failure()
         output_dir = run_dir / "output"
         output_dir.mkdir(exist_ok=True)
@@ -488,13 +530,15 @@ def run(args, run_dir, logger):
             writer.writerows(output)
         write_json(output_dir / "attribute_evidence.json", evidence)
         write_json(output_dir / "failures.json", failures)
-        manifest.update(collected_count=len(output), failure_count=len(failures),
-            unattempted_count=len(targets) - len(output) - len(failures),
+        manifest.update(collected_count=collected_count, output_count=len(output), fallback_count=fallback_count,
+            failure_count=len(failures), unattempted_count=unattempted_count, finalization_ready=ready,
+            collection_status="complete_with_warnings" if ready and failures else "complete" if ready else "partial",
             null_counts={field: sum(row[field] in ("", None) for row in output) for field in FIELDS if field != "id"})
         write_json(manifest_path, manifest)
-        event("collection_summary", target_count=len(targets), collected_count=len(output), failure_count=len(failures),
+        event("collection_summary", target_count=len(targets), collected_count=collected_count,
+              output_count=len(output), fallback_count=fallback_count, failure_count=len(failures),
               unattempted_count=manifest["unattempted_count"], null_counts=manifest["null_counts"])
-        if failures or len(output) != len(targets):
+        if not ready:
             logger.failure_stage = logger.failure_stage or "detail_collection"
             event("db_load_skipped", reason="incomplete_details", failure_count=len(failures),
                   unattempted_count=manifest["unattempted_count"])
@@ -506,9 +550,11 @@ def run(args, run_dir, logger):
             event("db_load_complete", inserted_count=manifest["inserted_count"], batch_id=batch_id)
         else:
             event("db_load_skipped", reason="no_load")
-        manifest["status"] = "success"
+        manifest["status"] = "success_with_warnings" if failures else "success"
         write_json(manifest_path, manifest)
-        event("run_complete", status="success", collected_count=len(output), db_loaded=manifest["db_loaded"], batch_id=batch_id)
+        event("run_complete", status=manifest["status"], collected_count=collected_count,
+              output_count=len(output), fallback_count=fallback_count, failure_count=len(failures),
+              db_loaded=manifest["db_loaded"], batch_id=batch_id)
         return 0
     except (Exception, KeyboardInterrupt) as exc:
         reason = safe_reason(exc)

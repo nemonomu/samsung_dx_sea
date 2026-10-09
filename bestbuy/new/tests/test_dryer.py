@@ -173,15 +173,53 @@ class ExtractionTests(unittest.TestCase):
         p = product()
         p["price"] = {}
         p["buyingOptions"] = [{"product":{"price":{"customerPrice":849.99}}}]
-        with self.assertRaisesRegex(ValueError,"missing_required"):
-            rules.make_row(target(),p,ldy,"b_test",datetime.now())
+        row, _ = rules.make_row(target(),p,ldy,"b_test",datetime.now())
+        self.assertEqual((row["final_sku_price"], row["original_sku_price"], row["savings"]), ("", "", ""))
 
-    def test_bare_dryer_name_needs_laundry_appliance_evidence(self):
+    def test_search_product_without_laundry_evidence_is_retained(self):
         p=product()
         p["name"]={"short":"Brand - Professional Blow Dryer"}
         p["specificationGroups"]=[]
-        with self.assertRaisesRegex(ValueError,"laundry_dryer_type_not_verified"):
-            rules.make_row(target(),p,ldy,"b_test",datetime.now())
+        p["description"] = None
+        row, _ = rules.make_row(target(),p,ldy,"b_test",datetime.now())
+        self.assertEqual(row["retailer_sku_name"], p["name"]["short"])
+        self.assertEqual(row["capacity"], "")
+
+    def test_missing_optional_model_and_price_remain_blank(self):
+        p = product()
+        p["manufacturer"] = None
+        p["price"] = None
+        row, _ = rules.make_row(target(), p, ldy, "b_test", datetime.now())
+        self.assertEqual((row["sku"], row["final_sku_price"]), ("", ""))
+
+    def test_cached_product_must_also_match_listing_item(self):
+        with self.assertRaisesRegex(ValueError, "identity_mismatch"):
+            rules.make_row(dict(target(), bsin="OTHER"), product(), ldy, "b_test", datetime.now())
+
+    def test_empty_detail_fields_retain_verified_own_listing_values(self):
+        p = product()
+        p.update(name=None, manufacturer=None, price=None, reviewInfo=None,
+                 description=None, specificationGroups=[])
+        t = dict(target(), bsin=p["bsin"],
+                 product_name="Brand - 7.4 Cu. Ft. Front Load Electric Dryer",
+                 model_number="LIST_MODEL", customer_price=599.99, regular_price=999.99,
+                 total_savings=400, review_count=100, rating=4.6)
+        row, evidence = rules.make_row(t, p, ldy, "b_test", datetime.now())
+        self.assertEqual((row["retailer_sku_name"], row["sku"]), (t["product_name"], "LIST_MODEL"))
+        self.assertEqual((row["final_sku_price"], row["original_sku_price"], row["savings"]), ("$599.99", "$999.99", "$400"))
+        self.assertEqual((row["count_of_reviews"], row["star_rating"]), ("100", 4.6))
+        self.assertEqual((row["capacity"], row["loading_type"]), ("7.4 Cu. Ft.", "Frontload"))
+        self.assertEqual(evidence["source"], "own_product_name")
+
+    def test_detail_values_take_priority_over_different_listing_values(self):
+        p = product()
+        t = dict(target(), bsin=p["bsin"], product_name="OTHER LISTING NAME",
+                 model_number="LIST_MODEL", customer_price=1, regular_price=2,
+                 total_savings=1, review_count=1, rating=1)
+        row, _ = rules.make_row(t, p, ldy, "b_test", datetime.now())
+        self.assertEqual((row["retailer_sku_name"], row["sku"]), (p["name"]["short"], "ELFE7637AT"))
+        self.assertEqual((row["final_sku_price"], row["original_sku_price"], row["savings"]), ("$999.99", "$1,214.99", "$215"))
+        self.assertEqual((row["count_of_reviews"], row["star_rating"]), ("152", 4.2))
 
     def test_verified_dryer_can_have_unstated_capacity(self):
         p=product()
@@ -240,20 +278,28 @@ class ExtractionTests(unittest.TestCase):
 
 
 class ListingTests(unittest.TestCase):
-    def test_standalone_selection(self):
-        for title in ("7.3 Cu. Ft. Electric Dryer", "8 Cu. Ft. Stackable Gas Dryer", "Portable Clothes Dryer", "Heat Pump Dryer", "Electric Dryer with Drying Rack"):
-            self.assertTrue(rules.is_standalone_dryer(title),title)
-        for title in ("Hair Dryer", "Hair-Dryer", "Hand Dryer", "Washer and Dryer Combo", "Electric Dryer Cord", "Dryer Vent Kit", "Washer", "Laundry Center with Dryer", "Dryer Rack"):
-            self.assertFalse(rules.is_standalone_dryer(title),title)
+    def test_search_results_are_kept_without_product_type_filter(self):
+        titles = ("Electric Dryer", "Dryer Lint Filter Replacement", "Dryer Drum Belt Replacement",
+                  "Clothes Drying Rack", "Hair Dryer", "Washer and Dryer Combo", "Washer")
+        main = [dict(list_row(index, index), product_name=title) for index, title in enumerate(titles, 1)]
+        rows = rules.merge_targets(main, main, len(main), len(main))
+        self.assertEqual([row["product_name"] for row in rows], list(titles))
+        self.assertEqual([row["bsr_rank"] for row in rows], list(range(1, len(main) + 1)))
 
-    def test_original_keyword_ranks_survive_filtering_and_duplicates(self):
+    def test_keyword_ranks_and_duplicates_follow_search_results(self):
         main = [{"sku_id":"1","product_name":"Washer","container_type":"organic_product"},
                 {"sku_id":"2","product_name":"Electric Dryer","container_type":"sponsored_ingrid"},
                 {"sku_id":"2","product_name":"Electric Dryer","container_type":"organic_product"},
                 {"sku_id":"3","product_name":"Gas Dryer","container_type":"organic_product"}]
         bsr = [dict(main[1]),dict(main[3]),dict(main[0]),dict(main[2])]
         rows = rules.merge_targets(main,bsr)
-        self.assertEqual([(r["sku_id"],r["main_rank"],r["bsr_rank"]) for r in rows],[("2",2,3),("3",3,1)])
+        self.assertEqual([(r["sku_id"],r["main_rank"],r["bsr_rank"]) for r in rows],[("1",1,2),("2",2,3),("3",3,1)])
+
+    def test_bsr_rank_limit_does_not_refill_duplicate_items(self):
+        bsr = [list_row(i, i) for i in range(1, 4)]
+        bsr[1]["bsin"] = bsr[0]["bsin"]
+        rows = rules.merge_targets([], bsr, 0, 2)
+        self.assertEqual([(row["sku_id"], row["bsr_rank"]) for row in rows], [("1", 1)])
 
     def test_reuses_existing_api_parser(self):
         rows = listing.parse_page_rows(1, api_graph([6471411]))
@@ -512,6 +558,27 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[1]["variables"]["sort"]["sort"], "Best-Selling")
         self.assertEqual(listing.SEARCH_SORT, "")
 
+    def test_listing_preserves_own_model_price_and_review_without_extra_requests(self):
+        graph = api_graph([1, 2])
+        graph["data"]["detailedProductSearch"]["documents"][0]["product"]["name"]["short"] = "Dryer Lint Filter Replacement"
+        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 2)
+        post.assert_called_once()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["product_name"], "Dryer Lint Filter Replacement")
+        self.assertEqual(rows[0]["model_number"], "ELFE7637AT")
+        self.assertEqual(rows[0]["customer_price"], 999.99)
+        self.assertEqual(rows[0]["review_count"], 152)
+        self.assertNotIn("raw_product_json", rows[0])
+
+    def test_bsr_listing_stops_at_rank_limit_even_with_duplicate_item(self):
+        graph = api_graph([1, 2])
+        graph["data"]["detailedProductSearch"]["documents"][1]["product"]["bsin"] = "ITEM1"
+        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), "bsr", 5, 2)
+        post.assert_called_once()
+        self.assertEqual(len(rules.merge_targets([], rows, 0, 2)), 1)
+
     def test_full_listing_requires_verified_empty_api_page(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, api_graph([1, 2])), (200, api_graph([]))]) as post, redirect_stdout(io.StringIO()):
             rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 0)
@@ -560,6 +627,53 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(errors["1"], "detail_attribute_response_incomplete")
         self.assertIn("description.long", log.getvalue())
 
+    def test_incomplete_cached_attributes_are_refetched_without_repeating_valid_product(self):
+        import json
+        for field in ("long", "short", "features", "description", "specificationGroups", "description_type"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                incomplete = api_product(1)
+                if field in ("short", "long"):
+                    del incomplete["description"][field]
+                elif field == "description_type":
+                    incomplete["description"] = "unexpected description shape"
+                else:
+                    del incomplete[field]
+                for sku, p in ((1, incomplete), (2, api_product(2))):
+                    runner.write_json(root / "products" / f"{sku}.json", {
+                        "collector_version": runner.COLLECTOR_VERSION,
+                        "product": p, "captured_at": "2026-10-08T10:00:00"})
+                current = api_product(1)
+                current["description"] = {"short": None, "long": "This top load dryer dries laundry efficiently."}
+                response = [{"data": {"productBySkuId": current}}]
+                with patch.object(runner, "api_post", return_value=(200, response)) as request, redirect_stdout(io.StringIO()) as log:
+                    rows, evidence, failures = runner.collect_details(self.runtime, root,
+                        [list_row(1, 1), list_row(2, 2)], "b_test", 5)
+                request.assert_called_once()
+                self.assertEqual([p["variables"]["skuId"] for p in request.call_args.args[1]], ["1"])
+                self.assertEqual([row["crawl_datetime"] for row in rows],
+                    [json.loads((root / "products/1.json").read_text(encoding="utf-8"))["captured_at"].replace("T", " "),
+                     "2026-10-08 10:00:00"])
+                self.assertEqual(rows[0]["loading_type"], "Topload")
+                self.assertEqual(evidence[0]["source"], "own_description_or_features")
+                self.assertEqual(failures, [])
+                self.assertIn("detail_cache_rejected", log.getvalue())
+                self.assertIn("detail_attribute_response_incomplete", log.getvalue())
+
+    def test_explicit_null_description_cache_is_reused_without_api(self):
+        for description in (None, {"short": None, "long": None}):
+            with self.subTest(description=description), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                p = api_product(1)
+                p.update(description=description, features=None, specificationGroups=None)
+                runner.write_json(root / "products/1.json", {"collector_version": runner.COLLECTOR_VERSION,
+                    "product": p, "captured_at": "2026-10-08T10:00:00"})
+                with patch.object(runner, "collect_product_batch") as request, redirect_stdout(io.StringIO()):
+                    rows, _, failures = runner.collect_details(self.runtime, root, [list_row(1, 1)], "b_test", 5)
+                request.assert_not_called()
+                self.assertEqual((len(rows), rows[0]["crawl_datetime"]), (1, "2026-10-08 10:00:00"))
+                self.assertEqual(failures, [])
+
     def test_null_description_or_both_null_fields_are_valid_not_transport_failure(self):
         for description in (None, {"short": None, "long": None}):
             p = api_product(1)
@@ -570,16 +684,17 @@ class ApiFlowTests(unittest.TestCase):
             self.assertEqual(set(captured), {"1"})
             self.assertFalse(errors)
 
-    def test_short_only_version_two_run_is_not_reused(self):
+    def test_old_collection_versions_are_not_reused(self):
         import json
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            original = {"collector_version": 2, "main_limit": 300, "bsr_limit": 100, "batch_id": "b_old"}
-            runner.write_json(root / "dryer_manifest.json", original)
-            with patch.object(runner, "load_runtime") as runtime, redirect_stdout(io.StringIO()):
-                self.assertEqual(runner.main(["--resume", str(root)]), 1)
-            runtime.assert_not_called()
-            self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), original)
+        for version in (1, 2, 3):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = {"collector_version": version, "main_limit": 300, "bsr_limit": 100, "batch_id": "b_old"}
+                runner.write_json(root / "dryer_manifest.json", original)
+                with patch.object(runner, "load_runtime") as runtime, redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(["--resume", str(root)]), 1)
+                runtime.assert_not_called()
+                self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), original)
 
     def test_main300_bsr100_union_reuses_ldy_identity_and_rank_functions(self):
         main = [list_row(i, i) for i in range(1, 311)]
@@ -713,7 +828,7 @@ class ApiFlowTests(unittest.TestCase):
             calls.append(skus)
             return 200, [{"errors": [{"message": "temporary synthetic failure"}]} if sku == "2" and len(calls) == 1
                          else {"data": {"productBySkuId": api_product(sku)}} for sku in skus]
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=post), patch.object(ldy, "MAX_ATTEMPTS", 2), patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=post), patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), redirect_stdout(io.StringIO()):
             root = Path(directory)
             targets = rules.merge_targets([list_row(1, 1), list_row(2, 2)], [])
             rows, _, failures = runner.collect_details(self.runtime, root, targets, "b_test", 5)
@@ -753,6 +868,137 @@ class ApiFlowTests(unittest.TestCase):
             import json
             self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), old)
 
+    def _run_retention_case(self, main, bsr, captures):
+        import csv
+        import json
+        cursor = FakeCursor()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger,
+                  patch.object(runner, "load_runtime", return_value=self.runtime),
+                  patch.object(runner, "collect_listing", side_effect=[main, bsr]),
+                  patch.object(runner, "collect_product_batch", side_effect=captures),
+                  patch.object(ldy, "detail_retry_sleep_seconds", return_value=0),
+                  patch.object(runner, "connect_db", return_value=FakeConnection(cursor))):
+                self.assertEqual(runner.run(runner.parse_args([]), root, logger), 0)
+            manifest = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+            with (root / "output/final_output.csv").open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            evidence = json.loads((root / "output/attribute_evidence.json").read_text(encoding="utf-8"))
+            failures = json.loads((root / "output/failures.json").read_text(encoding="utf-8"))
+            events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        return manifest, rows, evidence, failures, events, cursor
+
+    def test_313_search_results_including_twenty_parts_all_collect_and_load(self):
+        main = [list_row(i, i) for i in range(1, 301)]
+        bsr = [list_row(i, rank) for rank, i in enumerate([*range(1, 88), *range(301, 314)], 1)]
+        def captures(_, targets):
+            result = {}
+            for target in targets:
+                sku = target["sku_id"]
+                p = api_product(sku)
+                if int(sku) > 293:
+                    p.update(name={"short": "Dryer Lint Filter Replacement"}, specificationGroups=[], description=None)
+                result[sku] = {"collector_version": runner.COLLECTOR_VERSION,
+                               "product": p, "captured_at": "2026-10-09T10:00:00"}
+            return result, {}
+        manifest, rows, _, failures, _, cursor = self._run_retention_case(main, bsr, captures)
+        self.assertEqual((manifest["target_count"], manifest["collected_count"], manifest["inserted_count"]), (313, 313, 313))
+        self.assertEqual(sum(row["retailer_sku_name"] == "Dryer Lint Filter Replacement" for row in rows), 20)
+        self.assertEqual(len(cursor.inserted), 313)
+        self.assertEqual(failures, [])
+
+    def test_293_success_and_twenty_exhausted_failures_load_all_313_rows(self):
+        from collections import Counter
+        attempts = Counter()
+        main = [dict(list_row(i, i), product_name="Dryer Lint Filter Replacement",
+                     model_number="LIST" + str(i), customer_price=12.99, review_count=0) for i in range(1, 301)]
+        bsr = [dict(list_row(i, rank), product_name="Dryer Lint Filter Replacement",
+                    model_number="LIST" + str(i), customer_price=12.99, review_count=0)
+               for rank, i in enumerate([*range(1, 88), *range(301, 314)], 1)]
+        def captures(_, targets):
+            result, errors = {}, {}
+            for target in targets:
+                sku = target["sku_id"]
+                attempts[sku] += 1
+                if int(sku) > 293:
+                    errors[sku] = "detail_graphql_not_verified"
+                else:
+                    result[sku] = {"collector_version": runner.COLLECTOR_VERSION,
+                                   "product": api_product(sku), "captured_at": "2026-10-09T10:00:00"}
+            return result, errors
+        manifest, rows, evidence, failures, events, cursor = self._run_retention_case(main, bsr, captures)
+        self.assertEqual((manifest["collected_count"], manifest["fallback_count"], manifest["output_count"], manifest["inserted_count"]), (293, 20, 313, 313))
+        self.assertEqual((manifest["status"], manifest["collection_status"], manifest["unattempted_count"]), ("success_with_warnings", "complete_with_warnings", 0))
+        self.assertTrue(manifest["db_loaded"])
+        self.assertTrue(all(attempts[str(i)] == (1 if i <= 293 else 2) for i in range(1, 314)))
+        self.assertEqual(len(failures), 20)
+        self.assertTrue(all(failure["retry_exhausted"] for failure in failures))
+        self.assertEqual(len(rows), 313)
+        self.assertTrue(all(row["sku"] == "LIST" + str(i) and row["final_sku_price"] == "$12.99"
+                            and row["count_of_reviews"] == "0" and row["star_rating"] == "Not yet reviewed"
+                            and row["loading_type"] == "" and row["capacity"] == ""
+                            for i, row in enumerate(rows[293:], 294)))
+        self.assertTrue(all(entry["source"] == "detail_unavailable" and entry["capacity_source"] == "detail_unavailable" for entry in evidence[293:]))
+        self.assertEqual(sum(event["event"] == "detail_listing_row_retained" for event in events), 20)
+        self.assertEqual(len(cursor.inserted), 313)
+        self.assertTrue(all(values[rules.FIELDS[1:].index("loading_type")] is None for values in cursor.inserted[293:]))
+
+    def test_exhausted_http500_retains_missing_identifiers_and_unknown_reviews_as_null(self):
+        main = [dict(list_row(i, i), bsin="") for i in (1, 2)]
+        def captures(*_):
+            raise runner.DryerError("http_500")
+        manifest, rows, evidence, failures, _, cursor = self._run_retention_case(main, [], captures)
+        self.assertEqual((manifest["collected_count"], manifest["output_count"], manifest["inserted_count"]), (0, 2, 2))
+        self.assertEqual(manifest["status"], "success_with_warnings")
+        self.assertTrue(all(row["count_of_reviews"] == row["star_rating"] == row["item"] == row["sku"] == "" for row in rows))
+        self.assertTrue(all(failure["attempt"] == 2 for failure in failures))
+        self.assertTrue(all(entry["detail_reason"] == "http_500" for entry in evidence))
+        fields = rules.FIELDS[1:]
+        self.assertTrue(all(values[fields.index("count_of_reviews")] is None and values[fields.index("item")] is None for values in cursor.inserted))
+
+    def test_wrong_product_response_only_retains_verified_listing_values(self):
+        target = dict(list_row(1, 1), model_number="LIST1", customer_price=10, product_name="Dryer Lint Filter Replacement")
+        wrong = api_product(99)
+        wrong.update(name={"short": "OTHER PRODUCT"}, price={"customerPrice": 9999})
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, [{"data": {"productBySkuId": wrong}}])) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), redirect_stdout(io.StringIO()):
+            rows, evidence, failures = runner.collect_details(self.runtime, Path(directory), [target], "b_test", 5)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual((rows[0]["item"], rows[0]["sku"], rows[0]["final_sku_price"]), ("ITEM1", "LIST1", "$10"))
+        self.assertEqual(rows[0]["retailer_sku_name"], target["product_name"])
+        self.assertEqual(evidence[0]["detail_reason"], "detail_product_identity_mismatch")
+        self.assertTrue(failures[0]["retry_exhausted"])
+
+    def test_resume_warning_run_only_refetches_failed_product_and_keeps_success_time(self):
+        import json
+        main = [list_row(1, 1), list_row(2, 2)]
+        def first(_, targets):
+            return ({"1": {"collector_version": runner.COLLECTOR_VERSION, "product": api_product(1),
+                            "captured_at": "2026-10-09T10:00:00"}} if any(t["sku_id"] == "1" for t in targets) else {}), {"2": "detail_graphql_not_verified"}
+        def repaired(_, targets):
+            self.assertEqual([target["sku_id"] for target in targets], ["2"])
+            return {"2": {"collector_version": runner.COLLECTOR_VERSION, "product": api_product(2),
+                           "captured_at": "2026-10-09T11:00:00"}}, {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (redirect_stdout(io.StringIO()), patch.object(runner, "load_runtime", return_value=self.runtime),
+                  patch.object(runner, "collect_listing", side_effect=[main, [], main, []]),
+                  patch.object(ldy, "detail_retry_sleep_seconds", return_value=0)):
+                with diagnostics.run_logging(root) as logger, patch.object(runner, "collect_product_batch", side_effect=first):
+                    self.assertEqual(runner.run(runner.parse_args(["--no-load"]), root, logger), 0)
+                initial = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+                with diagnostics.run_logging(root) as logger, patch.object(runner, "collect_product_batch", side_effect=repaired) as fetch:
+                    self.assertEqual(runner.run(runner.parse_args(["--no-load", "--resume", str(root)]), root, logger), 0)
+                final = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
+                original = json.loads((root / "products/1.json").read_text(encoding="utf-8"))
+                failures = json.loads((root / "output/failures.json").read_text(encoding="utf-8"))
+            fetch.assert_called_once()
+        self.assertEqual((initial["status"], final["status"]), ("success_with_warnings", "success"))
+        self.assertEqual(final["batch_id"], initial["batch_id"])
+        self.assertEqual(original["captured_at"], "2026-10-09T10:00:00")
+        self.assertEqual((final["collected_count"], final["fallback_count"]), (2, 0))
+        self.assertEqual(failures, [])
+
     def test_http429_listing_stops_after_one_request(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(runner.DryerError, "http_429"):
@@ -762,7 +1008,7 @@ class ApiFlowTests(unittest.TestCase):
     def test_http429_details_stop_without_later_batches_or_db_load(self):
         import json
         main = [list_row(i, i) for i in range(1, 13)]
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, []]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "MAX_ATTEMPTS", 3), patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, []]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
             root = Path(directory)
             with diagnostics.run_logging(root) as logger:
                 self.assertEqual(runner.run(runner.parse_args([]), root, logger), 1)
@@ -955,21 +1201,21 @@ class LoggingTests(unittest.TestCase):
             self.assertEqual(result["failure_stage"],"db_preflight")
             self.assertNotIn("synthetic_private_value",str(result))
 
-    def test_required_column_failure_records_missing_field_names(self):
+    def test_normal_missing_price_keeps_row_without_retry_or_detail_failure(self):
         import json
         config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
         p=api_product(1)
         p["price"]={}
         captured={"collector_version":runner.COLLECTOR_VERSION,"product":p,"captured_at":"2026-10-08T10:00:00"}
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=[[list_row(1,1)],[]]), patch.object(runner,"collect_product_batch",return_value=({"1":captured},{})), patch.object(ldy,"MAX_ATTEMPTS",1), redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=[[list_row(1,1)],[]]), patch.object(runner,"collect_product_batch",return_value=({"1":captured},{})) as capture, redirect_stdout(io.StringIO()):
             root=Path(directory)
             runner.write_json(root/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
-            self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(root),"--no-load"]),1)
+            self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(root),"--no-load"]),0)
             failures=json.loads((root/"output/failures.json").read_text(encoding="utf-8"))
-            self.assertEqual(failures[0]["missing_fields"],["final_sku_price"])
-            text=(root/"logs/dryer.log").read_text(encoding="utf-8")
-            self.assertIn("db_load_skipped",text)
-            self.assertIn("final_sku_price",text)
+            self.assertEqual(failures, [])
+            capture.assert_called_once()
+            manifest=json.loads((root/"dryer_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["status"], manifest["output_count"], manifest["null_counts"]["final_sku_price"]), ("success", 1, 1))
 
     def test_progress_percentage_and_unknown_total(self):
         import json
