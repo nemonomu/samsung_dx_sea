@@ -114,47 +114,16 @@ def loading_type(product, feature_texts=()):
     return "", {"source": "not_stated"}
 
 
-def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
-    """Reuse LDY search-result identity/rank rules without product-type filtering."""
+def category_targets(rows, main_limit=0, bsr_limit=100):
+    """Reuse LDY identity deduplication; rank one organic Best-Selling list."""
     from . import step07_final_targets as legacy
-    containers = {"organic_product", "sponsored_ingrid"}
-    ranked_main = legacy.unique_main_rows([row for row in main_rows
-        if row.get("container_type", "organic_product") in containers])
-    selected_main = ranked_main
+    ranked = legacy.unique_main_rows([row for row in rows
+        if row.get("container_type", "organic_product") == "organic_product"
+        and not row.get("is_sponsored")])
     if main_limit:
-        selected_main = selected_main[:main_limit]
-
-    selected_bsr, seen_skus, seen_items = [], set(), set()
-    organic = sorted((row for row in bsr_rows if row.get("container_type") == "organic_product"),
-        key=lambda row: legacy.int_value(row.get("global_organic_rank") or row.get("visual_rank")))
-    for row in organic:
-        sku_id = str(row.get("sku_id") or "").strip()
-        if not sku_id or sku_id in seen_skus:
-            continue
-        seen_skus.add(sku_id)
-        rank = len(seen_skus)
-        if bsr_limit and rank > bsr_limit:
-            break
-        if legacy.row_seen(row, seen_items):
-            continue
-        selected_bsr.append(dict(row, bsr_rank=rank))
-        legacy.remember_row(row, seen_items)
-
-    bsr_by_sku = {str(row["sku_id"]): row for row in selected_bsr}
-    bsr_identity = {}
-    for row in selected_bsr:
-        for key in legacy.row_identity_keys(row):
-            bsr_identity.setdefault(key, row)
-    output, seen = [], set()
-    for row in selected_main:
-        bsr = legacy.lookup_bsr_row(row, bsr_by_sku, bsr_identity)
-        output.append(dict(row, bsr_rank=bsr.get("bsr_rank", "")))
-        legacy.remember_row(row, seen)
-    for row in selected_bsr:
-        if not legacy.row_seen(row, seen):
-            output.append(dict(row, main_rank=""))
-            legacy.remember_row(row, seen)
-    return output
+        ranked = ranked[:main_limit]
+    return [dict(row, bsr_rank=row["main_rank"] if not bsr_limit or row["main_rank"] <= bsr_limit else "")
+            for row in ranked]
 
 
 def dryer_capacity_with_evidence(product, helpers, feature_texts=()):

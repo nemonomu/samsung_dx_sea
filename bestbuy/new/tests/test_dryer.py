@@ -278,33 +278,36 @@ class ExtractionTests(unittest.TestCase):
 
 
 class ListingTests(unittest.TestCase):
-    def test_search_results_are_kept_without_product_type_filter(self):
-        titles = ("Electric Dryer", "Dryer Lint Filter Replacement", "Dryer Drum Belt Replacement",
-                  "Clothes Drying Rack", "Hair Dryer", "Washer and Dryer Combo", "Washer")
-        main = [dict(list_row(index, index), product_name=title) for index, title in enumerate(titles, 1)]
-        rows = rules.merge_targets(main, main, len(main), len(main))
+    def test_category_products_are_kept_without_product_type_filter(self):
+        titles = ("Electric Dryer", "Dryer Lint Filter Replacement", "Washer and Dryer Combo", "Washer")
+        rows = rules.category_targets([dict(list_row(i, i), product_name=title)
+                                     for i, title in enumerate(titles, 1)], len(titles), len(titles))
         self.assertEqual([row["product_name"] for row in rows], list(titles))
-        self.assertEqual([row["bsr_rank"] for row in rows], list(range(1, len(main) + 1)))
+        self.assertEqual([row["bsr_rank"] for row in rows], list(range(1, len(titles) + 1)))
 
-    def test_keyword_ranks_and_duplicates_follow_search_results(self):
-        main = [{"sku_id":"1","product_name":"Washer","container_type":"organic_product"},
-                {"sku_id":"2","product_name":"Electric Dryer","container_type":"sponsored_ingrid"},
-                {"sku_id":"2","product_name":"Electric Dryer","container_type":"organic_product"},
-                {"sku_id":"3","product_name":"Gas Dryer","container_type":"organic_product"}]
-        bsr = [dict(main[1]),dict(main[3]),dict(main[0]),dict(main[2])]
-        rows = rules.merge_targets(main,bsr)
-        self.assertEqual([(r["sku_id"],r["main_rank"],r["bsr_rank"]) for r in rows],[("1",1,2),("2",2,3),("3",3,1)])
+    def test_same_sku_or_bsin_keeps_first_product_and_contiguous_ranks(self):
+        candidates = [list_row(1, 1), list_row(1, 2), dict(list_row(2, 3), bsin="ITEM1"),
+                      list_row(3, 4), list_row(4, 5)]
+        rows = rules.category_targets(candidates, 3, 2)
+        self.assertEqual([(r["sku_id"], r["main_rank"], r["bsr_rank"]) for r in rows],
+                         [("1", 1, 1), ("3", 2, 2), ("4", 3, "")])
 
-    def test_bsr_rank_limit_does_not_refill_duplicate_items(self):
-        bsr = [list_row(i, i) for i in range(1, 4)]
-        bsr[1]["bsin"] = bsr[0]["bsin"]
-        rows = rules.merge_targets([], bsr, 0, 2)
-        self.assertEqual([(row["sku_id"], row["bsr_rank"]) for row in rows], [("1", 1)])
+    def test_ads_excluded_and_different_variant_identities_remain_separate(self):
+        candidates = [dict(list_row(9, 1), container_type="sponsored_ingrid"),
+                      dict(list_row(8, 2), is_sponsored=True), list_row(1, 3), list_row(2, 4)]
+        rows = rules.category_targets(candidates)
+        self.assertEqual([r["sku_id"] for r in rows], ["1", "2"])
+        self.assertEqual([r["bsr_rank"] for r in rows], [1, 2])
 
-    def test_reuses_existing_api_parser(self):
-        rows = listing.parse_page_rows(1, api_graph([6471411]))
-        self.assertEqual(rows[0]["sku_id"],"6471411")
-        self.assertEqual(rows[0]["container_type"],"organic_product")
+    def test_ldy_search_parser_and_category_parser_use_separate_documents(self):
+        graph = api_graph([2])
+        graph["data"]["detailedProductSearch"] = {"documents": [{"product": api_product(1)}]}
+        graph["data"]["search"]["withBestMedia"] = {"placements": []}
+        old_rows = listing.parse_page_rows(1, graph)
+        runtime = (None, listing, ldy)
+        new_rows, _, _, _ = runner.parse_category_page(runtime, 1, graph)
+        self.assertEqual([r["sku_id"] for r in old_rows], ["1"])
+        self.assertEqual([r["sku_id"] for r in new_rows], ["2"])
 
 class FakeCursor:
     def __init__(self, generated=True):
@@ -409,11 +412,11 @@ class DatabaseTests(unittest.TestCase):
             run=Path(directory)
             cache=run/"products"/"6471411.json"
             runner.write_json(cache,{"collector_version":runner.COLLECTOR_VERSION,"product":product(),"captured_at":"2026-10-08T10:00:00"})
-            runner.write_json(run/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(run/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
             runtime=(config,listing,ldy)
             rows=[dict(target(),product_name="Electric Dryer",container_type="organic_product"),dict(target("2"),product_name="Gas Dryer",container_type="organic_product")]
-            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",return_value=FakeConnection(FakeCursor())),patch.object(runner,"collect_listing",side_effect=[rows,[]]),patch.object(runner,"collect_product_batch",side_effect=runner.DryerError("http_401")) as capture,patch.object(runner,"load_test_table") as load,redirect_stdout(io.StringIO()):
+            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",return_value=FakeConnection(FakeCursor())),patch.object(runner,"collect_listing",return_value=rows),patch.object(runner,"collect_product_batch",side_effect=runner.DryerError("http_401")) as capture,patch.object(runner,"load_test_table") as load,redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(run)]),1)
             self.assertEqual(capture.call_count,1)
             load.assert_not_called()
@@ -426,13 +429,13 @@ class DatabaseTests(unittest.TestCase):
         import json
         with tempfile.TemporaryDirectory() as directory:
             run=Path(directory)
-            runner.write_json(run/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(run/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
             runtime=(config,listing,ldy)
             rows=[dict(target(),product_name="Electric Dryer",container_type="organic_product")]
             cursor=FakeCursor()
             captured={"collector_version":runner.COLLECTOR_VERSION,"product":product(),"captured_at":"2026-10-08T10:00:00"}
-            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",side_effect=[FakeConnection(FakeCursor()),FakeConnection(cursor)]),patch.object(runner,"collect_listing",side_effect=[rows,[]]),patch.object(runner,"collect_product_batch",return_value=({"6471411":captured},{})),redirect_stdout(io.StringIO()):
+            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",side_effect=[FakeConnection(FakeCursor()),FakeConnection(cursor)]),patch.object(runner,"collect_listing",return_value=rows),patch.object(runner,"collect_product_batch",return_value=({"6471411":captured},{})),redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(run)]),0)
             manifest=json.loads((run/"dryer_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["inserted_count"],1)
@@ -443,7 +446,7 @@ class DatabaseTests(unittest.TestCase):
         import json
         with tempfile.TemporaryDirectory() as directory:
             run=Path(directory)
-            original={"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing","status":"success","zip_code":"10010","store_id":"482"}
+            original={"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing","status":"success","zip_code":"10010","store_id":"482"}
             runner.write_json(run/"dryer_manifest.json",original)
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(["--resume",str(run),"--main-limit","0","--bsr-limit","0","--no-load"]),1)
@@ -469,8 +472,8 @@ def api_product(sku_id):
 
 
 def api_graph(skus):
-    return {"data": {"detailedProductSearch": {"documents": [
-        {"product": api_product(sku)} for sku in skus]}}}
+    return {"data": {"search": {"numFound": 313, "documents": [
+        {"__typename": "SearchProduct", "product": api_product(sku)} for sku in skus]}}}
 
 
 def list_row(sku, rank, bsr=False):
@@ -489,9 +492,6 @@ class ApiFlowTests(unittest.TestCase):
         self.config = SimpleNamespace(apply_bestbuy_location=lambda v: v,
             bestbuy_zip_code=lambda: "10010", bestbuy_store_id=lambda: "482")
         self.runtime = (self.config, listing, ldy)
-        self.operation = {"operationName": "PlpView_ProductList_Init",
-            "query": "query PlpView_ProductList_Init{detailedProductSearch{documents{product{skuId}}}}",
-            "variables": {"input": {}, "detailedSearchInput": {}, "sort": {}, "pagination": {}}}
 
     def test_default_main300_bsr100_and_batch5(self):
         args = runner.parse_args([])
@@ -499,25 +499,77 @@ class ApiFlowTests(unittest.TestCase):
         small = runner.parse_args(["--main-limit", "20", "--bsr-limit", "10"])
         self.assertEqual((small.main_limit, small.bsr_limit), (20, 10))
 
-    def test_main20_bsr10_union_preserves_both_ranks(self):
-        main = [list_row(i, i) for i in range(1, 26)]
-        bsr = [list_row(i, n) for n, i in enumerate(range(16, 26), 1)]
-        result = rules.merge_targets(main, bsr, 20, 10)
-        self.assertEqual(len(result), 25)
-        by_sku = {r["sku_id"]: r for r in result}
-        self.assertEqual((by_sku["16"]["main_rank"], by_sku["16"]["bsr_rank"]), (16, 1))
-        self.assertEqual(by_sku["21"]["main_rank"], "")
-        self.assertEqual(by_sku["1"]["bsr_rank"], "")
+    def test_main20_bsr10_share_one_list_without_appending_extra_products(self):
+        candidates = [list_row(i, i) for i in range(1, 26)]
+        rows = rules.category_targets(candidates, 20, 10)
+        self.assertEqual(len(rows), 20)
+        self.assertEqual([r["main_rank"] for r in rows], list(range(1, 21)))
+        self.assertEqual([r["bsr_rank"] for r in rows], list(range(1, 11)) + [""] * 10)
 
-    def test_ldy_bsin_and_url_identity_keep_original_sku(self):
-        main = list_row(1, 1)
-        main["bsin"] = ""
-        main["product_url"] = "https://www.bestbuy.com/product/sample/ITEM1/sku/1"
-        bsr = dict(list_row(2, 1), bsin="item1")
-        result = rules.merge_targets([main], [bsr], 20, 10)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["sku_id"], "1")
-        self.assertEqual(result[0]["bsr_rank"], 1)
+    def test_ldy_bsin_and_url_identity_keep_first_category_sku(self):
+        first = list_row(1, 1)
+        first["bsin"] = ""
+        first["product_url"] = "https://www.bestbuy.com/product/sample/ITEM1/sku/1"
+        repeated = dict(list_row(2, 2), bsin="item1")
+        rows = rules.category_targets([first, repeated], 20, 10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sku_id"], "1")
+        self.assertEqual((rows[0]["main_rank"], rows[0]["bsr_rank"]), (1, 1))
+
+    def test_category_parser_ignores_recommendations_ads_and_nonproduct_documents(self):
+        graph = api_graph([1, 2])
+        graph["data"]["search"]["documents"].insert(1, {"__typename": "SearchCombo"})
+        graph["data"]["detailedProductSearch"] = {"documents": [{"product": api_product(99)}]}
+        graph["data"]["search"]["withBestMedia"] = {"placements": [{"name": "BROWSE_SPONSORED_INGRID",
+            "documentsGridView": {"sponsoredDocuments": [{"product": api_product(98)}]}}]}
+        rows, empty, skipped, _ = runner.parse_category_page(self.runtime, 1, graph)
+        self.assertEqual([r["sku_id"] for r in rows], ["1", "2"])
+        self.assertFalse(empty)
+        self.assertEqual(skipped, 1)
+        self.assertEqual([(r["main_rank"], r["bsr_rank"]) for r in rules.category_targets(rows)], [(1, 1), (2, 2)])
+
+    def test_category_product_missing_requested_fields_is_rejected_but_null_is_valid(self):
+        graph = api_graph([1])
+        p = graph["data"]["search"]["documents"][0]["product"]
+        p.update(name=None, manufacturer=None, price=None, reviewInfo=None)
+        rows, _, _, _ = runner.parse_category_page(self.runtime, 1, graph)
+        self.assertEqual(len(rows), 1)
+        del p["bsin"]
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(runner.DryerError, "listing_product_fields_incomplete"):
+            runner.parse_category_page(self.runtime, 1, graph)
+
+    def test_category_partial_response_and_missing_identity_do_not_mark_listing_complete(self):
+        for graph in ({"errors": [{"path": ["search", "documents", 0, "product", "price"]}], "data": api_graph([1])["data"]},
+                      {"data": {"search": {"documents": [{"__typename": "SearchProduct", "product": None}]}}}):
+            with self.subTest(graph=graph), redirect_stdout(io.StringIO()), self.assertRaises(runner.DryerError):
+                runner.parse_category_page(self.runtime, 1, graph)
+
+    def test_available_category_less_than_target_completes_at_verified_empty_page(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=[(200, api_graph([1, 2])), (200, api_graph([]))]) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 300)
+        self.assertEqual([(r["main_rank"], r["bsr_rank"]) for r in rules.category_targets(rows, 300, 100)], [(1, 1), (2, 2)])
+        self.assertEqual(post.call_count, 2)
+
+    def test_search_or_wrong_category_resume_rejected_before_runtime_or_manifest_rewrite(self):
+        import json
+        for changed in ({"listing_mode": "search"}, {"category_id": "other"}, {"listing_sort": ""}, {"listing_page_size": 24}):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = {"collector_version": runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY,
+                            "main_limit": 300, "bsr_limit": 100, "batch_id": "b_existing", **changed}
+                runner.write_json(root / "dryer_manifest.json", original)
+                with patch.object(runner, "load_runtime") as runtime, redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(["--resume", str(root), "--no-load"]), 1)
+                runtime.assert_not_called()
+                self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), original)
+
+    def test_full_category_uses_bsr100_or_all_main_without_separate_api(self):
+        candidates = [list_row(i, i) for i in range(1, 314)]
+        limited = rules.category_targets(candidates, 0, 100)
+        all_ranks = rules.category_targets(candidates, 0, 0)
+        self.assertEqual(len(limited), 313)
+        self.assertEqual(sum(r["bsr_rank"] != "" for r in limited), 100)
+        self.assertEqual([r["bsr_rank"] for r in all_ranks], list(range(1, 314)))
 
     def test_capacity_uses_specs_despite_feature_title_conflict(self):
         p = product(capacity="7.3 cubic feet")
@@ -538,31 +590,37 @@ class ApiFlowTests(unittest.TestCase):
         p["features"] = [{"skuId": "other", "description": "top-load design"}]
         self.assertEqual(rules.loading_type(p)[0], "")
 
-    def test_listing_collects_pages_until_twenty_dryers(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, api_graph(range(1, 9))), (200, api_graph(range(9, 21)))]) as post, redirect_stdout(io.StringIO()):
-            rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 20)
-        self.assertEqual(len(rules.merge_targets(rows, [], 20, 0)), 20)
+    def test_listing_collects_category_pages_until_twenty_unique_products(self):
+        responses = [(200, api_graph(range(1, 19))), (200, api_graph(range(19, 37)))]
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=responses) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 20)
+        self.assertEqual(len(rules.category_targets(rows, 20, 10)), 20)
         self.assertEqual(post.call_count, 2)
         variables = post.call_args.args[1]["variables"]
-        self.assertEqual(variables["pagination"]["pageNumber"], 2)
-        self.assertEqual(variables["input"]["query"], "DRYER")
-        self.assertEqual(variables["sort"]["sort"], "")
+        self.assertEqual(variables["pagination"], {"pageNumber": 2, "offset": 18})
+        self.assertEqual(variables["input"], {"site": "WWW", "queryType": "BROWSE", "query": "categoryid$abcat0910004"})
+        self.assertEqual(variables["sort"]["sort"], "Best-Selling")
 
-    def test_bsr_best_selling_reuses_verified_cache(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, api_graph(range(1, 11)))) as post, redirect_stdout(io.StringIO()):
+    def test_category_listing_reuses_only_matching_verified_cache(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, api_graph(range(1, 11)))) as post, redirect_stdout(io.StringIO()):
             root = Path(directory)
-            first = runner.collect_listing(self.runtime, root, "bsr", 5, 10)
-            second = runner.collect_listing(self.runtime, root, "bsr", 5, 10)
-        self.assertEqual(first, second)
-        self.assertEqual(post.call_count, 1)
-        self.assertEqual(post.call_args.args[1]["variables"]["sort"]["sort"], "Best-Selling")
+            first = runner.collect_listing(self.runtime, root, 5, 10)
+            second = runner.collect_listing(self.runtime, root, 5, 10)
+            self.assertEqual(first, second)
+            post.assert_called_once()
+            saved = json.loads((root / "category_listing.json").read_text(encoding="utf-8"))
+            saved["category_id"] = "another_category"
+            runner.write_json(root / "category_listing.json", saved)
+            runner.collect_listing(self.runtime, root, 5, 10)
+            self.assertEqual(post.call_count, 2)
         self.assertEqual(listing.SEARCH_SORT, "")
 
     def test_listing_preserves_own_model_price_and_review_without_extra_requests(self):
         graph = api_graph([1, 2])
-        graph["data"]["detailedProductSearch"]["documents"][0]["product"]["name"]["short"] = "Dryer Lint Filter Replacement"
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
-            rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 2)
+        graph["data"]["search"]["documents"][0]["product"]["name"]["short"] = "Dryer Lint Filter Replacement"
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 2)
         post.assert_called_once()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["product_name"], "Dryer Lint Filter Replacement")
@@ -571,30 +629,31 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(rows[0]["review_count"], 152)
         self.assertNotIn("raw_product_json", rows[0])
 
-    def test_bsr_listing_stops_at_rank_limit_even_with_duplicate_item(self):
+    def test_category_listing_refills_duplicate_identities_to_main_target(self):
         graph = api_graph([1, 2])
-        graph["data"]["detailedProductSearch"]["documents"][1]["product"]["bsin"] = "ITEM1"
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
-            rows = runner.collect_listing(self.runtime, Path(directory), "bsr", 5, 2)
-        post.assert_called_once()
-        self.assertEqual(len(rules.merge_targets([], rows, 0, 2)), 1)
+        graph["data"]["search"]["documents"][1]["product"]["bsin"] = "ITEM1"
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=[(200, graph), (200, api_graph([3]))]) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 2)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([(r["sku_id"], r["main_rank"], r["bsr_rank"]) for r in rules.category_targets(rows, 2, 2)],
+                         [("1", 1, 1), ("3", 2, 2)])
 
     def test_full_listing_requires_verified_empty_api_page(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, api_graph([1, 2])), (200, api_graph([]))]) as post, redirect_stdout(io.StringIO()):
-            rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 0)
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=[(200, api_graph([1, 2])), (200, api_graph([]))]) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 0)
         self.assertEqual(len(rows), 2)
         self.assertEqual(post.call_count, 2)
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, {"data": {}})), patch.object(listing, "listing_retry_delay", return_value=0):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, {"data": {}})), patch.object(listing, "listing_retry_delay", return_value=0):
             with self.assertRaises(runner.DryerError):
-                runner.collect_listing(self.runtime, Path(directory), "main", 2, 0)
+                runner.collect_listing(self.runtime, Path(directory), 2, 0)
 
     def test_repeated_page_and_page_cap_never_mark_complete(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, api_graph([1, 2]))), patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, api_graph([1, 2]))), patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(runner.DryerError, "repeated_organic_page"):
-                runner.collect_listing(self.runtime, Path(directory), "main", 5, 20)
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, api_graph([1, 2]))), redirect_stdout(io.StringIO()):
+                runner.collect_listing(self.runtime, Path(directory), 5, 20)
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(200, api_graph([1, 2]))), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(runner.DryerError, "max_pages_reached"):
-                runner.collect_listing(self.runtime, Path(directory), "main", 1, 0)
+                runner.collect_listing(self.runtime, Path(directory), 1, 0)
 
     def test_shared_ldy_transport_and_features_batch_contract(self):
         response = [{"data": {"productBySkuId": api_product(i)}} for i in (1, 2)]
@@ -686,7 +745,7 @@ class ApiFlowTests(unittest.TestCase):
 
     def test_old_collection_versions_are_not_reused(self):
         import json
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 original = {"collector_version": version, "main_limit": 300, "bsr_limit": 100, "batch_id": "b_old"}
@@ -696,24 +755,18 @@ class ApiFlowTests(unittest.TestCase):
                 runtime.assert_not_called()
                 self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), original)
 
-    def test_main300_bsr100_union_reuses_ldy_identity_and_rank_functions(self):
-        main = [list_row(i, i) for i in range(1, 311)]
-        main.append(dict(list_row(1, 311), container_type="sponsored_ingrid"))
-        bsr = [list_row(i, rank) for rank, i in enumerate(range(251, 351), 1)]
-        bsr.append(list_row(251, 101))
-        result = rules.merge_targets(main, bsr, 300, 100)
-        self.assertEqual(len(result), 350)
-        self.assertEqual(len({row["sku_id"] for row in result}), 350)
-        by_sku = {row["sku_id"]: row for row in result}
-        self.assertEqual((by_sku["251"]["main_rank"], by_sku["251"]["bsr_rank"]), (251, 1))
-        self.assertEqual((by_sku["300"]["main_rank"], by_sku["300"]["bsr_rank"]), (300, 50))
-        self.assertEqual((by_sku["301"]["main_rank"], by_sku["301"]["bsr_rank"]), ("", 51))
-        self.assertEqual(by_sku["350"]["bsr_rank"], 100)
+    def test_main300_bsr100_same_ranks_and_no_bsr_after_rank100(self):
+        candidates = [list_row(i, i) for i in range(1, 311)]
+        candidates.append(list_row(1, 311))
+        rows = rules.category_targets(candidates, 300, 100)
+        self.assertEqual(len(rows), 300)
+        self.assertEqual(len({r["sku_id"] for r in rows}), 300)
+        self.assertEqual([r["main_rank"] for r in rows], list(range(1, 301)))
+        self.assertEqual([r["bsr_rank"] for r in rows], list(range(1, 101)) + [""] * 200)
 
-    def test_default300_100_run_collects_each_unique_product_once_and_logs_elapsed(self):
+    def test_default300_100_run_requests_listing_once_and_details_for_300(self):
         import json
         main = [list_row(i, i) for i in range(1, 301)]
-        bsr = [list_row(i, rank) for rank, i in enumerate(range(251, 351), 1)]
         fetched = []
         def captures(_, targets):
             fetched.extend(row["sku_id"] for row in targets)
@@ -722,27 +775,38 @@ class ApiFlowTests(unittest.TestCase):
                     for row in targets}, {}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]) as lists, patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as detail, patch.object(runner, "load_test_table", return_value=350):
+            with redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", return_value=main) as lists, patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as detail, patch.object(runner, "load_test_table", return_value=300):
                 self.assertEqual(runner.run(runner.parse_args([]), root, logger), 0)
             manifest = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
             events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
-            self.assertEqual((manifest["main_target_count"], manifest["bsr_target_count"], manifest["overlap_count"], manifest["collected_count"]), (300, 100, 50, 350))
-            self.assertEqual([call.args[-1] for call in lists.call_args_list], [300, 100])
+            self.assertEqual((manifest["main_target_count"], manifest["bsr_target_count"], manifest["overlap_count"], manifest["collected_count"]), (300, 100, 100, 300))
+            lists.assert_called_once_with(self.runtime, root, 100, 300)
             self.assertEqual(len(fetched), len(set(fetched)))
-            self.assertEqual(detail.call_count, 70)
-            complete = next(event for event in events if event["event"] == "run_complete")
+            self.assertEqual(detail.call_count, 60)
+            targets = json.loads((root / "targets.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(t["bsr_rank"] == t["main_rank"] for t in targets[:100]))
+            self.assertTrue(all(t["bsr_rank"] == "" for t in targets[100:]))
+            assigned = next(e for e in events if e["event"] == "bsr_ranks_assigned")
+            self.assertEqual(assigned["additional_api_requests"], 0)
+            complete = next(e for e in events if e["event"] == "run_complete")
             self.assertEqual(complete["status"], "success")
             self.assertGreaterEqual(complete["elapsed_s"], 0)
 
-    def test_pages_are_collected_until_300_and_100_targets(self):
-        for kind, limit, pages in (("main", 300, [range(1, 151), range(151, 301)]), ("bsr", 100, [range(1, 51), range(51, 101)])):
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, api_graph(page)) for page in pages]) as post, redirect_stdout(io.StringIO()):
-                rows = runner.collect_listing(self.runtime, Path(directory), kind, 5, limit)
-            selected = rules.merge_targets(rows, [], limit, 0) if kind == "main" else rules.merge_targets([], rows, 0, limit)
-            self.assertEqual(len(selected), limit)
-            self.assertEqual(post.call_count, 2)
-            self.assertEqual(post.call_args.args[1]["variables"]["input"]["query"], "DRYER")
-            self.assertEqual(post.call_args.args[1]["variables"]["sort"]["sort"], "Best-Selling" if kind == "bsr" else "")
+    def test_category_300_uses_17_pages_and_preserves_listing_fields(self):
+        graphs = [(200, api_graph(range(start, start + 18))) for start in range(1, 307, 18)]
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=graphs) as post, redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 100, 300)
+        self.assertEqual(len(rules.category_targets(rows, 300, 100)), 300)
+        self.assertEqual(post.call_count, 17)
+        payload = post.call_args.args[1]
+        self.assertEqual(payload["variables"]["pagination"], {"pageNumber": 17, "offset": 18})
+        self.assertEqual(payload["variables"]["sort"], {"sort": "Best-Selling"})
+        self.assertEqual(payload["variables"]["productPriceInput"], ldy.fulfillment_product_price_input())
+        self.assertIn("ProductItemPriceInput!", payload["query"])
+        for selection in ("bsin", "name{short}", "manufacturer{modelNumber}", "reviewInfo{averageRating reviewCount}", "price(input:$productPriceInput)"):
+            self.assertIn(selection, payload["query"])
+        for excluded in ("detailedProductSearch", "withBestMedia", "siteControlBrowse", "fulfillmentOptions"):
+            self.assertNotIn(excluded, payload["query"])
 
     def test_standalone_bat_defaults_and_optional_arguments(self):
         source = Path(runner.__file__).resolve().parent.parent / "bby_dryer_daily_task.bat"
@@ -755,18 +819,17 @@ class ApiFlowTests(unittest.TestCase):
     def test_http400_stops_before_load_and_reports_detail_request_stage(self):
         import json
         main = [list_row(i, i) for i in range(1, 21)]
-        bsr = [list_row(i, n) for n, i in enumerate([*range(1, 10), 21], 1)]
         body = {"errors": [{"message": 'Unknown type "ProductPriceInput". Did you mean "ProductItemPriceInput"? synthetic_private_value',
                             "extensions": {"code": "GRAPHQL_VALIDATION_FAILED", "private": "synthetic_private_value"}}]}
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {"private": "synthetic_private_value"}, 0)) as post, patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()) as console:
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", return_value=main), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {"private": "synthetic_private_value"}, 0)) as post, patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()) as console:
             root = Path(directory)
-            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume", str(root)]), 1)
             result = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
             failures = json.loads((root / "output/failures.json").read_text(encoding="utf-8"))
             events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
             rejected = next(e for e in events if e["event"] == "api_response_rejected")
-            self.assertEqual((result["target_count"], result["collected_count"], result["failure_count"], result["unattempted_count"]), (21, 0, 5, 16))
+            self.assertEqual((result["target_count"], result["collected_count"], result["failure_count"], result["unattempted_count"]), (20, 0, 5, 15))
             self.assertEqual(result["failure_stage"], "detail_request")
             self.assertEqual({e["error_category"] for e in failures}, {"http_400"})
             self.assertEqual(rejected["graphql_error_categories"], ["unknown_type"])
@@ -805,8 +868,8 @@ class ApiFlowTests(unittest.TestCase):
     def test_failed_listing_pass_does_not_splice_earlier_pages(self):
         graphs = [(200, api_graph([1, 2])), (200, {"data": {}}),
                   (200, api_graph([3, 4])), (200, api_graph([5, 6]))]
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=graphs), patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
-            rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 4)
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=graphs), patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
+            rows = runner.collect_listing(self.runtime, Path(directory), 5, 4)
         self.assertEqual([r["sku_id"] for r in rows], ["3", "4", "5", "6"])
 
     def test_batch_identity_mismatch_and_missing_features_fail(self):
@@ -830,7 +893,7 @@ class ApiFlowTests(unittest.TestCase):
                          else {"data": {"productBySkuId": api_product(sku)}} for sku in skus]
         with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", side_effect=post), patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), redirect_stdout(io.StringIO()):
             root = Path(directory)
-            targets = rules.merge_targets([list_row(1, 1), list_row(2, 2)], [])
+            targets = rules.category_targets([list_row(1, 1), list_row(2, 2)])
             rows, _, failures = runner.collect_details(self.runtime, root, targets, "b_test", 5)
             self.assertTrue((root / "products" / "1.json").exists())
             with patch.object(runner, "collect_product_batch") as capture:
@@ -841,21 +904,22 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(rows, cached)
         self.assertFalse(failures)
 
-    def test_main20_bsr10_complete_run_counts_overlap_and_load(self):
+    def test_main20_bsr10_complete_run_loads_twenty_rows_with_ten_bsr_ranks(self):
         import json
         main = [list_row(i, i) for i in range(1, 21)]
-        bsr = [list_row(i, n) for n, i in enumerate(range(16, 26), 1)]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
+            runner.write_json(root / "dryer_manifest.json", {"collector_version": runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY,
+                              "main_limit": 20, "bsr_limit": 10, "batch_id": "b_existing"})
             def captures(_, targets):
-                return {t["sku_id"]: {"collector_version":runner.COLLECTOR_VERSION, "product":api_product(t["sku_id"]), "captured_at":"2026-10-08T10:00:00"} for t in targets}, {}
-            with patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as fetch, patch.object(runner, "load_test_table", return_value=25) as load, redirect_stdout(io.StringIO()):
-                self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume", str(root)]), 0)
+                return {t["sku_id"]: {"collector_version": runner.COLLECTOR_VERSION, "product": api_product(t["sku_id"]), "captured_at": "2026-10-08T10:00:00"} for t in targets}, {}
+            with patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", return_value=main) as lists, patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as fetch, patch.object(runner, "load_test_table", return_value=20) as load, redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(["--main-limit", "20", "--bsr-limit", "10", "--resume", str(root)]), 0)
             result = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual((result["main_target_count"], result["bsr_target_count"], result["overlap_count"], result["collected_count"]), (20, 10, 5, 25))
-            self.assertEqual(fetch.call_count, 5)
-            self.assertEqual(len(load.call_args.args[1]), 25)
+            self.assertEqual((result["main_target_count"], result["bsr_target_count"], result["overlap_count"], result["collected_count"]), (20, 10, 10, 20))
+            lists.assert_called_once()
+            self.assertEqual(fetch.call_count, 4)
+            self.assertEqual(len(load.call_args.args[1]), 20)
 
     def test_old_render_run_cannot_resume_as_api_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -868,7 +932,7 @@ class ApiFlowTests(unittest.TestCase):
             import json
             self.assertEqual(json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8")), old)
 
-    def _run_retention_case(self, main, bsr, captures):
+    def _run_retention_case(self, main, captures):
         import csv
         import json
         cursor = FakeCursor()
@@ -876,7 +940,7 @@ class ApiFlowTests(unittest.TestCase):
             root = Path(directory)
             with (redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger,
                   patch.object(runner, "load_runtime", return_value=self.runtime),
-                  patch.object(runner, "collect_listing", side_effect=[main, bsr]),
+                  patch.object(runner, "collect_listing", return_value=main),
                   patch.object(runner, "collect_product_batch", side_effect=captures),
                   patch.object(ldy, "detail_retry_sleep_seconds", return_value=0),
                   patch.object(runner, "connect_db", return_value=FakeConnection(cursor))):
@@ -889,66 +953,59 @@ class ApiFlowTests(unittest.TestCase):
             events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
         return manifest, rows, evidence, failures, events, cursor
 
-    def test_313_search_results_including_twenty_parts_all_collect_and_load(self):
+    def test_300_category_results_including_twenty_parts_all_collect_and_load(self):
         main = [list_row(i, i) for i in range(1, 301)]
-        bsr = [list_row(i, rank) for rank, i in enumerate([*range(1, 88), *range(301, 314)], 1)]
         def captures(_, targets):
             result = {}
             for target in targets:
                 sku = target["sku_id"]
                 p = api_product(sku)
-                if int(sku) > 293:
+                if int(sku) > 280:
                     p.update(name={"short": "Dryer Lint Filter Replacement"}, specificationGroups=[], description=None)
-                result[sku] = {"collector_version": runner.COLLECTOR_VERSION,
-                               "product": p, "captured_at": "2026-10-09T10:00:00"}
+                result[sku] = {"collector_version": runner.COLLECTOR_VERSION, "product": p, "captured_at": "2026-10-09T10:00:00"}
             return result, {}
-        manifest, rows, _, failures, _, cursor = self._run_retention_case(main, bsr, captures)
-        self.assertEqual((manifest["target_count"], manifest["collected_count"], manifest["inserted_count"]), (313, 313, 313))
+        manifest, rows, _, failures, _, cursor = self._run_retention_case(main, captures)
+        self.assertEqual((manifest["target_count"], manifest["collected_count"], manifest["inserted_count"]), (300, 300, 300))
         self.assertEqual(sum(row["retailer_sku_name"] == "Dryer Lint Filter Replacement" for row in rows), 20)
-        self.assertEqual(len(cursor.inserted), 313)
+        self.assertEqual(len(cursor.inserted), 300)
         self.assertEqual(failures, [])
 
-    def test_293_success_and_twenty_exhausted_failures_load_all_313_rows(self):
+    def test_280_success_and_twenty_exhausted_failures_load_all_300_rows(self):
         from collections import Counter
         attempts = Counter()
-        main = [dict(list_row(i, i), product_name="Dryer Lint Filter Replacement",
-                     model_number="LIST" + str(i), customer_price=12.99, review_count=0) for i in range(1, 301)]
-        bsr = [dict(list_row(i, rank), product_name="Dryer Lint Filter Replacement",
-                    model_number="LIST" + str(i), customer_price=12.99, review_count=0)
-               for rank, i in enumerate([*range(1, 88), *range(301, 314)], 1)]
+        main = [dict(list_row(i, i), product_name="Dryer Lint Filter Replacement", model_number="LIST" + str(i),
+                     customer_price=12.99, review_count=0) for i in range(1, 301)]
         def captures(_, targets):
             result, errors = {}, {}
             for target in targets:
                 sku = target["sku_id"]
                 attempts[sku] += 1
-                if int(sku) > 293:
+                if int(sku) > 280:
                     errors[sku] = "detail_graphql_not_verified"
                 else:
-                    result[sku] = {"collector_version": runner.COLLECTOR_VERSION,
-                                   "product": api_product(sku), "captured_at": "2026-10-09T10:00:00"}
+                    result[sku] = {"collector_version": runner.COLLECTOR_VERSION, "product": api_product(sku), "captured_at": "2026-10-09T10:00:00"}
             return result, errors
-        manifest, rows, evidence, failures, events, cursor = self._run_retention_case(main, bsr, captures)
-        self.assertEqual((manifest["collected_count"], manifest["fallback_count"], manifest["output_count"], manifest["inserted_count"]), (293, 20, 313, 313))
+        manifest, rows, evidence, failures, events, cursor = self._run_retention_case(main, captures)
+        self.assertEqual((manifest["collected_count"], manifest["fallback_count"], manifest["output_count"], manifest["inserted_count"]), (280, 20, 300, 300))
         self.assertEqual((manifest["status"], manifest["collection_status"], manifest["unattempted_count"]), ("success_with_warnings", "complete_with_warnings", 0))
         self.assertTrue(manifest["db_loaded"])
-        self.assertTrue(all(attempts[str(i)] == (1 if i <= 293 else 2) for i in range(1, 314)))
+        self.assertTrue(all(attempts[str(i)] == (1 if i <= 280 else 2) for i in range(1, 301)))
         self.assertEqual(len(failures), 20)
-        self.assertTrue(all(failure["retry_exhausted"] for failure in failures))
-        self.assertEqual(len(rows), 313)
+        self.assertTrue(all(f["retry_exhausted"] for f in failures))
+        self.assertEqual(len(rows), 300)
         self.assertTrue(all(row["sku"] == "LIST" + str(i) and row["final_sku_price"] == "$12.99"
-                            and row["count_of_reviews"] == "0" and row["star_rating"] == "Not yet reviewed"
-                            and row["loading_type"] == "" and row["capacity"] == ""
-                            for i, row in enumerate(rows[293:], 294)))
-        self.assertTrue(all(entry["source"] == "detail_unavailable" and entry["capacity_source"] == "detail_unavailable" for entry in evidence[293:]))
-        self.assertEqual(sum(event["event"] == "detail_listing_row_retained" for event in events), 20)
-        self.assertEqual(len(cursor.inserted), 313)
-        self.assertTrue(all(values[rules.FIELDS[1:].index("loading_type")] is None for values in cursor.inserted[293:]))
+                            and row["count_of_reviews"] == "0" and row["loading_type"] == "" and row["capacity"] == ""
+                            for i, row in enumerate(rows[280:], 281)))
+        self.assertTrue(all(e["source"] == "detail_unavailable" for e in evidence[280:]))
+        self.assertEqual(sum(e["event"] == "detail_listing_row_retained" for e in events), 20)
+        self.assertEqual(len(cursor.inserted), 300)
+        self.assertTrue(all(values[rules.FIELDS[1:].index("loading_type")] is None for values in cursor.inserted[280:]))
 
     def test_exhausted_http500_retains_missing_identifiers_and_unknown_reviews_as_null(self):
         main = [dict(list_row(i, i), bsin="") for i in (1, 2)]
         def captures(*_):
             raise runner.DryerError("http_500")
-        manifest, rows, evidence, failures, _, cursor = self._run_retention_case(main, [], captures)
+        manifest, rows, evidence, failures, _, cursor = self._run_retention_case(main, captures)
         self.assertEqual((manifest["collected_count"], manifest["output_count"], manifest["inserted_count"]), (0, 2, 2))
         self.assertEqual(manifest["status"], "success_with_warnings")
         self.assertTrue(all(row["count_of_reviews"] == row["star_rating"] == row["item"] == row["sku"] == "" for row in rows))
@@ -982,7 +1039,7 @@ class ApiFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (redirect_stdout(io.StringIO()), patch.object(runner, "load_runtime", return_value=self.runtime),
-                  patch.object(runner, "collect_listing", side_effect=[main, [], main, []]),
+                  patch.object(runner, "collect_listing", return_value=main),
                   patch.object(ldy, "detail_retry_sleep_seconds", return_value=0)):
                 with diagnostics.run_logging(root) as logger, patch.object(runner, "collect_product_batch", side_effect=first):
                     self.assertEqual(runner.run(runner.parse_args(["--no-load"]), root, logger), 0)
@@ -1000,15 +1057,15 @@ class ApiFlowTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
     def test_http429_listing_stops_after_one_request(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(listing, "listing_retry_delay", return_value=0), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(runner.DryerError, "http_429"):
-                runner.collect_listing(self.runtime, Path(directory), "main", 5, 300)
+                runner.collect_listing(self.runtime, Path(directory), 5, 300)
         post.assert_called_once()
 
     def test_http429_details_stop_without_later_batches_or_db_load(self):
         import json
         main = [list_row(i, i) for i in range(1, 13)]
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, []]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", return_value=main), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
             root = Path(directory)
             with diagnostics.run_logging(root) as logger:
                 self.assertEqual(runner.run(runner.parse_args([]), root, logger), 1)
@@ -1178,7 +1235,7 @@ class LoggingTests(unittest.TestCase):
             runner.api_post(runtime[2], {"operationName":"PublicProbe"})
         with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=(config, listing, ldy)), patch.object(runner, "collect_listing", side_effect=listing_failure), patch.object(ldy, "browser_graphql_post", side_effect=post), patch.object(ldy, "navigate_detail_browser", side_effect=fail_navigation), redirect_stdout(io.StringIO()):
             root = Path(directory)
-            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             original = ldy.navigate_detail_browser
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume", str(root), "--no-load"]), 1)
             self.assertIs(ldy.navigate_detail_browser, original)
@@ -1194,7 +1251,7 @@ class LoggingTests(unittest.TestCase):
         config = SimpleNamespace(bestbuy_zip_code=lambda:"10010", bestbuy_store_id=lambda:"482")
         with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=(config, listing, ldy)), patch.object(runner, "connect_db", side_effect=RuntimeError("synthetic_private_value")), patch.object(runner, "collect_listing") as collect, redirect_stdout(io.StringIO()):
             root = Path(directory)
-            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(root)]),1)
             collect.assert_not_called()
             result=json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
@@ -1209,7 +1266,7 @@ class LoggingTests(unittest.TestCase):
         captured={"collector_version":runner.COLLECTOR_VERSION,"product":p,"captured_at":"2026-10-08T10:00:00"}
         with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=[[list_row(1,1)],[]]), patch.object(runner,"collect_product_batch",return_value=({"1":captured},{})) as capture, redirect_stdout(io.StringIO()):
             root=Path(directory)
-            runner.write_json(root/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(root/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(root),"--no-load"]),0)
             failures=json.loads((root/"output/failures.json").read_text(encoding="utf-8"))
             self.assertEqual(failures, [])
@@ -1234,11 +1291,11 @@ class LoggingTests(unittest.TestCase):
         config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
         with tempfile.TemporaryDirectory() as directory, patch.object(runner,"load_runtime",return_value=(config,listing,ldy)), patch.object(runner,"collect_listing",side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
             root=Path(directory)
-            runner.write_json(root/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION,"main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
+            runner.write_json(root/"dryer_manifest.json",{"collector_version":runner.COLLECTOR_VERSION, **runner.LISTING_IDENTITY, "main_limit":20,"bsr_limit":10,"batch_id":"b_existing"})
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(root),"--no-load"]),130)
             result=json.loads((root/"dryer_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(result["status"],"interrupted")
-            self.assertEqual(result["failure_stage"],"main_listing")
+            self.assertEqual(result["failure_stage"],"category_listing")
 
 
 if __name__ == "__main__":

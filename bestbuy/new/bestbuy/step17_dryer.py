@@ -11,10 +11,20 @@ from decimal import Decimal
 from pathlib import Path
 
 from .step00_collection_recovery import MAX_ITEM_ATTEMPTS
-from .step00_dryer import FIELDS, TEST_TABLE, make_listing_row, make_row, merge_targets, primary_url, public_product
+from .step00_dryer import FIELDS, TEST_TABLE, make_listing_row, make_row, category_targets, primary_url, public_product
 from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
-COLLECTOR_VERSION = 4
+COLLECTOR_VERSION = 5
+CATEGORY_ID = "abcat0910004"
+LISTING_SORT = "Best-Selling"
+LISTING_PAGE_SIZE = 18
+LISTING_IDENTITY = {"listing_mode": "category", "category_id": CATEGORY_ID,
+                    "listing_sort": LISTING_SORT, "listing_page_size": LISTING_PAGE_SIZE}
+LIST_QUERY = """query DryerCategoryList($input:SearchInput!$pagination:SearchPagination!$sort:SearchSort
+$productPriceInput:ProductItemPriceInput!){search(input:$input,pagination:$pagination,sort:$sort){
+numFound documents{__typename ... on SearchProduct{product{skuId bsin name{short}
+manufacturer{modelNumber}url{pdp}reviewInfo{averageRating reviewCount}
+price(input:$productPriceInput){customerPrice regularPrice totalSavings}}}}}}"""
 QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductItemPriceInput!){productBySkuId(skuId:$skuId){
 skuId bsin name{short}description{short long}features{description title}manufacturer{modelNumber}url{pdp}
 reviewInfo{averageRating reviewCount}specificationGroups{specifications{displayName value}}
@@ -109,74 +119,122 @@ def listing_target(row, helpers):
     return target
 
 
-def collect_listing(runtime, run_dir, kind, max_pages, limit):
+def category_payload(runtime, page):
+    config, _, helpers = runtime
+    variables = {"input": {"site": "WWW", "queryType": "BROWSE", "query": "categoryid$" + CATEGORY_ID},
+        "pagination": {"pageNumber": page, "offset": LISTING_PAGE_SIZE}, "sort": {"sort": LISTING_SORT},
+        "productPriceInput": helpers.fulfillment_product_price_input()}
+    config.apply_bestbuy_location(variables)
+    return {"operationName": "DryerCategoryList", "variables": variables, "query": LIST_QUERY}
+
+
+def parse_category_page(runtime, page, body):
+    """Only category search.documents are organic; recommendations/ads are ignored."""
+    if not isinstance(body, dict):
+        raise DryerError("invalid_response")
+    if body.get("errors"):
+        event("listing_response_rejected", **graphql_response_diagnostic(body))
+        raise DryerError("graphql_listing_error")
+    data = body.get("data")
+    search = data.get("search") if isinstance(data, dict) else None
+    documents = search.get("documents") if isinstance(search, dict) else None
+    if not isinstance(documents, list):
+        raise DryerError("missing_documents")
+    _, listing, helpers = runtime
+    rows, skipped = [], 0
+    for position, document in enumerate(documents, 1):
+        if not isinstance(document, dict):
+            raise DryerError("missing_document")
+        product = document.get("product")
+        if document.get("__typename") not in (None, "SearchProduct"):
+            skipped += 1
+            continue
+        if not isinstance(product, dict) or not str(product.get("skuId") or "").isdigit():
+            raise DryerError("missing_product_identity")
+        missing = [key for key in ("bsin", "name", "manufacturer", "url", "reviewInfo", "price") if key not in product]
+        if missing:
+            event("listing_response_rejected", sku_id=str(product["skuId"]), missing_fields=missing)
+            raise DryerError("listing_product_fields_incomplete")
+        global_rank = (page - 1) * LISTING_PAGE_SIZE + position
+        occurrence = {"page": page, "visual_rank": position, "organic_rank": position,
+            "container_type": "organic_product", "is_sponsored": False,
+            "placement": "search.documents", "source_event_id": "dryer_category_api"}
+        row = listing.parse_product_occurrence(product, occurrence,
+            {"global_visual_rank": global_rank, "global_organic_rank": global_rank})
+        rows.append(listing_target(row, helpers))
+    return rows, not documents, skipped, search.get("numFound")
+
+
+def collect_listing(runtime, run_dir, max_pages, limit):
     _, listing, helpers = runtime
     from .step00_collection_recovery import MAX_LISTING_PASSES
-    from .step01_listing_recovery import validate_page
-    cache = run_dir / f"{kind}_listing.json"
+    cache = run_dir / "category_listing.json"
+    selection = {"collector_version": COLLECTOR_VERSION, "limit": limit, **LISTING_IDENTITY}
     if cache.exists():
         saved = json.loads(cache.read_text(encoding="utf-8"))
-        if (saved.get("collector_version") == COLLECTOR_VERSION and saved.get("limit") == limit
+        if (all(saved.get(key) == value for key, value in selection.items())
                 and (saved.get("complete") or saved.get("limit_reached"))):
-            event("listing_cache_reused", listing=kind, pages=saved.get("pages", 0), cached_rows=len(saved["rows"]))
+            event("listing_cache_reused", listing="category", pages=saved.get("pages", 0), cached_rows=len(saved["rows"]))
             return saved["rows"]
-    operation = listing.load_product_list_operation("PlpView_ProductList_Init")
-    original_sort = listing.SEARCH_SORT
-    listing.SEARCH_SORT = "Best-Selling" if kind == "bsr" else ""
-    try:
-        # Like LDY, discard a failed pass and restart at page one. Never splice list orders.
-        for pass_number in range(1, MAX_LISTING_PASSES + 1):
-            rows, seen_organic = [], set()
-            event("listing_pass_start", listing=kind, attempt=pass_number, max_attempts=MAX_LISTING_PASSES,
-                  sort="Best-Selling" if kind == "bsr" else "default", target_limit=limit or None)
-            for page in range(1, max_pages + 1):
-                event("listing_page_start", listing=kind, page=page, attempt=pass_number)
-                payload = listing.prepare_product_list_payload(operation, page)
-                status, body = api_post(helpers, payload)
-                if status in {400, 401, 402, 403, 404, 429}:
-                    raise DryerError(f"http_{status}")
-                parsed = listing.parse_page_rows(page, body) if isinstance(body, dict) else []
-                ok, reason, empty = validate_page(body,
-                    {"status_code": status, "error": "", "parse_error": ""}, parsed)
-                organic = [str(r["sku_id"]) for r in parsed if r.get("container_type") == "organic_product"]
-                if ok and organic and all(sku in seen_organic for sku in organic):
-                    ok, reason = False, "repeated_organic_page"
-                if page == 1 and empty:
-                    ok, reason = False, "empty_first_page"
-                if not ok:
-                    event("listing_page_failed", listing=kind, page=page, attempt=pass_number,
-                          http_status=status, reason=reason, parsed_rows=len(parsed))
-                    write_json(cache, {"collector_version": COLLECTOR_VERSION, "limit": limit,
-                        "rows": [], "pages": page, "complete": False, "limit_reached": False,
-                        "pass_number": pass_number, "failure_reason": reason})
-                    if pass_number == MAX_LISTING_PASSES:
-                        raise DryerError(f"{kind}_{reason}_page_{page}")
-                    delay = listing.listing_retry_delay(pass_number)
-                    event("listing_retry", listing=kind, next_attempt=pass_number + 1, failed_page=page,
-                          reason=reason, sleep_s=delay, restart_from_page=1)
-                    with phase("listing_retry_wait", listing=kind):
-                        time.sleep(delay)
-                    break
-                seen_organic.update(organic)
-                # Keep public target data and original positions; no raw request/response logs.
-                rows.extend(listing_target(row, helpers) for row in parsed)
-                selected = merge_targets(rows, []) if kind == "main" else merge_targets([], rows)
-                ranked_count = len(selected) if kind == "main" else len(seen_organic)
-                reached = limit > 0 and ranked_count >= limit
-                write_json(cache, {"collector_version": COLLECTOR_VERSION, "limit": limit,
-                    "rows": rows, "pages": page, "complete": empty, "limit_reached": reached,
-                    "pass_number": pass_number})
-                progress(kind + "_list", min(ranked_count, limit) if limit else ranked_count, limit,
-                         page=page, parsed_rows=len(parsed), candidate_count=len(selected), complete=empty)
-                if reached or empty:
-                    return rows
-                if listing.LISTING_PAGE_SLEEP_SECONDS:
-                    with phase("listing_page_wait", listing=kind, sleep_s=listing.LISTING_PAGE_SLEEP_SECONDS):
-                        time.sleep(listing.LISTING_PAGE_SLEEP_SECONDS)
-            else:
-                raise DryerError(f"{kind}_max_pages_reached_collection_incomplete")
-    finally:
-        listing.SEARCH_SORT = original_sort
+    # Discard failed passes and restart page one; never mix ranking snapshots.
+    for pass_number in range(1, MAX_LISTING_PASSES + 1):
+        rows, seen_skus, skipped_total = [], set(), 0
+        event("listing_pass_start", listing="category", attempt=pass_number, max_attempts=MAX_LISTING_PASSES,
+              category_id=CATEGORY_ID, sort=LISTING_SORT, target_limit=limit or None)
+        for page in range(1, max_pages + 1):
+            event("listing_page_start", listing="category", page=page, attempt=pass_number)
+            status, body = api_post(helpers, category_payload(runtime, page))
+            if status in {400, 401, 402, 403, 404, 429}:
+                raise DryerError(f"http_{status}")
+            if isinstance(body, list) and len(body) == 1:
+                body = body[0]
+            parsed, empty, skipped, num_found = [], False, 0, None
+            reason = f"http_{status}" if status != 200 else ""
+            if not reason:
+                try:
+                    parsed, empty, skipped, num_found = parse_category_page(runtime, page, body)
+                except DryerError as exc:
+                    reason = safe_reason(exc)
+            page_skus = [str(row["sku_id"]) for row in parsed]
+            if not reason and page_skus and all(sku in seen_skus for sku in page_skus):
+                reason = "repeated_organic_page"
+            if not reason and page == 1 and empty:
+                reason = "empty_first_page"
+            if reason:
+                event("listing_page_failed", listing="category", page=page, attempt=pass_number,
+                      http_status=status, reason=reason, parsed_rows=len(parsed))
+                write_json(cache, {**selection, "rows": [], "pages": page, "complete": False,
+                    "limit_reached": False, "pass_number": pass_number, "failure_reason": reason})
+                if pass_number == MAX_LISTING_PASSES:
+                    raise DryerError(f"category_{reason}_page_{page}")
+                delay = listing.listing_retry_delay(pass_number)
+                event("listing_retry", listing="category", next_attempt=pass_number + 1, failed_page=page,
+                      reason=reason, sleep_s=delay, restart_from_page=1)
+                with phase("listing_retry_wait", listing="category"):
+                    time.sleep(delay)
+                break
+            seen_skus.update(page_skus)
+            rows.extend(parsed)
+            skipped_total += skipped
+            ranked_count = len(category_targets(rows))
+            reached = limit > 0 and ranked_count >= limit
+            write_json(cache, {**selection, "rows": rows, "pages": page, "complete": empty,
+                "limit_reached": reached, "pass_number": pass_number, "num_found": num_found,
+                "unique_product_count": ranked_count, "duplicate_count": len(rows) - ranked_count,
+                "skipped_document_count": skipped_total})
+            progress("category_list", min(ranked_count, limit) if limit else ranked_count, limit,
+                page=page, parsed_rows=len(parsed), candidate_count=ranked_count,
+                duplicate_count=len(rows) - ranked_count, skipped_documents=skipped,
+                num_found=num_found, complete=empty)
+            if reached or empty:
+                if empty and limit and ranked_count < limit:
+                    event("listing_exhausted", available_count=ranked_count, requested_count=limit)
+                return rows
+            if listing.LISTING_PAGE_SLEEP_SECONDS:
+                with phase("listing_page_wait", listing="category", sleep_s=listing.LISTING_PAGE_SLEEP_SECONDS):
+                    time.sleep(listing.LISTING_PAGE_SLEEP_SECONDS)
+        else:
+            raise DryerError("category_max_pages_reached_collection_incomplete")
 
 
 def missing_attribute_fields(product):
@@ -420,8 +478,8 @@ def load_test_table(config, rows, batch_id):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DRYER API only; public.ldy_dryer_retail_test only")
-    parser.add_argument("--main-limit", type=int, default=300, help="search results from default sort; 0=all")
-    parser.add_argument("--bsr-limit", type=int, default=100, help="search results within Best-Selling ranks; 0=all")
+    parser.add_argument("--main-limit", type=int, default=300, help="unique category products in Best-Selling order; 0=all")
+    parser.add_argument("--bsr-limit", type=int, default=100, help="same ranks on the first N main products; 0=all main products")
     parser.add_argument("--detail-batch-size", type=int, default=5, help="SKUs per browser API batch")
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--resume", type=Path, help="reuse captures and batch id from the same API run")
@@ -450,18 +508,20 @@ def main(argv=None):
 def run(args, run_dir, logger):
     manifest_path = run_dir / "dryer_manifest.json"
     manifest = {"collector_version": COLLECTOR_VERSION, "category": "DRYER", "table": "public." + TEST_TABLE,
-        "search_term": "DRYER", "main_limit": args.main_limit, "bsr_limit": args.bsr_limit,
+        **LISTING_IDENTITY, "main_limit": args.main_limit, "bsr_limit": args.bsr_limit,
         "transport": "browser_graphql", "detail_batch_size": args.detail_batch_size,
         "status": "started", "db_loaded": False}
     has_previous = manifest_path.is_file()
     state_writable = not has_previous
     runtime = None
     event("run_start", run_dir=str(run_dir), main_limit=args.main_limit, bsr_limit=args.bsr_limit,
-          detail_batch_size=args.detail_batch_size, no_load=args.no_load, resume=bool(args.resume))
+          detail_batch_size=args.detail_batch_size, no_load=args.no_load, resume=bool(args.resume), **LISTING_IDENTITY)
     try:
         previous = json.loads(manifest_path.read_text(encoding="utf-8")) if has_previous else {}
         if previous and previous.get("collector_version") != COLLECTOR_VERSION:
             raise DryerError("resume_requires_current_api_run")
+        if previous and any(previous.get(key) != value for key, value in LISTING_IDENTITY.items()):
+            raise DryerError("resume_must_use_the_same_category_selection")
         if previous and any(previous.get(key) != manifest[key] for key in ("main_limit", "bsr_limit")):
             raise DryerError("resume_must_use_the_same_limits")
         batch_id = previous.get("batch_id") or "b_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -496,17 +556,17 @@ def run(args, run_dir, logger):
                     connection.close()
         else:
             event("db_preflight_skipped", reason="no_load")
-        with phase("main_listing", target_limit=args.main_limit or None):
-            main_rows = collect_listing(runtime, run_dir, "main", args.max_pages, args.main_limit)
+        with phase("category_listing", category_id=CATEGORY_ID, sort=LISTING_SORT,
+                   target_limit=args.main_limit or None):
+            category_rows = collect_listing(runtime, run_dir, args.max_pages, args.main_limit)
         logger.clear_failure()
-        with phase("bsr_listing", target_limit=args.bsr_limit or None):
-            bsr_rows = collect_listing(runtime, run_dir, "bsr", args.max_pages, args.bsr_limit)
-        logger.clear_failure()
-        main_count = len(merge_targets(main_rows, [], args.main_limit, 0))
-        bsr_count = len(merge_targets([], bsr_rows, 0, args.bsr_limit))
-        targets = merge_targets(main_rows, bsr_rows, args.main_limit, args.bsr_limit)
+        targets = category_targets(category_rows, args.main_limit, args.bsr_limit)
         if not targets:
-            raise DryerError("no_search_targets")
+            raise DryerError("no_category_targets")
+        main_count = len(targets)
+        bsr_count = sum(row["bsr_rank"] not in ("", None) for row in targets)
+        event("bsr_ranks_assigned", source="same_category_listing", bsr_count=bsr_count,
+              main_count=main_count, additional_api_requests=0)
         manifest.update(main_target_count=main_count, bsr_target_count=bsr_count,
             overlap_count=main_count + bsr_count - len(targets), target_count=len(targets))
         write_json(run_dir / "targets.json", targets)
