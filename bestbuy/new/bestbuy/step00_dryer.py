@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
-TEST_TABLE = "ldy_dryer_retail_test"
+TABLE = "public.ldy_dryer_retail"
 FIELDS = (
     "id", "country", "account_name", "item", "sku", "retailer_sku_name",
     "product_url", "count_of_reviews", "star_rating", "count_of_star_ratings",

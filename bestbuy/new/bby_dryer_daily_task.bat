@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions
-cd /d "%~dp0"
+pushd "%~dp0"
+if errorlevel 1 exit /b 1
 set "BESTBUY_CATEGORY=DRYER"
 set "BESTBUY_URL_SOURCE=default"
 set "BESTBUY_LISTING_COLLECTION_MODE=browser_graphql"
@@ -17,4 +18,5 @@ if "%~1"=="" (
     "%DRYER_PYTHON%" -B -m bestbuy.step17_dryer %*
 )
 set "DRYER_EXIT=%ERRORLEVEL%"
+popd
 endlocal & exit /b %DRYER_EXIT%

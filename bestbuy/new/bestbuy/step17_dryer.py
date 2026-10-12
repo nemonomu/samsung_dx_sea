@@ -1,4 +1,4 @@
-"""DRYER API-only run: shared BBY transport -> exact 20-column test table."""
+"""DRYER API-only run: shared BBY transport -> existing 20-column retail table."""
 import argparse
 import csv
 import json
@@ -11,7 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .step00_collection_recovery import MAX_ITEM_ATTEMPTS
-from .step00_dryer import (FIELDS, TEST_TABLE, make_listing_row, make_row, merge_targets,
+from .step00_dryer import (FIELDS, TABLE, make_listing_row, make_row, merge_targets,
                           ordered_listing_rows, primary_url, product_selection, public_product)
 from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
@@ -453,26 +453,19 @@ def connect_db(config, readonly=False):
 
 def inspect_table(cursor):
     cursor.execute("""SELECT column_name, data_type, column_default IS NOT NULL, is_identity
-        FROM information_schema.columns WHERE table_schema='public' AND table_name=%s
-        ORDER BY ordinal_position""", (TEST_TABLE,))
+        FROM information_schema.columns WHERE table_schema=%s AND table_name=%s
+        ORDER BY ordinal_position""", tuple(TABLE.split(".")))
     return cursor.fetchall()
 
 
 def validate_schema(columns):
+    if not columns:
+        raise DryerError("dryer_table_not_found")
     if {entry[0] for entry in columns} != set(FIELDS):
-        raise DryerError("test_table_must_have_exactly_20_requested_columns")
+        raise DryerError("dryer_table_must_have_exactly_20_requested_columns")
     identifier = next(entry for entry in columns if entry[0] == "id")
     if not (identifier[2] or identifier[3] == "YES"):
-        raise DryerError("test_table_id_must_be_generated")
-
-
-def dryer_table_columns():
-    # Reuse LDY definitions for the requested subset; only three names differ.
-    from .step13_db_prepare import LDY_COLUMNS
-    columns = dict(LDY_COLUMNS)
-    source_names = {"crawl_datetime": "crawl_strdatetime",
-                    "loading_type": "ldy_loading_type", "capacity": "ldy_capacity"}
-    return [(field, columns[source_names.get(field, field)]) for field in FIELDS]
+        raise DryerError("dryer_table_id_must_be_generated")
 
 
 def db_value(value, data_type, column_name=""):
@@ -488,9 +481,9 @@ def db_value(value, data_type, column_name=""):
     return value
 
 
-def load_test_table(config, rows, batch_id):
+def load_table(config, rows, batch_id):
     if not rows or any(row.get("batch_id") != batch_id or row.get("account_name") != "Bestbuy" for row in rows):
-        raise DryerError("invalid_test_batch")
+        raise DryerError("invalid_dryer_batch")
     # Missing optional identifiers are NULL, not a shared product identity.
     keys = [str(row["item"]).casefold() for row in rows if row.get("item")]
     if len(keys) != len(set(keys)):
@@ -500,31 +493,25 @@ def load_test_table(config, rows, batch_id):
         with connection:
             with connection.cursor() as cursor:
                 cursor.execute("SET LOCAL statement_timeout = '60s'")
-                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (TEST_TABLE + ":" + batch_id,))
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (TABLE + ":Bestbuy:" + batch_id,))
                 columns = inspect_table(cursor)
-                if not columns:
-                    definitions = []
-                    for field, definition in dryer_table_columns():
-                        definitions.append('"' + field + '" ' + definition)
-                    cursor.execute('CREATE TABLE public.ldy_dryer_retail_test (' + ", ".join(definitions) + ')')
-                    columns = inspect_table(cursor)
                 validate_schema(columns)
                 types = {entry[0]: entry[1] for entry in columns}
                 fields = FIELDS[1:]
                 values = [tuple(db_value(row[field], types[field], field) for field in fields) for row in rows]
-                cursor.execute("DELETE FROM public.ldy_dryer_retail_test WHERE batch_id=%s AND account_name=%s", (batch_id, "Bestbuy"))
-                sql = 'INSERT INTO public.ldy_dryer_retail_test (' + ",".join('"' + f + '"' for f in fields) + ') VALUES (' + ",".join(["%s"] * len(fields)) + ')'
+                cursor.execute(f"DELETE FROM {TABLE} WHERE batch_id=%s AND account_name=%s", (batch_id, "Bestbuy"))
+                sql = f'INSERT INTO {TABLE} (' + ",".join('"' + f + '"' for f in fields) + ') VALUES (' + ",".join(["%s"] * len(fields)) + ')'
                 cursor.executemany(sql, values)
-                cursor.execute("SELECT count(*) FROM public.ldy_dryer_retail_test WHERE batch_id=%s AND account_name=%s", (batch_id, "Bestbuy"))
+                cursor.execute(f"SELECT count(*) FROM {TABLE} WHERE batch_id=%s AND account_name=%s", (batch_id, "Bestbuy"))
                 if cursor.fetchone()[0] != len(rows):
-                    raise DryerError("inserted_test_batch_count_mismatch")
+                    raise DryerError("inserted_dryer_batch_count_mismatch")
     finally:
         connection.close()
     return len(rows)
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="DRYER API only; public.ldy_dryer_retail_test only")
+    parser = argparse.ArgumentParser(description=f"DRYER API only; {TABLE} only")
     parser.add_argument("--main-limit", type=int, default=300, help="retained products after exclusion in default sort; 0=all")
     parser.add_argument("--bsr-limit", type=int, default=100, help="retained products after exclusion in Best-Selling sort; 0=all")
     parser.add_argument("--detail-batch-size", type=int, default=5, help="SKUs per browser API batch")
@@ -547,6 +534,9 @@ def main(argv=None):
     try:
         with run_logging(run_dir) as logger:
             return run(args, run_dir, logger)
+    except KeyboardInterrupt:
+        print("status=interrupted reason=KeyboardInterrupt", flush=True)
+        return 130
     except OSError:
         print("status=failed reason=run_log_not_writable", flush=True)
         return 1
@@ -554,7 +544,7 @@ def main(argv=None):
 
 def run(args, run_dir, logger):
     manifest_path = run_dir / "dryer_manifest.json"
-    manifest = {"collector_version": COLLECTOR_VERSION, "category": "DRYER", "table": "public." + TEST_TABLE,
+    manifest = {"collector_version": COLLECTOR_VERSION, "category": "DRYER", "table": TABLE,
         "search_term": "DRYER", "main_limit": args.main_limit, "bsr_limit": args.bsr_limit,
         "filter_policy": FILTER_POLICY, "rank_mode": "filtered_products",
         "transport": "browser_graphql", "detail_batch_size": args.detail_batch_size,
@@ -568,6 +558,8 @@ def run(args, run_dir, logger):
         previous = json.loads(manifest_path.read_text(encoding="utf-8")) if has_previous else {}
         if previous and previous.get("collector_version") != COLLECTOR_VERSION:
             raise DryerError("resume_requires_current_api_run")
+        if previous.get("table") not in (None, TABLE):
+            raise DryerError("resume_table_must_match_original_run")
         if previous and any(previous.get(key) != manifest[key] for key in ("main_limit", "bsr_limit")):
             raise DryerError("resume_must_use_the_same_limits")
         batch_id = previous.get("batch_id") or "b_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -586,7 +578,7 @@ def run(args, run_dir, logger):
         state_writable = True
         write_json(manifest_path, manifest)
         if not args.no_load:
-            with phase("db_preflight", table="public." + TEST_TABLE):
+            with phase("db_preflight", table=TABLE):
                 connection = connect_db(config, readonly=True)
                 try:
                     with connection:
@@ -596,8 +588,7 @@ def run(args, run_dir, logger):
                             event("db_schema_checked", column_count=len(columns), table_exists=bool(columns),
                                   missing_fields=[field for field in FIELDS if field not in {entry[0] for entry in columns}] if columns else [],
                                   unexpected_column_count=len({entry[0] for entry in columns} - set(FIELDS)))
-                            if columns:
-                                validate_schema(columns)
+                            validate_schema(columns)
                 finally:
                     connection.close()
         else:
@@ -660,8 +651,8 @@ def run(args, run_dir, logger):
                   unattempted_count=manifest["unattempted_count"])
             raise DryerError("incomplete_details_db_load_skipped")
         if not args.no_load:
-            with phase("db_load", table="public." + TEST_TABLE, expected_rows=len(output), batch_id=batch_id):
-                manifest["inserted_count"] = load_test_table(config, output, batch_id)
+            with phase("db_load", table=TABLE, expected_rows=len(output), batch_id=batch_id):
+                manifest["inserted_count"] = load_table(config, output, batch_id)
             manifest["db_loaded"] = True
             event("db_load_complete", inserted_count=manifest["inserted_count"], batch_id=batch_id)
         else:
@@ -688,6 +679,34 @@ def run(args, run_dir, logger):
                     runtime[2].close_detail_browser_page()
             except Exception as exc:
                 event("browser_cleanup_failed", **error_diagnostic(exc))
+        manifest["elapsed_s"] = round(time.monotonic() - logger.started, 2)
+        mail_interrupted = False
+        if not args.no_load and manifest["status"] != "interrupted":
+            try:
+                from .step18_dryer_email_notify import notify_run
+                with phase("email_notify"):
+                    manifest["email"] = notify_run(manifest, run_dir)
+                write_json(run_dir / "output" / "email_notify_manifest.json", manifest["email"])
+            except KeyboardInterrupt:
+                mail_interrupted = True
+                manifest["email"] = {"sent": False, "status": "interrupted"}
+                event("email_notify_interrupted")
+            except Exception as exc:
+                manifest["email"] = {"sent": False, "status": "failed", **error_diagnostic(exc)}
+                event("email_notify_failed", **error_diagnostic(exc))
+        else:
+            event("email_notify_skipped", reason="no_load" if args.no_load else "interrupted")
+        manifest["total_elapsed_s"] = round(time.monotonic() - logger.started, 2)
+        if state_writable:
+            try:
+                write_json(manifest_path, manifest)
+            except Exception as exc:
+                event("run_state_update_failed", **error_diagnostic(exc))
+        event("run_finished", status=manifest["status"], db_loaded=manifest["db_loaded"],
+              duration_s=round(time.monotonic() - logger.started, 2),
+              email_sent=manifest.get("email", {}).get("sent", False))
+        if mail_interrupted:
+            raise KeyboardInterrupt
 
 
 if __name__ == "__main__":

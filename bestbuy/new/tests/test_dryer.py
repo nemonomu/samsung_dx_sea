@@ -14,6 +14,7 @@ from unittest.mock import patch
 os.environ["BESTBUY_ENV_PATH"] = str(Path(tempfile.gettempdir()) / "bby_dryer_offline_no_env")
 os.environ["BESTBUY_URL_SOURCE"] = "default"
 os.environ["BESTBUY_CATEGORY"] = "LDY"
+os.environ["BESTBUY_EMAIL_DRY_RUN"] = "1"
 
 from bestbuy import step08_detail_enrichment as ldy
 from bestbuy import step01_main_list as listing
@@ -335,14 +336,14 @@ class FakeConnection:
 class DatabaseTests(unittest.TestCase):
     def row(self):
         return rules.make_row(target(),product(),ldy,"b_test",datetime.now())[0]
-    def test_load_is_confined_to_test_table_and_same_batch(self):
+    def test_load_is_confined_to_operational_table_and_same_batch(self):
         cursor=FakeCursor()
         connection=FakeConnection(cursor)
         with patch.object(runner,"connect_db",return_value=connection),patch.dict(os.environ,{"BESTBUY_OUTPUT_TABLE":"tv_retail_com"}):
-            self.assertEqual(runner.load_test_table(None,[self.row()],"b_test"),1)
+            self.assertEqual(runner.load_table(None,[self.row()],"b_test"),1)
         sql="\n".join(call[0] for call in cursor.calls)
         self.assertNotIn("tv_retail_com",sql)
-        self.assertIn("DELETE FROM public.ldy_dryer_retail_test WHERE batch_id=%s AND account_name=%s",sql)
+        self.assertIn("DELETE FROM public.ldy_dryer_retail WHERE batch_id=%s AND account_name=%s",sql)
         self.assertTrue(connection.closed)
         self.assertEqual(len(cursor.inserted[0]),19)
     def test_common_insert_formats_match_existing_bby(self):
@@ -354,7 +355,7 @@ class DatabaseTests(unittest.TestCase):
                        count_of_star_ratings="1,234", main_rank="3")
             cursor = FakeCursor()
             with self.subTest(rating=rating), patch.object(runner, "connect_db", return_value=FakeConnection(cursor)):
-                self.assertEqual(runner.load_test_table(None, [row], "b_test"), 1)
+                self.assertEqual(runner.load_table(None, [row], "b_test"), 1)
                 values = dict(zip(rules.FIELDS[1:], cursor.inserted[0]))
                 self.assertEqual(values["star_rating"], expected)
                 self.assertEqual(values["main_rank"], 3)
@@ -364,44 +365,29 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(values, {field: normalize_value(row[field], types[field], field)
                                           for field in rules.FIELDS[1:]})
 
-    def test_new_table_reuses_ldy_types_and_only_requested_columns(self):
+    def test_missing_operational_table_fails_without_ddl_or_delete(self):
         class MissingTableCursor(FakeCursor):
-            def __init__(self):
-                super().__init__()
-                self.schema_reads = 0
             def fetchall(self):
-                self.schema_reads += 1
-                return [] if self.schema_reads == 1 else super().fetchall()
+                return []
         cursor = MissingTableCursor()
-        with patch.object(runner, "connect_db", return_value=FakeConnection(cursor)):
-            self.assertEqual(runner.load_test_table(None, [self.row()], "b_test"), 1)
-        statements = [sql for sql, _ in cursor.calls if sql.startswith("CREATE TABLE")]
-        self.assertEqual(len(statements), 1)
-        ddl = statements[0]
-        self.assertIn("CREATE TABLE public.ldy_dryer_retail_test", ddl)
-        self.assertIn('"country" varchar(10) NOT NULL DEFAULT', ddl)
-        self.assertIn('"account_name" varchar(50) NOT NULL DEFAULT', ddl)
-        self.assertIn('"calendar_week" varchar(20)', ddl)
-        self.assertIn('"crawl_datetime" varchar(50)', ddl)
-        self.assertIn('"loading_type" text', ddl)
-        self.assertIn('"capacity" text', ddl)
-        self.assertEqual(ddl.count('"'), 40)
-        self.assertNotIn('"product"', ddl)
-        self.assertNotIn('"page_type"', ddl)
-        self.assertNotIn('"ldy_loading_type"', ddl)
-        self.assertNotIn('"crawl_strdatetime"', ddl)
+        connection = FakeConnection(cursor)
+        with patch.object(runner, "connect_db", return_value=connection):
+            with self.assertRaisesRegex(runner.DryerError, "dryer_table_not_found"):
+                runner.load_table(None, [self.row()], "b_test")
+        self.assertFalse(any(sql.startswith(("CREATE", "ALTER", "DROP", "DELETE", "INSERT")) for sql, _ in cursor.calls))
+        self.assertTrue(connection.closed)
 
     def test_schema_failure_occurs_before_delete(self):
         cursor=FakeCursor(generated=False)
         with patch.object(runner,"connect_db",return_value=FakeConnection(cursor)):
             with self.assertRaisesRegex(runner.DryerError,"id_must_be_generated"):
-                runner.load_test_table(None,[self.row()],"b_test")
+                runner.load_table(None,[self.row()],"b_test")
         self.assertFalse(any("DELETE" in call[0] for call in cursor.calls))
     def test_wrong_batch_or_duplicate_prevents_any_db_connection(self):
         row=self.row()
         with patch.object(runner,"connect_db") as connect:
-            with self.assertRaises(runner.DryerError): runner.load_test_table(None,[row],"different")
-            with self.assertRaises(runner.DryerError): runner.load_test_table(None,[row,row],"b_test")
+            with self.assertRaises(runner.DryerError): runner.load_table(None,[row],"different")
+            with self.assertRaises(runner.DryerError): runner.load_table(None,[row,row],"b_test")
             connect.assert_not_called()
     def test_retry_uses_successful_capture_and_skips_load_on_failure(self):
         import json
@@ -413,7 +399,7 @@ class DatabaseTests(unittest.TestCase):
             config=SimpleNamespace(bestbuy_zip_code=lambda:"10010",bestbuy_store_id=lambda:"482")
             runtime=(config,listing,ldy)
             rows=[dict(target(),product_name="Electric Dryer",container_type="organic_product"),dict(target("2"),product_name="Gas Dryer",container_type="organic_product")]
-            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",return_value=FakeConnection(FakeCursor())),patch.object(runner,"collect_listing",side_effect=[rows,[]]),patch.object(runner,"collect_product_batch",side_effect=runner.DryerError("http_401")) as capture,patch.object(runner,"load_test_table") as load,redirect_stdout(io.StringIO()):
+            with patch.object(runner,"load_runtime",return_value=runtime),patch.object(runner,"connect_db",return_value=FakeConnection(FakeCursor())),patch.object(runner,"collect_listing",side_effect=[rows,[]]),patch.object(runner,"collect_product_batch",side_effect=runner.DryerError("http_401")) as capture,patch.object(runner,"load_table") as load,redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume",str(run)]),1)
             self.assertEqual(capture.call_count,1)
             load.assert_not_called()
@@ -722,7 +708,7 @@ class ApiFlowTests(unittest.TestCase):
                     for row in targets}, {}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]) as lists, patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as detail, patch.object(runner, "load_test_table", return_value=350):
+            with redirect_stdout(io.StringIO()), diagnostics.run_logging(root) as logger, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]) as lists, patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as detail, patch.object(runner, "load_table", return_value=350):
                 self.assertEqual(runner.run(runner.parse_args([]), root, logger), 0)
             manifest = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
             events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -758,7 +744,7 @@ class ApiFlowTests(unittest.TestCase):
         bsr = [list_row(i, n) for n, i in enumerate([*range(1, 10), 21], 1)]
         body = {"errors": [{"message": 'Unknown type "ProductPriceInput". Did you mean "ProductItemPriceInput"? synthetic_private_value',
                             "extensions": {"code": "GRAPHQL_VALIDATION_FAILED", "private": "synthetic_private_value"}}]}
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {"private": "synthetic_private_value"}, 0)) as post, patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()) as console:
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(ldy, "browser_graphql_post", return_value=(400, "synthetic_private_value", body, {"private": "synthetic_private_value"}, 0)) as post, patch.object(runner, "load_table") as load, redirect_stdout(io.StringIO()) as console:
             root = Path(directory)
             runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
             self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume", str(root)]), 1)
@@ -850,7 +836,7 @@ class ApiFlowTests(unittest.TestCase):
             runner.write_json(root / "dryer_manifest.json", {"collector_version":runner.COLLECTOR_VERSION, "main_limit":20, "bsr_limit":10, "batch_id":"b_existing"})
             def captures(_, targets):
                 return {t["sku_id"]: {"collector_version":runner.COLLECTOR_VERSION, "product":api_product(t["sku_id"]), "captured_at":"2026-10-08T10:00:00"} for t in targets}, {}
-            with patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as fetch, patch.object(runner, "load_test_table", return_value=25) as load, redirect_stdout(io.StringIO()):
+            with patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, bsr]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "collect_product_batch", side_effect=captures) as fetch, patch.object(runner, "load_table", return_value=25) as load, redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(["--main-limit","20","--bsr-limit","10","--resume", str(root)]), 0)
             result = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual((result["main_target_count"], result["bsr_target_count"], result["overlap_count"], result["collected_count"]), (20, 10, 5, 25))
@@ -1008,7 +994,7 @@ class ApiFlowTests(unittest.TestCase):
     def test_http429_details_stop_without_later_batches_or_db_load(self):
         import json
         main = [list_row(i, i) for i in range(1, 13)]
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, []]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(runner, "collect_listing", side_effect=[main, []]), patch.object(runner, "connect_db", return_value=FakeConnection(FakeCursor())), patch.object(runner, "api_post", return_value=(429, {})) as post, patch.object(ldy, "detail_retry_sleep_seconds", return_value=0), patch.object(runner, "load_table") as load, redirect_stdout(io.StringIO()):
             root = Path(directory)
             with diagnostics.run_logging(root) as logger:
                 self.assertEqual(runner.run(runner.parse_args([]), root, logger), 1)

@@ -151,7 +151,7 @@ class SelectionFlowTests(unittest.TestCase):
                 runner.collect_listing(self.runtime, Path(directory), "main", 5, 3)
 
     def test_selection_http429_stops_before_bsr_and_db(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, self.graph([1], {1: None})), (429, {})]) as post, patch.object(runner, "load_test_table") as load, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "load_runtime", return_value=self.runtime), patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, self.graph([1], {1: None})), (429, {})]) as post, patch.object(runner, "load_table") as load, redirect_stdout(io.StringIO()):
             root = Path(directory)
             with runner.run_logging(root) as logger:
                 self.assertEqual(runner.run(runner.parse_args(["--no-load"]), root, logger), 1)
