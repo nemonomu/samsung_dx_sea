@@ -11,10 +11,12 @@ from decimal import Decimal
 from pathlib import Path
 
 from .step00_collection_recovery import MAX_ITEM_ATTEMPTS
-from .step00_dryer import FIELDS, TEST_TABLE, make_listing_row, make_row, merge_targets, primary_url, public_product
+from .step00_dryer import (FIELDS, TEST_TABLE, make_listing_row, make_row, merge_targets,
+                          ordered_listing_rows, primary_url, product_selection, public_product)
 from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
 
-COLLECTOR_VERSION = 4
+COLLECTOR_VERSION = 6
+FILTER_POLICY = "laundry_exclusions_v1"
 QUERY = """query DryerDetail($skuId:String!$productPriceInput:ProductItemPriceInput!){productBySkuId(skuId:$skuId){
 skuId bsin name{short}description{short long}features{description title}manufacturer{modelNumber}url{pdp}
 reviewInfo{averageRating reviewCount}specificationGroups{specifications{displayName value}}
@@ -109,24 +111,60 @@ def listing_target(row, helpers):
     return target
 
 
-def collect_listing(runtime, run_dir, kind, max_pages, limit):
+def collect_listing(runtime, run_dir, kind, max_pages, limit, batch_id="b_selection", batch_size=5, detail_state=None):
     _, listing, helpers = runtime
     from .step00_collection_recovery import MAX_LISTING_PASSES
     from .step01_listing_recovery import validate_page
+    from .step07_final_targets import remember_row, row_seen
+    detail_state = {} if detail_state is None else detail_state
+    decisions = detail_state.setdefault("selection_decisions", {})
     cache = run_dir / f"{kind}_listing.json"
     if cache.exists():
         saved = json.loads(cache.read_text(encoding="utf-8"))
         if (saved.get("collector_version") == COLLECTOR_VERSION and saved.get("limit") == limit
+                and saved.get("filter_policy") == FILTER_POLICY
                 and (saved.get("complete") or saved.get("limit_reached"))):
-            event("listing_cache_reused", listing=kind, pages=saved.get("pages", 0), cached_rows=len(saved["rows"]))
-            return saved["rows"]
+            ranked = merge_targets(saved["rows"], []) if kind == "main" else merge_targets([], saved["rows"])
+            if all(row.get("selection_action") in {"keep", "uncertain"} for row in saved["rows"]) and (
+                    saved.get("complete") or limit > 0 and len(ranked) >= limit):
+                event("listing_cache_reused", listing=kind, pages=saved.get("pages", 0), cached_rows=len(ranked))
+                return saved["rows"]
     operation = listing.load_product_list_operation("PlpView_ProductList_Init")
     original_sort = listing.SEARCH_SORT
     listing.SEARCH_SORT = "Best-Selling" if kind == "bsr" else ""
     try:
         # Like LDY, discard a failed pass and restart at page one. Never splice list orders.
         for pass_number in range(1, MAX_LISTING_PASSES + 1):
-            rows, seen_organic = [], set()
+            rows, seen_organic, seen_candidates, audit = [], set(), set(), []
+
+            def record(target, decision):
+                entry = {"listing": kind, "sku_id": str(target.get("sku_id") or ""),
+                         "item": target.get("bsin") or target.get("item") or "",
+                         "product_name": target.get("product_name") or target.get("retailer_sku_name") or "",
+                         "product_url": target.get("product_url") or "", "page": target.get("page"),
+                         "raw_visual_rank": target.get("global_visual_rank"),
+                         "raw_organic_rank": target.get("global_organic_rank"), **decision}
+                audit.append(entry)
+                event("selection_decision", listing=kind, sku_id=entry["sku_id"], page=entry["page"],
+                      action=decision["action"], reason=decision["reason"], source=decision["source"])
+
+            def save(page, complete=False, reached=False, failure_reason=""):
+                excluded = [entry for entry in audit if entry["action"] == "exclude"]
+                reasons = {reason: sum(entry["reason"] == reason for entry in excluded)
+                           for reason in sorted({entry["reason"] for entry in excluded})}
+                summary = {"examined_count": len(audit), "selected_count": len(rows),
+                           "excluded_count": len(excluded), "excluded_reasons": reasons,
+                           "duplicate_count": sum(entry["action"] == "duplicate" for entry in audit),
+                           "uncertain_retained_count": sum(row["selection_action"] == "uncertain" for row in rows),
+                           "shortfall": max(0, limit - len(rows)) if limit else 0}
+                write_json(run_dir / f"{kind}_selection.json", {"collector_version": COLLECTOR_VERSION,
+                    "filter_policy": FILTER_POLICY, "listing": kind, "pass_number": pass_number,
+                    "complete": complete, "limit_reached": reached, "summary": summary, "decisions": audit})
+                write_json(cache, {"collector_version": COLLECTOR_VERSION, "filter_policy": FILTER_POLICY,
+                    "limit": limit, "rows": rows if not failure_reason else [], "pages": page,
+                    "complete": complete, "limit_reached": reached, "pass_number": pass_number,
+                    "failure_reason": failure_reason, "selection_summary": summary})
+                return summary
             event("listing_pass_start", listing=kind, attempt=pass_number, max_attempts=MAX_LISTING_PASSES,
                   sort="Best-Selling" if kind == "bsr" else "default", target_limit=limit or None)
             for page in range(1, max_pages + 1):
@@ -146,9 +184,7 @@ def collect_listing(runtime, run_dir, kind, max_pages, limit):
                 if not ok:
                     event("listing_page_failed", listing=kind, page=page, attempt=pass_number,
                           http_status=status, reason=reason, parsed_rows=len(parsed))
-                    write_json(cache, {"collector_version": COLLECTOR_VERSION, "limit": limit,
-                        "rows": [], "pages": page, "complete": False, "limit_reached": False,
-                        "pass_number": pass_number, "failure_reason": reason})
+                    save(page, failure_reason=reason)
                     if pass_number == MAX_LISTING_PASSES:
                         raise DryerError(f"{kind}_{reason}_page_{page}")
                     delay = listing.listing_retry_delay(pass_number)
@@ -158,22 +194,68 @@ def collect_listing(runtime, run_dir, kind, max_pages, limit):
                         time.sleep(delay)
                     break
                 seen_organic.update(organic)
-                # Keep public target data and original positions; no raw request/response logs.
-                rows.extend(listing_target(row, helpers) for row in parsed)
-                selected = merge_targets(rows, []) if kind == "main" else merge_targets([], rows)
-                ranked_count = len(selected) if kind == "main" else len(seen_organic)
-                reached = limit > 0 and ranked_count >= limit
-                write_json(cache, {"collector_version": COLLECTOR_VERSION, "limit": limit,
-                    "rows": rows, "pages": page, "complete": empty, "limit_reached": reached,
-                    "pass_number": pass_number})
-                progress(kind + "_list", min(ranked_count, limit) if limit else ranked_count, limit,
-                         page=page, parsed_rows=len(parsed), candidate_count=len(selected), complete=empty)
+                candidates = []
+                for raw in ordered_listing_rows(parsed, kind):
+                    target = listing_target(raw, helpers)
+                    if not target["sku_id"]:
+                        continue
+                    if row_seen(target, seen_candidates):
+                        record(target, {"action": "duplicate", "reason": "same_product", "source": "listing_identity"})
+                        continue
+                    remember_row(target, seen_candidates)
+                    key = (str(target["sku_id"]), str(target.get("bsin") or target.get("item") or "").casefold())
+                    decision = product_selection(target)
+                    previous_decision = decisions.get(key)
+                    if previous_decision and (previous_decision["action"] != "uncertain" or decision["action"] == "uncertain"):
+                        decision = previous_decision
+                    if decision["action"] == "exclude":
+                        decisions[key] = decision
+                        record(target, decision)
+                    else:
+                        candidates.append((target, key, decision))
+                start = 0
+                while start < len(candidates) and (not limit or len(rows) < limit):
+                    size = min(batch_size, limit - len(rows)) if limit else batch_size
+                    chunk = candidates[start:start + size]
+                    start += len(chunk)
+                    uncertain = [target for target, key, decision in chunk
+                                 if decision["action"] == "uncertain" and key not in decisions]
+                    if uncertain:
+                        event("selection_detail_start", listing=kind, page=page, sku_ids=[t["sku_id"] for t in uncertain])
+                        with phase("selection_detail", listing=kind, page=page, operations=len(uncertain)):
+                            collect_details(runtime, run_dir, uncertain, batch_id, batch_size, detail_state,
+                                            progress_stage="selection_detail")
+                        if detail_state.get("stopped_reason"):
+                            save(page, failure_reason=detail_state["stopped_reason"])
+                            raise DryerError(detail_state["stopped_reason"])
+                    for target, key, decision in chunk:
+                        if decision["action"] == "uncertain" and key not in decisions:
+                            capture = detail_state.get("captures", {}).get(str(target["sku_id"]))
+                            decision = product_selection(target, capture["product"]) if capture else {
+                                "action": "uncertain", "reason": "detail_unavailable", "source": "detail_api"}
+                        decisions[key] = decision
+                        record(target, decision)
+                        if decision["action"] != "exclude":
+                            rows.append(dict(target, selection_action=decision["action"],
+                                             selection_reason=decision["reason"], selection_source=decision["source"]))
+                reached = limit > 0 and len(rows) >= limit
+                summary = save(page, complete=empty, reached=reached)
+                progress(kind + "_list", len(rows), limit, page=page, parsed_rows=len(parsed),
+                         candidate_count=len(rows), excluded_count=summary["excluded_count"],
+                         duplicate_count=summary["duplicate_count"],
+                         uncertain_retained_count=summary["uncertain_retained_count"], complete=empty)
                 if reached or empty:
+                    event("listing_selection_complete", listing=kind, pages=page,
+                          stop_reason="target_reached" if reached else "products_exhausted", **summary)
+                    if empty and limit and len(rows) < limit:
+                        event("listing_shortfall", listing=kind, requested=limit, collected=len(rows),
+                              shortfall=limit - len(rows), reason="products_exhausted")
                     return rows
                 if listing.LISTING_PAGE_SLEEP_SECONDS:
                     with phase("listing_page_wait", listing=kind, sleep_s=listing.LISTING_PAGE_SLEEP_SECONDS):
                         time.sleep(listing.LISTING_PAGE_SLEEP_SECONDS)
             else:
+                save(max_pages, failure_reason="max_pages_reached")
                 raise DryerError(f"{kind}_max_pages_reached_collection_incomplete")
     finally:
         listing.SEARCH_SORT = original_sort
@@ -232,12 +314,15 @@ def collect_product_batch(runtime, targets):
     return captures, errors
 
 
-def collect_details(runtime, run_dir, targets, batch_id, batch_size):
+def collect_details(runtime, run_dir, targets, batch_id, batch_size, detail_state=None, progress_stage="detail"):
     _, _, helpers = runtime
+    detail_state = {} if detail_state is None else detail_state
+    reusable = detail_state.setdefault("captures", {})
+    previous_failures = detail_state.setdefault("failures", {})
     successes, failures = {}, {}
     pending = []
 
-    def accept(target, capture):
+    def accept(target, capture, save_capture=True):
         sku_id = str(target["sku_id"])
         if capture.get("collector_version") != COLLECTOR_VERSION:
             raise DryerError("capture_version_mismatch")
@@ -245,32 +330,46 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
             raise DryerError("detail_attribute_response_incomplete")
         timestamp = datetime.fromisoformat(capture["captured_at"])
         row, evidence = make_row(target, capture["product"], helpers, batch_id, timestamp)
-        write_json(run_dir / "products" / f"{sku_id}.json", capture)
+        if save_capture:
+            write_json(run_dir / "products" / f"{sku_id}.json", capture)
+        reusable[sku_id] = capture
         successes[sku_id] = (row, evidence)
         failures.pop(sku_id, None)
-        progress("detail", len(successes), len(targets), sku_id=sku_id,
+        previous_failures.pop(sku_id, None)
+        progress(progress_stage, len(successes), len(targets), sku_id=sku_id,
                  failure_count=len(failures), pending_count=len(targets) - len(successes), status="success")
         for field, source in (("loading_type", evidence.get("source")), ("capacity", evidence.get("capacity_source"))):
             if row[field] in ("", None):
                 event("attribute_missing", sku_id=sku_id, field=field, reason=source or "not_stated")
 
     for target in targets:
+        sku_id = str(target["sku_id"])
         cache = run_dir / "products" / f"{target['sku_id']}.json"
-        if cache.exists():
+        if sku_id in reusable or cache.exists():
             try:
-                accept(target, json.loads(cache.read_text(encoding="utf-8")))
-                event("detail_cache_reused", sku_id=str(target["sku_id"]))
+                capture = reusable.get(sku_id) or json.loads(cache.read_text(encoding="utf-8"))
+                accept(target, capture, save_capture=False)
+                event("detail_cache_reused", sku_id=sku_id)
                 continue
             except Exception as exc:
-                event("detail_cache_rejected", sku_id=str(target["sku_id"]), reason=safe_reason(exc), **error_diagnostic(exc))
+                reusable.pop(sku_id, None)
+                event("detail_cache_rejected", sku_id=sku_id, reason=safe_reason(exc), **error_diagnostic(exc))
+        if sku_id in previous_failures:
+            failures[sku_id] = previous_failures[sku_id]
+            if failures[sku_id].get("retry_exhausted"):
+                event("detail_failure_reused", sku_id=sku_id, reason=failures[sku_id]["reason"])
+                continue
         pending.append(target)
-    stopped = False
+    stopped = bool(detail_state.get("stopped_reason"))
     for start in range(0, len(pending), batch_size):
+        if stopped:
+            break
         remaining = pending[start:start + batch_size]
         for attempt in range(1, MAX_ITEM_ATTEMPTS + 1):
             batch_error = ""
             diagnostics = {}
             event("detail_batch_start", batch=start // batch_size + 1, attempt=attempt,
+                  purpose=progress_stage,
                   max_attempts=MAX_ITEM_ATTEMPTS, sku_ids=[str(t["sku_id"]) for t in remaining],
                   collected_count=len(successes), target_count=len(targets))
             try:
@@ -295,6 +394,7 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                 failures[sku_id] = {"sku_id": sku_id, "stage": "detail", "reason": errors.get(sku_id, "detail_missing_response"),
                     "attempt": attempt, "max_attempts": MAX_ITEM_ATTEMPTS, "retry_exhausted": False,
                     "failed_at": datetime.now().isoformat(timespec="seconds"), **sku_diagnostics}
+                previous_failures[sku_id] = failures[sku_id]
                 event("detail_failed", **failures[sku_id])
                 retry.append(target)
             remaining = retry
@@ -302,6 +402,7 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
                 break
             if batch_error in {"browser_api_unavailable", "http_400", "http_401", "http_402", "http_403", "http_404", "http_429"}:
                 stopped = True
+                detail_state["stopped_reason"] = batch_error
                 event("detail_stopped", reason=batch_error, collected_count=len(successes), failure_count=len(failures),
                       unattempted_count=len(targets) - len(successes) - len(failures))
                 break
@@ -328,7 +429,7 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size):
             fallback_count += 1
             event("detail_listing_row_retained", sku_id=sku_id, reason=failure["reason"],
                   attempt=failure["attempt"], null_fields=[field for field in FIELDS if field != "id" and row[field] in (None, "")])
-            progress("detail", len(successes) + fallback_count, len(targets), sku_id=sku_id,
+            progress(progress_stage, len(successes) + fallback_count, len(targets), sku_id=sku_id,
                      collected_count=len(successes), failure_count=len(failures), fallback_count=fallback_count,
                      pending_count=len(targets) - len(successes) - fallback_count, status="warning")
     return [row for row, _ in ordered], [e for _, e in ordered], list(failures.values())
@@ -420,8 +521,8 @@ def load_test_table(config, rows, batch_id):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DRYER API only; public.ldy_dryer_retail_test only")
-    parser.add_argument("--main-limit", type=int, default=300, help="search results from default sort; 0=all")
-    parser.add_argument("--bsr-limit", type=int, default=100, help="search results within Best-Selling ranks; 0=all")
+    parser.add_argument("--main-limit", type=int, default=300, help="retained products after exclusion in default sort; 0=all")
+    parser.add_argument("--bsr-limit", type=int, default=100, help="retained products after exclusion in Best-Selling sort; 0=all")
     parser.add_argument("--detail-batch-size", type=int, default=5, help="SKUs per browser API batch")
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--resume", type=Path, help="reuse captures and batch id from the same API run")
@@ -451,6 +552,7 @@ def run(args, run_dir, logger):
     manifest_path = run_dir / "dryer_manifest.json"
     manifest = {"collector_version": COLLECTOR_VERSION, "category": "DRYER", "table": "public." + TEST_TABLE,
         "search_term": "DRYER", "main_limit": args.main_limit, "bsr_limit": args.bsr_limit,
+        "filter_policy": FILTER_POLICY, "rank_mode": "filtered_products",
         "transport": "browser_graphql", "detail_batch_size": args.detail_batch_size,
         "status": "started", "db_loaded": False}
     has_previous = manifest_path.is_file()
@@ -496,11 +598,14 @@ def run(args, run_dir, logger):
                     connection.close()
         else:
             event("db_preflight_skipped", reason="no_load")
+        detail_state = {}
         with phase("main_listing", target_limit=args.main_limit or None):
-            main_rows = collect_listing(runtime, run_dir, "main", args.max_pages, args.main_limit)
+            main_rows = collect_listing(runtime, run_dir, "main", args.max_pages, args.main_limit,
+                                        batch_id, args.detail_batch_size, detail_state)
         logger.clear_failure()
         with phase("bsr_listing", target_limit=args.bsr_limit or None):
-            bsr_rows = collect_listing(runtime, run_dir, "bsr", args.max_pages, args.bsr_limit)
+            bsr_rows = collect_listing(runtime, run_dir, "bsr", args.max_pages, args.bsr_limit,
+                                       batch_id, args.detail_batch_size, detail_state)
         logger.clear_failure()
         main_count = len(merge_targets(main_rows, [], args.main_limit, 0))
         bsr_count = len(merge_targets([], bsr_rows, 0, args.bsr_limit))
@@ -509,12 +614,19 @@ def run(args, run_dir, logger):
             raise DryerError("no_search_targets")
         manifest.update(main_target_count=main_count, bsr_target_count=bsr_count,
             overlap_count=main_count + bsr_count - len(targets), target_count=len(targets))
+        selection_audits = {}
+        for kind in ("main", "bsr"):
+            audit_file = run_dir / f"{kind}_selection.json"
+            if audit_file.exists():
+                selection_audits[kind] = json.loads(audit_file.read_text(encoding="utf-8"))
+        manifest["selection_summaries"] = {kind: audit["summary"] for kind, audit in selection_audits.items()}
+        write_json(run_dir / "output" / "selection_audit.json", selection_audits)
         write_json(run_dir / "targets.json", targets)
         write_json(manifest_path, manifest)
         event("targets_ready", main_count=main_count, bsr_count=bsr_count, overlap_count=manifest["overlap_count"],
               target_count=len(targets))
         with phase("detail_collection", target_count=len(targets)):
-            output, evidence, failures = collect_details(runtime, run_dir, targets, batch_id, args.detail_batch_size)
+            output, evidence, failures = collect_details(runtime, run_dir, targets, batch_id, args.detail_batch_size, detail_state)
         fallback_count = sum(entry.get("detail_status") == "failed" for entry in evidence)
         collected_count = len(output) - fallback_count
         unattempted_count = len(targets) - collected_count - len(failures)

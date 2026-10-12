@@ -71,6 +71,98 @@ def owned_description_texts(product):
         yield from feature_strings(product.get(key))
 
 
+def classify_product_name(value):
+    """Exclude only a clearly named non-target; keep laundry combinations."""
+    name = text(value)
+    normalized = re.sub(r"[\u2010-\u2015]", "-", name).casefold()
+
+    def decision(action, reason):
+        return {"action": action, "reason": reason, "source": "product_name", "evidence": name[:300]}
+
+    # The accessory must be the item being sold, not something included with it.
+    accessory = re.search(
+        r"\b(?:laundry\s+)?pedestals?\b|\b(?:stacking|stack\s+bracket|recess)\s+kits?\b|"
+        r"\bwall\s+guards?\b|\b(?:dryer|drying)\s+(?:racks?|lint\s+filters?|drum\s+belts?|"
+        r"vent\s+(?:kits?|hoses?)|power\s+cords?)\b", normalized)
+    if accessory:
+        prefix = normalized[:accessory.start()]
+        appliance = re.search(r"\b(?:dryers?|washers?|wash\s*tower|laundry\s+(?:tower|center)|drying\s+(?:machine|cabinet))\b", prefix)
+        included = re.search(r"\b(?:with|includes?|including|featuring)\b", prefix)
+        bundle = (re.search(r"\b(?:and|plus)\b|&", prefix) and re.search(
+            r"\b(?:electric|gas|clothes|tumble)\b.*\bdryer\b|\bwash\s*tower\b|\blaundry\s+(?:tower|center)\b", prefix))
+        included_with_appliance = appliance and (included or bundle)
+        if not included_with_appliance:
+            return decision("exclude", "accessory")
+    non_laundry = re.search(r"\b(?:hand|hair)\s*-?\s*dryers?\b", normalized)
+    if non_laundry:
+        prefix = normalized[:non_laundry.start()]
+        if not (re.search(r"\b(?:clothes|laundry|electric|gas)\b.*\bdryer\b", prefix)
+                and re.search(r"\b(?:with|includes?|including|and|plus)\b", prefix)):
+            return decision("exclude", "non_laundry_dryer")
+    dryer = re.search(r"\bdryers?\b|\bdrying\s+(?:machine|cabinet)\b|\bwash\s*tower\b", normalized)
+    if dryer:
+        if (re.search(r"\b(?:electric|gas|clothes|laundry|tumble|condensation|heat\s*pump|vented|ventless)\b", normalized)
+                or re.search(r"\b(?:wash\s*tower|laundry\s+(?:tower|center)|drying\s+(?:machine|cabinet))\b", normalized)):
+            return decision("keep", "laundry_drying")
+        return decision("uncertain", "unclassified_product")
+    if re.search(r"\bwashers?\b|\bwashing\s+machines?\b", normalized):
+        if re.search(r"\b(?:dry|drying|combo)\b|\ball[- ]in[- ]one\b", normalized):
+            return decision("uncertain", "possible_laundry_drying")
+        return decision("exclude", "washer_only")
+    return decision("uncertain", "unclassified_product")
+
+
+def product_selection(target, product=None):
+    """Use only the product's own API data, never matching/related items."""
+    if product is None:
+        return classify_product_name(target.get("product_name") or target.get("retailer_sku_name"))
+    name = text((product.get("name") or {}).get("short"))
+    result = classify_product_name(name)
+    result["source"] = "detail_product_name"
+    if result["action"] != "uncertain" or result["reason"] == "possible_laundry_drying":
+        return result
+    specs = [spec for group in product.get("specificationGroups") or []
+             for spec in group.get("specifications") or []]
+    spec_decisions = []
+    for spec in specs:
+        label = text(spec.get("displayName")).casefold()
+        if label in {"product name", "product type", "appliance type"}:
+            result = classify_product_name(spec.get("value"))
+            result["source"] = "own_specifications"
+            if result["action"] != "uncertain":
+                spec_decisions.append(result)
+    # Matching Washer Type/Model is deliberately not evidence of a washer item.
+    if any(text(s.get("value")) and text(s.get("displayName")).casefold() in
+           {"dryer heating source", "dryer capacity", "washer/dryer combo type"} for s in specs):
+        spec_decisions.append({"action": "keep", "reason": "laundry_drying", "source": "own_specifications"})
+    if spec_decisions:
+        if len({d["action"] for d in spec_decisions}) == 1:
+            return spec_decisions[0]
+        return {"action": "uncertain", "reason": "conflicting_product_type", "source": "own_specifications"}
+    for entry in owned_description_texts(product):
+        # Only an opening statement identifying this product can exclude it.
+        opening = re.split(r"[.!?]\s+", entry, maxsplit=1)[0][:300]
+        if (re.match(r"^(?:this|our)\b", opening, re.I)
+                and not re.search(r"\b(?:matching|compatible)\b|\bpair\s+with\b|\bfor\s+use\s+with\b", opening, re.I)):
+            result = classify_product_name(opening)
+            result["source"] = "own_description"
+            if result["action"] != "uncertain":
+                return result
+    return {"action": "uncertain", "reason": "unclassified_product", "source": "detail_api",
+            "evidence": name[:300]}
+
+
+def ordered_listing_rows(rows, kind):
+    """Preserve each search order and the existing LDY container policy."""
+    from . import step07_final_targets as legacy
+    allowed = {"organic_product", "sponsored_ingrid"} if kind == "main" else {"organic_product"}
+    rows = [row for row in rows if row.get("container_type", "organic_product" if kind == "main" else "") in allowed]
+    if kind == "main":
+        return sorted(rows, key=lambda row: (legacy.int_value(row.get("global_visual_rank")),
+            legacy.int_value(row.get("page")), legacy.int_value(row.get("visual_rank"))))
+    return sorted(rows, key=lambda row: legacy.int_value(row.get("global_organic_rank") or row.get("visual_rank")))
+
+
 def loading_type(product, feature_texts=()):
     values = []
     for group in product.get("specificationGroups") or []:
@@ -115,29 +207,21 @@ def loading_type(product, feature_texts=()):
 
 
 def merge_targets(main_rows, bsr_rows, main_limit=0, bsr_limit=0):
-    """Reuse LDY search-result identity/rank rules without product-type filtering."""
+    """Rank accepted products without gaps; retain LDY cross-list identity merge."""
     from . import step07_final_targets as legacy
-    containers = {"organic_product", "sponsored_ingrid"}
-    ranked_main = legacy.unique_main_rows([row for row in main_rows
-        if row.get("container_type", "organic_product") in containers])
+    ranked_main = legacy.unique_main_rows(ordered_listing_rows(main_rows, "main"))
     selected_main = ranked_main
     if main_limit:
         selected_main = selected_main[:main_limit]
 
-    selected_bsr, seen_skus, seen_items = [], set(), set()
-    organic = sorted((row for row in bsr_rows if row.get("container_type") == "organic_product"),
-        key=lambda row: legacy.int_value(row.get("global_organic_rank") or row.get("visual_rank")))
-    for row in organic:
+    selected_bsr, seen_items = [], set()
+    for row in ordered_listing_rows(bsr_rows, "bsr"):
         sku_id = str(row.get("sku_id") or "").strip()
-        if not sku_id or sku_id in seen_skus:
+        if not sku_id or legacy.row_seen(row, seen_items):
             continue
-        seen_skus.add(sku_id)
-        rank = len(seen_skus)
-        if bsr_limit and rank > bsr_limit:
+        if bsr_limit and len(selected_bsr) >= bsr_limit:
             break
-        if legacy.row_seen(row, seen_items):
-            continue
-        selected_bsr.append(dict(row, bsr_rank=rank))
+        selected_bsr.append(dict(row, bsr_rank=len(selected_bsr) + 1))
         legacy.remember_row(row, seen_items)
 
     bsr_by_sku = {str(row["sku_id"]): row for row in selected_bsr}

@@ -278,16 +278,16 @@ class ExtractionTests(unittest.TestCase):
 
 
 class ListingTests(unittest.TestCase):
-    def test_search_results_are_kept_without_product_type_filter(self):
-        titles = ("Electric Dryer", "Dryer Lint Filter Replacement", "Dryer Drum Belt Replacement",
-                  "Clothes Drying Rack", "Hair Dryer", "Washer and Dryer Combo", "Washer")
+    def test_merge_preserves_preselected_laundry_and_uncertain_products(self):
+        titles = ("Electric Dryer", "Gas Dryer", "Drying Cabinet", "WashTower",
+                  "Unknown Appliance", "Washer and Dryer Combo", "Compact Drying Machine")
         main = [dict(list_row(index, index), product_name=title) for index, title in enumerate(titles, 1)]
         rows = rules.merge_targets(main, main, len(main), len(main))
         self.assertEqual([row["product_name"] for row in rows], list(titles))
         self.assertEqual([row["bsr_rank"] for row in rows], list(range(1, len(main) + 1)))
 
     def test_keyword_ranks_and_duplicates_follow_search_results(self):
-        main = [{"sku_id":"1","product_name":"Washer","container_type":"organic_product"},
+        main = [{"sku_id":"1","product_name":"Washer and Dryer Combo","container_type":"organic_product"},
                 {"sku_id":"2","product_name":"Electric Dryer","container_type":"sponsored_ingrid"},
                 {"sku_id":"2","product_name":"Electric Dryer","container_type":"organic_product"},
                 {"sku_id":"3","product_name":"Gas Dryer","container_type":"organic_product"}]
@@ -295,11 +295,11 @@ class ListingTests(unittest.TestCase):
         rows = rules.merge_targets(main,bsr)
         self.assertEqual([(r["sku_id"],r["main_rank"],r["bsr_rank"]) for r in rows],[("1",1,2),("2",2,3),("3",3,1)])
 
-    def test_bsr_rank_limit_does_not_refill_duplicate_items(self):
+    def test_bsr_rank_limit_refills_duplicate_items_without_rank_gaps(self):
         bsr = [list_row(i, i) for i in range(1, 4)]
         bsr[1]["bsin"] = bsr[0]["bsin"]
         rows = rules.merge_targets([], bsr, 0, 2)
-        self.assertEqual([(row["sku_id"], row["bsr_rank"]) for row in rows], [("1", 1)])
+        self.assertEqual([(row["sku_id"], row["bsr_rank"]) for row in rows], [("1", 1), ("3", 2)])
 
     def test_reuses_existing_api_parser(self):
         rows = listing.parse_page_rows(1, api_graph([6471411]))
@@ -561,23 +561,23 @@ class ApiFlowTests(unittest.TestCase):
     def test_listing_preserves_own_model_price_and_review_without_extra_requests(self):
         graph = api_graph([1, 2])
         graph["data"]["detailedProductSearch"]["documents"][0]["product"]["name"]["short"] = "Dryer Lint Filter Replacement"
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, graph), (200, api_graph([3]))]) as post, redirect_stdout(io.StringIO()):
             rows = runner.collect_listing(self.runtime, Path(directory), "main", 5, 2)
-        post.assert_called_once()
+        self.assertEqual(post.call_count, 2)
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["product_name"], "Dryer Lint Filter Replacement")
+        self.assertEqual([row["sku_id"] for row in rows], ["2", "3"])
         self.assertEqual(rows[0]["model_number"], "ELFE7637AT")
         self.assertEqual(rows[0]["customer_price"], 999.99)
         self.assertEqual(rows[0]["review_count"], 152)
         self.assertNotIn("raw_product_json", rows[0])
 
-    def test_bsr_listing_stops_at_rank_limit_even_with_duplicate_item(self):
+    def test_bsr_listing_fetches_next_page_to_replace_duplicate_item(self):
         graph = api_graph([1, 2])
         graph["data"]["detailedProductSearch"]["documents"][1]["product"]["bsin"] = "ITEM1"
-        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", return_value=(200, graph)) as post, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, graph), (200, api_graph([3]))]) as post, redirect_stdout(io.StringIO()):
             rows = runner.collect_listing(self.runtime, Path(directory), "bsr", 5, 2)
-        post.assert_called_once()
-        self.assertEqual(len(rules.merge_targets([], rows, 0, 2)), 1)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([(r["sku_id"], r["bsr_rank"]) for r in rules.merge_targets([], rows, 0, 2)], [("1", 1), ("3", 2)])
 
     def test_full_listing_requires_verified_empty_api_page(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(listing, "load_product_list_operation", return_value=self.operation), patch.object(runner, "api_post", side_effect=[(200, api_graph([1, 2])), (200, api_graph([]))]) as post, redirect_stdout(io.StringIO()):
@@ -727,7 +727,7 @@ class ApiFlowTests(unittest.TestCase):
             manifest = json.loads((root / "dryer_manifest.json").read_text(encoding="utf-8"))
             events = [json.loads(line) for line in (root / "logs/dryer_events.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual((manifest["main_target_count"], manifest["bsr_target_count"], manifest["overlap_count"], manifest["collected_count"]), (300, 100, 50, 350))
-            self.assertEqual([call.args[-1] for call in lists.call_args_list], [300, 100])
+            self.assertEqual([call.args[4] for call in lists.call_args_list], [300, 100])
             self.assertEqual(len(fetched), len(set(fetched)))
             self.assertEqual(detail.call_count, 70)
             complete = next(event for event in events if event["event"] == "run_complete")
