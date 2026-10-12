@@ -163,46 +163,90 @@ def ordered_listing_rows(rows, kind):
     return sorted(rows, key=lambda row: legacy.int_value(row.get("global_organic_rank") or row.get("visual_rank")))
 
 
+def _loading_matches(value, own_dryer, separate_units=False):
+    """Resolve each load phrase locally, without borrowing a washer's attribute."""
+    value = re.sub(r"[\u2010-\u2015]", "-", text(value))
+    matches = {}
+    for sentence in re.split(r"[.!?;]\s+", value):
+        for match in re.finditer(r"\b(front|top)[ -]*load(?:ing)?\b", sentence, re.I):
+            before, after = sentence[:match.start()], sentence[match.end():]
+            # Reject a referenced appliance, not an entire sentence mentioning one.
+            if re.search(r"\b(?:matching|compatible|pairs?\s+with|for\s+use\s+with)\b[^.!?;]{0,60}$", before, re.I):
+                continue
+            joint = re.match(r"\s+washers?\s*(?:and|&|/|\+)\s*dryers?\b", after, re.I)
+            following = re.match(r"(?:(?!\b(?:washers?|washing\s+machines?)\b)[^.!?;]){0,70}\bdryers?\b", after, re.I)
+            preceding = re.search(r"\bdryers?\b(?:(?!\b(?:washers?|washing\s+machines?)\b)[^.!?;]){0,70}$", before, re.I)
+            owners = list(re.finditer(r"\b(?:washers?|washing\s+machines?|dryers?)\b", before[-70:], re.I))
+            washer_owner = owners and not re.fullmatch(r"dryers?", owners[-1].group(), re.I)
+            structure = re.match(
+                r"\s+(?:design|(?:transparent\s+)?(?:lid|door)|(?:laundry\s+)?pair|machine|"
+                r"all[- ]in[- ]one\s+(?:units?|machines?))\b", after, re.I)
+            design = own_dryer and not washer_owner and structure
+            if separate_units and structure and not re.fullmatch(r"\s+(?:laundry\s+)?pair", structure.group(), re.I):
+                # An unqualified machine/lid on a two-unit tower may be its washer.
+                design = None
+            if washer_owner and structure:
+                following = None
+            next_owner = re.search(r"\b(?:washers?|washing\s+machines?|dryers?)\b", after[:70], re.I)
+            if next_owner and not re.fullmatch(r"dryers?", next_owner.group(), re.I) and not joint:
+                # A dryer elsewhere in the sentence cannot make "top load washer"
+                # a dryer attribute. A later compatibility clause may follow its lid.
+                compatibility = design and re.search(r"\b(?:pairs?|matches|compatible|compatibility)\b",
+                                                      after[design.end():next_owner.start()], re.I)
+                preceding = None
+                if not compatibility:
+                    design = None
+            if joint or following or preceding or design:
+                rule = "joint_washer_dryer" if joint else "own_dryer_phrase" if following or preceding else "own_unit_design"
+                matches.setdefault(match.group(1).lower(), {"evidence": sentence[:300], "rule": rule})
+    return matches
+
+
 def loading_type(product, feature_texts=()):
+    specs = [spec for group in product.get("specificationGroups") or []
+             for spec in group.get("specifications") or []]
     values = []
-    for group in product.get("specificationGroups") or []:
-        for spec in group.get("specifications") or []:
-            label = text(spec.get("displayName")).casefold()
-            if label in {"dryer load type", "dryer loading type", "load type", "loading type"}:
-                value = text(spec.get("value"))
-                if value:
-                    values.append(value)
+    for spec in specs:
+        label = text(spec.get("displayName")).casefold()
+        if label in {"dryer load type", "dryer loading type", "load type", "loading type"}:
+            value = text(spec.get("value"))
+            if value:
+                values.append(value)
     if values:
         if len({v.casefold() for v in values}) == 1:
             return values[0], {"source": "specifications", "evidence": values[0]}
         return "", {"source": "conflicting_specifications"}
 
+    name = text((product.get("name") or {}).get("short"))
+    labels = {text(spec.get("displayName")).casefold() for spec in specs if text(spec.get("value"))}
+    own_dryer = bool(re.search(r"\bdryers?\b|\bdrying\s+(?:machine|cabinet)\b|\bwash\s*tower\b", name, re.I)) or any(
+        label in {"dryer capacity", "dryer heating source"} for label in labels)
+    separate_units = {"washer capacity", "dryer capacity"} <= labels or bool(
+        re.search(r"\bwash\s*tower\b|\blaundry\s+(?:tower|center)\b", name, re.I))
+    description = product.get("description") or {}
+    entries = [("description." + key, description[key]) for key in ("short", "long")
+               if isinstance(description, dict) and description.get(key)]
+    for field in ("features", "featureGroups"):
+        scoped = dict(product, description={}, features=[], featureGroups=[])
+        scoped[field] = product.get(field)
+        entries.extend((field, entry) for entry in owned_description_texts(scoped))
+    entries.extend(("feature_texts", entry) for entry in feature_texts)
     matches = {}
-    for entry in list(owned_description_texts(product)) + list(feature_texts):
-        for sentence in re.split(r"[.!?;]\s+", text(entry)):
-            mentions_washer = re.search(r"\b(?:washer|washing machine)\b", sentence, re.I)
-            for kind in ("front", "top"):
-                term = rf"\b{kind}[ -]?load(?:ing)?\b"
-                own_dryer = re.search(term + r"(?:(?!\b(?:washer|washing machine)\b)[^.!?;]){0,70}\bdryer\b", sentence, re.I)
-                reverse = re.search(r"\bdryer\b[^.!?;]{0,70}" + term, sentence, re.I) if not mentions_washer else None
-                design = re.search(term + r"\s+design\b", sentence, re.I) if not mentions_washer else None
-                if own_dryer or reverse or design:
-                    matches[kind] = sentence[:300]
+    for field, entry in entries:
+        for kind, evidence in _loading_matches(entry, own_dryer, separate_units).items():
+            matches.setdefault(kind, dict(evidence, source_field=field))
     if len(matches) == 1:
         kind = next(iter(matches))
-        return kind.title() + "load", {"source": "own_description_or_features", "evidence": matches[kind]}
+        return kind.title() + "load", dict(matches[kind], source="own_description_or_features")
     if matches:
         # A title must not override conflicting higher-priority own descriptions.
         return "", {"source": "conflicting_features"}
-    name = text((product.get("name") or {}).get("short"))
-    # This guards attribute ownership only; it does not remove a search result.
-    if not re.search(r"\b(?:washer|washing machine|matching|compatible)\b", name, re.I):
-        kinds = [kind for kind in ("front", "top")
-                 if re.search(rf"\b{kind}[ -]?load(?:ing)?\b", name, re.I)]
-        if len(kinds) == 1:
-            return kinds[0].title() + "load", {"source": "own_product_name", "evidence": name[:300]}
-        if kinds:
-            return "", {"source": "conflicting_product_name"}
+    matches = _loading_matches(name, own_dryer, separate_units)
+    if len(matches) == 1:
+        kind = next(iter(matches))
+        return kind.title() + "load", dict(matches[kind], source="own_product_name", source_field="name.short")
+    if matches:
+        return "", {"source": "conflicting_product_name"}
     return "", {"source": "not_stated"}
 
 

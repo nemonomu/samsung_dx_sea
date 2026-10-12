@@ -341,6 +341,10 @@ def collect_details(runtime, run_dir, targets, batch_id, batch_size, detail_stat
         for field, source in (("loading_type", evidence.get("source")), ("capacity", evidence.get("capacity_source"))):
             if row[field] in ("", None):
                 event("attribute_missing", sku_id=sku_id, field=field, reason=source or "not_stated")
+            elif field == "loading_type":
+                event("attribute_collected", sku_id=sku_id, field=field, value=row[field], source=source,
+                      source_field=evidence.get("source_field", "specificationGroups"),
+                      rule=evidence.get("rule", "explicit_specification"), evidence=evidence.get("evidence", ""))
 
     for target in targets:
         sku_id = str(target["sku_id"])
