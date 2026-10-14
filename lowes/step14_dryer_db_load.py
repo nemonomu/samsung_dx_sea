@@ -25,12 +25,14 @@ def connect_db():
     from .step00_config import db_config
     import psycopg2
     settings = db_config()
-    if not settings or not all(settings.get(k) for k in ("host", "user", "database")):
+    if not settings or not all(settings.get(k) for k in ("host", "user")):
         raise DryerDBError("DB settings not configured")
+    # Existing REF/LDY loading uses postgres when the database name is omitted.
+    database = settings.get("database") or "postgres"
     # The loader passes secrets internally; no DSN/settings/exception text is printed.
     return psycopg2.connect(host=settings.get("host"), port=int(settings.get("port") or 5432),
                             user=settings.get("user"), password=settings.get("password"),
-                            dbname=settings.get("database"), connect_timeout=10,
+                            dbname=database, connect_timeout=10,
                             application_name="lowes_dryer")
 
 

@@ -286,6 +286,51 @@ class RuleTests(unittest.TestCase):
 
 
 class DBTests(unittest.TestCase):
+    def test_connection_defaults_missing_database_without_mutating_settings(self):
+        from types import SimpleNamespace
+        import sys
+        for database in (None, ""):
+            config = {"host": "offline.invalid", "user": "offline"}
+            if database is not None:
+                config["database"] = database
+            original = dict(config)
+            expected_connection = object()
+            connect = MagicMock(return_value=expected_connection)
+            with patch.dict(sys.modules, {
+                "lowes.step00_config": SimpleNamespace(db_config=lambda: config),
+                "psycopg2": SimpleNamespace(connect=connect),
+            }):
+                self.assertIs(loader.connect_db(), expected_connection)
+            self.assertEqual(connect.call_args.kwargs["dbname"], "postgres")
+            self.assertEqual(config, original)
+
+    def test_connection_preserves_explicit_database(self):
+        from types import SimpleNamespace
+        import sys
+        connect = MagicMock()
+        with patch.dict(sys.modules, {
+            "lowes.step00_config": SimpleNamespace(db_config=lambda: {
+                "host": "offline.invalid", "user": "offline", "database": "offline_dryer",
+            }),
+            "psycopg2": SimpleNamespace(connect=connect),
+        }):
+            loader.connect_db()
+        self.assertEqual(connect.call_args.kwargs["dbname"], "offline_dryer")
+
+    def test_connection_rejects_missing_host_or_user_before_connecting(self):
+        from types import SimpleNamespace
+        import sys
+        for config in ({}, {"host": "offline.invalid"}, {"user": "offline"}):
+            connect = MagicMock()
+            with patch.dict(sys.modules, {
+                "lowes.step00_config": SimpleNamespace(db_config=lambda: config),
+                "psycopg2": SimpleNamespace(connect=connect),
+            }):
+                with self.assertRaises(loader.DryerDBError) as failure:
+                    loader.connect_db()
+            self.assertEqual(failure.exception.public_reason, "DB settings not configured")
+            connect.assert_not_called()
+
     def metadata(self):
         result = {c: {"type": "text", "identity": "NO", "default": None, "nullable": "YES"}
                   for c in rules.COLUMNS}

@@ -173,10 +173,15 @@ GROUP BY item HAVING count(*) > 1;
 CSV 검수가 끝난 같은 배치를 다시 적재할 때 사용함.
 해당 테이블의 같은 `batch_id`·`Lowes` 행만 삭제·삽입하며 한 트랜잭션으로 처리함.
 적재 실패는 롤백되며 다른 배치는 유지됨.
+DB 이름(`database`)이 생략되거나 빈 값이면 기존 REF·LDY와 동일하게 `postgres`를 사용함.
+명시된 DB 이름은 유지하며 `host`·`user`가 없으면 적재 전에 중단함.
 
 ```powershell
 python -m lowes.step14_dryer_db_load --csv "<run_root>\output\final_output.csv"
 ```
+
+단독 CSV 적재는 원래 수집 회차의 `manifest.json`을 갱신하지 않음.
+재적재 성공 여부와 최종값 일치는 같은 CSV에 `--verify-only`를 붙여 별도로 확인함.
 
 DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
 
