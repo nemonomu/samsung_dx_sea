@@ -20,10 +20,12 @@ from urllib.parse import quote, urlsplit
 from .step00_dryer import (
     BASE_URL, BSR_URL, COLUMNS, Settings, bsr_url, detail_product, detail_url,
     enrich_row, finalize_dryer, listing_page, listing_url, next_offsets,
-    parse_card, product_kind, reviews_url, select_bsr, select_main, validate_reviews,
+    parse_card, positive_id, product_classification, product_kind, region_evidence,
+    price_combination_warnings, reviews_url, select_bsr, select_main, validate_reviews,
     validate_rows,
 )
-from .step00_dryer_audit import AuditJournal, project_listing, source_record, value_record
+from .step00_dryer_audit import (AuditJournal, ExclusionJournal, project_listing, region_summary,
+                                  source_record, value_record)
 
 
 OCCURRENCE_COLUMNS = (
@@ -67,6 +69,7 @@ class APIResult:
     attempts: int = 0
     reason: str = ""
     store: str = ""
+    region: object = None
 
     @property
     def ok(self):
@@ -214,6 +217,7 @@ def fetch_detail(api, settings, source, logger):
             api.set_region(settings.detail_store)
         primary = api.get(detail_url(item, settings), "productdetail", item, sku,
                           lambda payload: detail_product(payload, item), settings.detail_store)
+        primary.region = region_evidence(primary.payload, item, settings, settings.detail_store, "productdetail")
         if primary.ok or not settings.alt_store_enabled or settings.alt_store.lstrip("0") == settings.detail_store:
             return primary, []
         logger.warning("[상세 대체 매장] item=%s primary_status=%s alt_store=%s ZIP=%s",
@@ -221,6 +225,7 @@ def fetch_detail(api, settings, source, logger):
         api.set_region(settings.alt_store, alternate=True)
         alternate = api.get(detail_url(item, settings, settings.alt_store), "productdetail_alt", item, sku,
                             lambda payload: detail_product(payload, item), settings.alt_store)
+        alternate.region = region_evidence(alternate.payload, item, settings, settings.alt_store, "productdetail_alt")
         alternate.attempts += primary.attempts
         return alternate, [{"item": item, "api": "productdetail_primary", **primary.summary(),
                             "recovered": alternate.ok}]
@@ -229,12 +234,44 @@ def fetch_detail(api, settings, source, logger):
             api.set_region(previous_store)
 
 
+def resolve_candidate(api, settings, source, logger, detail_cache, on_detail=None):
+    """Resolve before ranking; later detail enrichment reuses this one request."""
+    item = source["omni_item_id"]
+    if source["kind"] in {"washer", "other", "combo", "bundle"}:
+        return
+    cached = item in detail_cache
+    if not cached and str(getattr(api, "active_store", "")).lstrip("0") != settings.detail_store.lstrip("0"):
+        api.set_region(settings.detail_store)
+    response, recovered = detail_cache.get(item) or fetch_detail(api, settings, source, logger)
+    detail_cache[item] = (response, recovered)
+    listing = source["_classification"]
+    if response.ok:
+        verdict = product_classification(detail_product(response.payload, item)[0])
+        if verdict["kind"] != "unknown":
+            verdict = dict(verdict, source="productdetail", resolved=True)
+        else:
+            verdict = dict(listing, reason="listing_evidence_detail_unclassified" if listing["kind"] == "dryer" else "unconfirmed_after_detail",
+                           resolved=True)
+    else:
+        verdict = dict(listing, reason="listing_evidence_detail_failed" if listing["kind"] == "dryer" else "unconfirmed_after_detail_failure",
+                       resolved=True)
+    source.update(kind=verdict["kind"], _classification=verdict)
+    if on_detail:
+        on_detail(source, response)
+    logger.info("[대상 판정] list=%s item=%s sku=%s kind=%s reason=%s detail_status=%s cached=%s",
+                source.get("_list_type"), item, source.get("model_id") or "-", source["kind"],
+                verdict["reason"], response.status, cached)
+
+
 def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, on_page=None):
     logger.info("[메인 시작] target_limit=%s", settings.main_limit)
     rows, seen_ids, signatures, pages = [], set(), set(), []
+    first_classification = {}
     offset, adjusted, finished = 0, None, False
     eligible_count = 0
     for page in range(1, settings.max_main_pages + 1):
+        if str(getattr(api, "active_store", "")).lstrip("0") != settings.listing_store.lstrip("0"):
+            api.set_region(settings.listing_store)
         result = api.get(listing_url(offset, adjusted, settings), "main", validator=listing_page)
         if not result.ok:
             write_json(run_dir / "audit" / "main_failure.json", result.summary())
@@ -246,38 +283,45 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
         signatures.add(signature)
         for position, card in enumerate(cards, 1):
             row = parse_card(card, page, position, offset + position)
-            row.update(_audit_listing=project_listing(card), _listing_api=result.summary())
+            row.update(_audit_listing=project_listing(card), _listing_api=result.summary(), _list_type="main",
+                       _listing_region=region_evidence(card, row["omni_item_id"], settings, settings.listing_store, "main"))
             item = row["omni_item_id"]
             if "/collections/" in row["product_url"]:
+                row["kind"] = "bundle"
+                row["_classification"] = dict(row["_classification"], kind="bundle", eligible=False, reason="collection_card")
                 rows.append(row)
                 if item:
                     seen_ids.add(item)
-                logger.info("[메인 제외] page=%s position=%s reason=collection_card", page, position)
+                    first_classification[item] = row["_classification"]
+                if on_page:
+                    on_page([row])
+                continue
+            if not item and row["kind"] in {"washer", "other", "combo", "bundle"} and row["product_url"]:
+                rows.append(row)
+                if on_page:
+                    on_page([row])
                 continue
             if not item:
                 if on_page:
-                    on_page(select_main(rows, settings.main_limit))
+                    on_page(rows)
                 logger.error("[목록 오류] stage=main page=%s position=%s sku=%s reason=missing_product_id",
                              page, position, row["model_id"] or "-")
                 raise CollectionError("main_missing_product_id")
-            if row["kind"] in {"unknown", "other"} and item not in seen_ids and eligible_count < settings.main_limit:
-                logger.info("[종류 확인] item=%s sku=%s", item, row["model_id"] or "-")
-                response, recovered = fetch_detail(api, settings, row, logger)
-                detail_cache[item] = (response, recovered)
-                if response.ok:
-                    product, _ = detail_product(response.payload, item)
-                    row["kind"] = product_kind(product)
-                else:
-                    row["kind"] = "unknown"
-                if on_detail:
-                    on_detail(row, response)
-            if item not in seen_ids and row["kind"] not in {"washer", "other"}:
-                eligible_count += 1
+            if item in seen_ids:
+                row.update(kind=first_classification[item]["kind"], _classification=first_classification[item])
+            else:
+                if on_page:
+                    on_page([row])
+                if eligible_count < settings.main_limit:
+                    resolve_candidate(api, settings, row, logger, detail_cache, on_detail)
+                if row["kind"] == "dryer":
+                    eligible_count += 1
+                first_classification[item] = row["_classification"]
+                seen_ids.add(item)
             rows.append(row)
-            seen_ids.add(item)
         targets = select_main(rows, settings.main_limit)
         if on_page:
-            on_page(targets)
+            on_page(rows)
         page_info = {"page": page, "offset": offset, "rows": len(cards), "total": metadata["total"],
                      "targets": len(targets), "status": result.status, "attempts": result.attempts}
         pages.append(page_info)
@@ -304,6 +348,8 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
             if unexpected_empty:
                 raise CollectionError("main_unexpected_empty_page")
         if len(targets) >= settings.main_limit or exhausted or not cards:
+            page_info["end_reason"] = "target_limit" if len(targets) >= settings.main_limit else "source_exhausted"
+            write_json(run_dir / "main" / "pages.json", pages)
             finished = True
             break
         offset, adjusted = next_offsets(offset, metadata, settings.page_size, adjusted)
@@ -313,14 +359,17 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
     return rows, pages
 
 
-def collect_bsr(api, settings, logger, run_dir, on_page=None):
+def collect_bsr(api, settings, logger, run_dir, on_page=None, detail_cache=None, on_detail=None):
     logger.info("[BSR 시작] displayed_rank_limit=%s", settings.bsr_limit)
     api.open(BSR_URL)
     api.set_region(settings.listing_store)
-    rows, pages, signatures = [], [], set()
+    detail_cache = detail_cache if detail_cache is not None else {}
+    rows, pages, signatures, first_classification = [], [], set(), {}
     offset, adjusted = 0, 0
     while len(rows) < settings.bsr_limit:
         page = len(pages) + 1
+        if str(getattr(api, "active_store", "")).lstrip("0") != settings.listing_store.lstrip("0"):
+            api.set_region(settings.listing_store)
         result = api.get(bsr_url(offset, adjusted), "bsr", validator=listing_page)
         if not result.ok:
             write_json(run_dir / "audit" / "bsr_failure.json", result.summary())
@@ -332,21 +381,37 @@ def collect_bsr(api, settings, logger, run_dir, on_page=None):
         signatures.add(signature)
         for position, card in enumerate(cards[:settings.bsr_limit - len(rows)], 1):
             row = parse_card(card, page, position, len(rows) + 1)
-            row.update(_audit_listing=project_listing(card), _listing_api=result.summary())
-            if not row["omni_item_id"]:
+            row.update(_audit_listing=project_listing(card), _listing_api=result.summary(), _list_type="bsr",
+                       _listing_region=region_evidence(card, row["omni_item_id"], settings, settings.listing_store, "bsr"))
+            item = row["omni_item_id"]
+            if "/collections/" in row["product_url"]:
+                row["kind"] = "bundle"
+                row["_classification"] = dict(row["_classification"], kind="bundle", eligible=False, reason="collection_card")
+            elif not item and row["kind"] in {"washer", "other", "combo", "bundle"} and row["product_url"]:
+                pass
+            elif not item:
                 if on_page:
                     on_page(rows)
-                logger.error("[목록 오류] stage=bsr page=%s position=%s sku=%s reason=missing_product_id",
-                             page, position, row["model_id"] or "-")
                 raise CollectionError("bsr_missing_product_id")
+            elif item in first_classification:
+                row.update(kind=first_classification[item]["kind"], _classification=first_classification[item])
+            else:
+                if on_page:
+                    on_page([row])
+                resolve_candidate(api, settings, row, logger, detail_cache, on_detail)
+                first_classification[item] = row["_classification"]
+            if item:
+                first_classification.setdefault(item, row["_classification"])
             rows.append(row)
         if on_page:
             on_page(rows)
         pages.append({"page": page, "offset": offset, "rows": len(cards), "collected": len(rows),
+                      "eligible": len(select_bsr(rows, settings.bsr_limit)),
                       "status": result.status, "attempts": result.attempts})
         write_csv(run_dir / "bsr" / "bsr_occurrences.csv", rows, OCCURRENCE_COLUMNS)
         write_json(run_dir / "bsr" / "pages.json", pages)
-        logger.info("[BSR] page=%s displayed=%s/%s", page, len(rows), settings.bsr_limit)
+        logger.info("[BSR] page=%s displayed=%s/%s eligible=%s", page, len(rows), settings.bsr_limit,
+                    len(select_bsr(rows, settings.bsr_limit)))
         if len(rows) >= settings.bsr_limit:
             break
         if not cards:
@@ -374,7 +439,8 @@ def selected_targets(main_rows, bsr_rows, settings, operations):
     eligible = select_main(main_rows, settings.main_limit)
     main, _ = operations["main"](eligible)
     bsr_cutoff = [dict(r, bsr_rank=r["original_rank"]) for r in bsr_rows
-                  if r["original_rank"] <= settings.bsr_limit]
+                  if r["original_rank"] <= settings.bsr_limit and r.get("kind") == "dryer"
+                  and "/collections/" not in r.get("product_url", "")]
     first_by_id = {}
     for row in bsr_cutoff:
         first_by_id.setdefault(row["omni_item_id"], row)
@@ -387,18 +453,49 @@ def selected_targets(main_rows, bsr_rows, settings, operations):
 def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operations):
     started = time.monotonic()
     cache = {}
+
     journal = AuditJournal(run_dir / "audit" / "value_audit.jsonl")
-    logger.info("[검수 파일] path=%s", journal.path)
+    exclusions = ExclusionJournal(run_dir / "audit" / "excluded_items.jsonl")
+    logger.info("[검수 파일] path=%s exclusions=%s", journal.path, exclusions.path)
     def preserve_classification(source, response):
-        journal.upsert(source_record(source, response, None, batch_id, "pending_selection", main=source))
+        listing_type = source.get("_list_type", "main")
+        record = source_record(source, response, None, batch_id, "pending_selection",
+                               main=source if listing_type == "main" else None,
+                               bsr=source if listing_type == "bsr" else None)
+        if source["kind"] != "dryer":
+            record.update(status="excluded", exclusion_reason=source["_classification"]["reason"])
+            exclusions.capture(source, batch_id, response)
+        journal.upsert(record)
+    def preserve_listings(rows, listing_type):
+        valid = [r for r in rows if positive_id(r.get("omni_item_id"))]
+        journal.capture_listings(valid, batch_id, listing_type)
+        seen = set()
+        for source in rows:
+            key = source.get("omni_item_id") or source.get("product_url")
+            if key in seen:
+                continue
+            seen.add(key)
+            verdict = source.get("_classification") or {}
+            if source["kind"] not in {"dryer", "unknown"} or (source["kind"] == "unknown" and verdict.get("resolved")):
+                cached = cache.get(source["omni_item_id"])
+                exclusions.capture(source, batch_id, cached[0] if cached else None)
+                if positive_id(source.get("omni_item_id")):
+                    record = dict(journal.records[source["omni_item_id"]], status="excluded",
+                                  product_kind=source["kind"], classification=verdict,
+                                  exclusion_reason=verdict["reason"])
+                    journal.upsert(record)
     main_rows, main_pages = collect_main(api, settings, logger, run_dir, cache, preserve_classification,
-                                        lambda rows: journal.capture_listings(rows, batch_id, "main"))
+                                        lambda rows: preserve_listings(rows, "main"))
     bsr_rows, bsr_pages = collect_bsr(api, settings, logger, run_dir,
-                                     lambda rows: journal.capture_listings(rows, batch_id, "bsr"))
+                                     lambda rows: preserve_listings(rows, "bsr"), cache, preserve_classification)
     main, bsr = selected_targets(main_rows, bsr_rows, settings, operations)
     main_by_id = {row["omni_item_id"]: row for row in main}
     bsr_by_id = {row["omni_item_id"]: row for row in bsr}
     targets = operations["merge"](main, bsr)
+    conflicting = {r["omni_item_id"] for r in targets} & {r["item"] for r in exclusions.records.values() if r["item"]}
+    if conflicting:
+        logger.error("[대상 분류 충돌] items=%s reason=conflicting_product_classification", ",".join(sorted(conflicting)))
+        raise CollectionError("conflicting_product_classification")
     calendar_week = f"w{datetime.fromisoformat(crawl_dt).isocalendar().week:02d}"
     for target in targets:
         target.update(batch_id=batch_id, crawl_datetime=crawl_dt, calendar_week=calendar_week)
@@ -407,30 +504,24 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     write_csv(run_dir / "output" / "final_targets.csv", targets, OCCURRENCE_COLUMNS)
     logger.info("[상세 시작] total=%s", len(targets))
     api.set_region(settings.detail_store)
-    failures, recovered_requests, quality, spec_audit, enriched = [], [], [], [], []
-    rejected_main = set()
+    failures, quality, spec_audit, enriched = [], [], [], []
+    recovered_requests = [entry for response, recovered in cache.values() for entry in recovered]
+    target_ids = {r["omni_item_id"] for r in targets}
+    for item, (response, _) in cache.items():
+        if not response.ok and item not in target_ids:
+            failures.append({"item": item, "sku": journal.records[item].get("sku"),
+                             "stage": "classification", "api": "productdetail", **response.summary(),
+                             "affected_columns": [], "action": "excluded_unconfirmed_kind"})
+    for record in exclusions.records.values():
+        if record["kind"] == "unknown":
+            quality.append({"item": record["item"], "reason": record["reason"]})
     for index, source in enumerate(targets, 1):
         previous_quality_count = len(quality)
         item, sku = source["omni_item_id"], source.get("model_id", "")
         response, recovered = cache.get(item) or fetch_detail(api, settings, source, logger)
-        recovered_requests.extend(recovered)
         journal.upsert(source_record(source, response, None, batch_id,
                                      main=main_by_id.get(item), bsr=bsr_by_id.get(item)))
-        actual_kind = product_kind(detail_product(response.payload, item)[0]) if response.ok else source.get("kind")
-        if (actual_kind in {"washer", "other"} and source.get("main_rank") not in (None, "")
-                and source.get("bsr_rank") in (None, "")):
-            rejected_main.add(item)
-            quality.append({"item": item, "reason": "main_excluded_after_detail", "kind": actual_kind})
-            excluded = dict(journal.records[item], status="excluded", product_kind=actual_kind,
-                            exclusion_reason="non_target_after_detail")
-            journal.upsert(excluded)
-            logger.warning("[메인 제외] item=%s sku=%s reason=non_target_after_detail kind=%s reviews=not_requested",
-                           item, sku or "-", actual_kind)
-            logger.info("[상세] %s/%s (%.1f%%) item=%s api_failure_products=%s elapsed=%.1fs",
-                        index, len(targets), 100 * index / len(targets), item,
-                        len({f["item"] for f in failures}), time.monotonic() - started)
-            time.sleep(settings.page_wait)
-            continue
+        actual_kind = source["kind"]
         reviews = api.get(reviews_url(item), "reviews", item, sku, validate_reviews)
         try:
             row, audit = enrich_row(source, response.payload if response.ok else None,
@@ -445,11 +536,9 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
             raise
         value_audit["product_kind"] = actual_kind
         journal.upsert(value_audit)
-        if actual_kind in {"washer", "other"} and source.get("main_rank") not in (None, ""):
-            rejected_main.add(item)
-            quality.append({"item": item, "reason": "main_excluded_after_detail", "kind": actual_kind})
-        elif actual_kind == "unknown":
-            quality.append({"item": item, "reason": "product_kind_unconfirmed"})
+        quality.extend(price_combination_warnings(provisional))
+        if response.region and response.region["status"] == "delivery_zip_mismatch":
+            quality.append({"item": item, "reason": "response_delivery_zip_mismatch"})
         if row.get("_sku_conflict"):
             quality.append({"item": item, "reason": "listing_detail_model_conflict_original_kept",
                             "listing_model": source.get("model_id"), "detail_model": row.get("_detail_model_id")})
@@ -495,10 +584,7 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
         write_csv(run_dir / "audit" / "spec_audit.csv", spec_audit, AUDIT_COLUMNS)
         write_json(run_dir / "audit" / "failures.json", failures)
         time.sleep(settings.page_wait)
-    # Confirmed non-targets found in detail must not retain a main rank.
-    retained_main = [r for r in main if r["omni_item_id"] not in rejected_main]
-    for rank, row in enumerate(retained_main, 1):
-        row["main_rank"] = rank
+    retained_main = main
     final_targets = operations["merge"](retained_main, bsr)
     by_id = {r["omni_item_id"]: r for r in enriched}
     final_rows = []
@@ -507,7 +593,7 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
         row.update(main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"),
                    batch_id=batch_id, crawl_datetime=crawl_dt)
         final_rows.append(finalize_dryer(row, batch_id, crawl_dt, operations["finalize"]))
-    counts = validate_rows(final_rows, settings.main_limit, settings.bsr_limit)
+    counts = validate_rows(final_rows, settings.main_limit, settings.bsr_limit, allow_empty=True)
     journal.finish(final_rows)
     logger.info("[검수 파일 완료] final_products=%s recorded_products=%s path=%s",
                 len(final_rows), len(journal.records), journal.path)
@@ -519,7 +605,7 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
             if saved is not None and saved[column] in (None, "")
         ]
         if saved is None:
-            failure["action"] = "excluded_after_detail"
+            failure.setdefault("action", "excluded_after_detail")
         logger.warning("[오류 결과] item=%s sku=%s api=%s status=%s retries=%s missing_columns=%s action=%s",
                        failure["item"], (saved or {}).get("sku") or failure["sku"] or "-",
                        failure["api"], failure["status"], failure["retries"],
@@ -538,16 +624,23 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     one_audit_per_spec = {(a["item"], a["column"]): a for a in spec_audit}
     one_kind_per_item = {a["item"]: a["kind"] for a in spec_audit}
     one_excluded_per_item = {r["omni_item_id"]: r["kind"] for r in main_rows
-                            if r["kind"] in {"washer", "other"}}
+                            if r["kind"] != "dryer" and (r["kind"] != "unknown" or r.get("_classification", {}).get("resolved"))}
     summary = {
         "batch_id": batch_id, "crawl_datetime": crawl_dt, "settings": asdict(settings),
+        "selection_policy": "standalone_dryer_v2",
+        "main_end_reason": main_pages[-1].get("end_reason"),
+        "exclusions": {"products": len(exclusions.records),
+                       "by_reason": dict(Counter(r["reason"] for r in exclusions.records.values()))},
+        "region": region_summary(list(journal.records.values())),
+        "price_checks": [warning for row in final_rows for warning in price_combination_warnings(row)],
         "counts": counts, "main_pages": len(main_pages), "bsr_pages": len(bsr_pages),
         "main_raw": len(main_rows), "bsr_displayed": len(bsr_rows),
         "main_collection_cards": len({r["product_url"] for r in main_rows
                                       if "/collections/" in r["product_url"]}),
         "main_shortfall": max(0, settings.main_limit - counts["main"]),
         "main_excluded_by_kind": dict(Counter(one_excluded_per_item.values())),
-        "excluded_after_detail": sorted(rejected_main),
+        "excluded_after_detail": sorted(r["item"] for r in exclusions.records.values()
+                                        if r["item"] and r["classification"].get("source") == "productdetail"),
         "kind_counts": dict(Counter(one_kind_per_item.values())),
         "spec_reasons": {c: dict(Counter(a["reason"] for a in one_audit_per_spec.values() if a["column"] == c))
                          for c in ("loading_type", "capacity")},
@@ -557,7 +650,10 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     }
     if summary["main_shortfall"]:
         logger.warning("[메인 대상 부족] requested=%s selected=%s excluded_after_detail=%s",
-                       settings.main_limit, counts["main"], len(rejected_main))
+                       settings.main_limit, counts["main"], len(summary["excluded_after_detail"]))
+    logger.info("[제외 집계] products=%s reasons=%s", len(exclusions.records), summary["exclusions"]["by_reason"])
+    logger.info("[지역 검수] ZIP=%s detail=%s price_region_verified=False", settings.zip_code,
+                summary["region"]["detail_delivery_zip_status"])
     logger.info("[사양 집계] loading_type_null=%s capacity_null=%s reasons=%s",
                 counts["loading_type_null"], counts["capacity_null"],
                 json.dumps(summary["spec_reasons"], ensure_ascii=False))
@@ -605,12 +701,14 @@ def main(argv=None):
                                        now.strftime("%Y-%m-%d %H:%M:%S"), operations)
         api.close()
         manifest["collection"] = summary
-        if not args.collect_only:
+        if not args.collect_only and rows:
             stage = "db_load"
             from .step14_dryer_db_load import load_batch
             loaded = load_batch(rows, logger=logger)
             manifest.update(db_loaded=True, db=loaded)
             write_json(root / "db_load_summary.json", loaded)
+        if not rows:
+            manifest["db_skip_reason"] = "no_eligible_products"
         manifest["status"] = summary["collection_status"]
         logger.info("[완료] status=%s products=%s main=%s bsr=%s api_failure_products=%s quality_warnings=%s db_loaded=%s",
                     manifest["status"], len(rows), summary["counts"]["main"], summary["counts"]["bsr"],

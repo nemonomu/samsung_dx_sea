@@ -94,6 +94,7 @@ def final_row(item="1000", main=1, bsr=None):
 
 
 def settings(**kwargs):
+    kwargs.setdefault("main_limit", 100)
     return rules.Settings(page_wait=0, seed_wait=0, retry_wait=0, alt_store_enabled=False, **kwargs)
 
 
@@ -102,7 +103,7 @@ class RuleTests(unittest.TestCase):
         s = rules.Settings.from_env({"LOWES_API_STORE_ZIP": "10001", "LOWES_API_STORE_ID": "0289"})
         self.assertEqual(s.zip_code, "10010")
         self.assertEqual(s.detail_store, "289")
-        self.assertEqual((s.main_limit, s.bsr_limit), (100, 100))
+        self.assertEqual((s.main_limit, s.bsr_limit), (300, 100))
         self.assertIn("/0289/Guest/10010?", rules.detail_url("1000", s))
         with self.assertRaises(ValueError):
             rules.Settings(bsr_limit=101)
@@ -164,7 +165,8 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(len(selected), 100)
         self.assertEqual(selected[0]["omni_item_id"], "1001")
         self.assertTrue(selected[0]["sponsored"])
-        self.assertEqual(selected[1]["kind"], "combo")
+        self.assertNotIn("1002", {row["omni_item_id"] for row in selected})
+        self.assertEqual(selected[1]["omni_item_id"], "1003")
         self.assertEqual([r["main_rank"] for r in selected], list(range(1, 101)))
         legacy, _ = operations()["main"](selected)
         self.assertEqual([r["omni_item_id"] for r in legacy], [r["omni_item_id"] for r in selected])
@@ -487,7 +489,7 @@ class FakeAPI:
         pass
 
     def set_region(self, store):
-        pass
+        self.active_store = str(store)
 
     def get(self, path, label, item="", sku="", validator=None, store=""):
         self.calls[(label, item)] += 1
@@ -505,7 +507,7 @@ class FakeAPI:
             if item == "1060":
                 payload = detail(item, [{"key": "Dryer Load Type", "value": "Front load"},
                                         {"key": "Washer Dryer Capacity (Cu. Feet)", "value": "4.8"}],
-                                 name="All-In-One Washer Dryer Combo")
+                                 name="Electric Dryer")
             else:
                 payload = detail(item)
         elif label == "reviews":
@@ -623,7 +625,7 @@ class CollectionTests(unittest.TestCase):
             self.assertIn("1002", {r["item"] for r in rows})
             self.assertEqual(api.calls[("productdetail", "1000")], 1)
 
-    def test_late_non_target_skips_reviews_unless_it_is_a_bsr_product(self):
+    def test_detail_washer_excluded_from_both_and_main_refilled(self):
         class LateWasherAPI(FakeAPI):
             washer_id = "1000"
             def get(self, path, label, item="", sku="", validator=None, store=""):
@@ -631,32 +633,28 @@ class CollectionTests(unittest.TestCase):
                 if label == "productdetail" and item == self.washer_id and result.ok:
                     result.payload = detail(item, specs=[], name="Top-Load Washer")
                 return result
-
         for item, is_bsr in (("1000", False), ("1050", True)):
             api = LateWasherAPI()
             api.washer_id = item
             with scratch() as root:
                 rows, summary = self.collect(api, root)
-                self.assertEqual(summary["counts"]["main"], 99)
-                self.assertEqual(summary["counts"]["bsr"], 100)
+                self.assertEqual(summary["counts"]["main"], 100)
+                self.assertEqual(summary["counts"]["bsr"], 99 if is_bsr else 100)
                 self.assertEqual(api.calls[("productdetail", item)], 1)
-                self.assertEqual(api.calls[("reviews", item)], 1 if is_bsr else 0)
-                selected = next((row for row in rows if row["item"] == item), None)
-                if is_bsr:
-                    self.assertIsNotNone(selected)
-                    self.assertIsNone(selected["main_rank"])
-                    self.assertEqual(selected["bsr_rank"], 1)
-                else:
-                    self.assertIsNone(selected)
+                self.assertEqual(api.calls[("reviews", item)], 0)
+                self.assertNotIn(item, {r["item"] for r in rows})
+                self.assertTrue(check_run(root)["selection"]["verified"])
 
-    def test_real_dryer_with_pedestal_not_excluded_as_accessory(self):
+    def test_dryer_with_included_pedestal_is_excluded_without_detail(self):
         api = FakeAPI()
         api.main_cards[0] = card(1000, "Electric Dryer with included pedestal")
         with scratch() as root:
             rows, summary = self.collect(api, root)
             self.assertEqual(summary["counts"]["main"], 100)
-            self.assertIn("1000", {r["item"] for r in rows})
-            self.assertEqual(api.calls[("productdetail", "1000")], 1)
+            self.assertNotIn("1000", {r["item"] for r in rows})
+            self.assertEqual(api.calls[("productdetail", "1000")], 0)
+            self.assertEqual(api.calls[("reviews", "1000")], 0)
+            self.assertTrue(check_run(root)["selection"]["verified"])
 
     def test_collection_group_skipped_before_numeric_product_id_check(self):
         api = FakeAPI()
@@ -802,6 +800,9 @@ class ValueAuditTests(unittest.TestCase):
             self.assertEqual(only_bsr["fields"]["final_sku_price"]["raw_value"], 599)
             self.assertEqual(only_bsr["fields"]["final_sku_price"]["source"], "productdetail.price.sellingPrice")
             self.assertEqual(only_bsr["fields"]["main_rank"]["null_reason"], "not_in_main")
+            self.assertIsNone(only_bsr["source_values"]["main"])
+            self.assertIsNone(only_bsr["occurrences"]["main"])
+            self.assertIsNone(only_bsr["region"]["main"])
             self.assertEqual(by_id["1060"]["fields"]["capacity"]["null_reason"], "shared_capacity_only")
             self.assertEqual(by_id["1060"]["fields"]["capacity"]["raw_value"][0]["value"], "4.8")
             self.assertEqual(value_audit.compare_csv(records, rows)["compared_columns"], list(rules.COLUMNS))
@@ -918,7 +919,7 @@ class ValueAuditTests(unittest.TestCase):
                     raise KeyboardInterrupt()
                 return super().get(path, label, item, *args, **kwargs)
         for label, item, status in (("reviews", "1000", "detail_received"),
-                                    ("productdetail", "1001", "provisional")):
+                                    ("productdetail", "1001", "pending_selection")):
             api = InterruptedAPI()
             api.interrupt_label, api.interrupt_item = label, item
             with scratch() as root:
@@ -948,7 +949,7 @@ class ValueAuditTests(unittest.TestCase):
             self.assertEqual(records[0]["status"], "pending_selection")
             self.assertEqual(records[0]["api"]["productdetail"]["status"], 200)
             self.assertIsNone(records[0]["final_values"])
-            self.assertEqual(len(records), 100)
+            self.assertEqual(len(records), 120)
             self.assertEqual(records[1]["source_values"]["listing"]["price"]["sellingPrice"], 499)
 
     def test_malformed_main_card_preserves_preceding_valid_listings(self):
@@ -961,7 +962,7 @@ class ValueAuditTests(unittest.TestCase):
             self.assertEqual(len(records), 5)
             self.assertEqual(records[0]["source_values"]["listing"]["price"]["sellingPrice"], 499)
             self.assertEqual(records[0]["api"]["listing"]["status"], 200)
-            self.assertEqual(records[0]["api"]["productdetail"]["status"], "not_requested")
+            self.assertEqual(records[0]["api"]["productdetail"]["status"], 200)
 
     def test_normalization_failure_preserves_already_received_review_statistics(self):
         with scratch() as root:
@@ -1016,6 +1017,321 @@ class ValueAuditTests(unittest.TestCase):
             path.write_text('{"schema_version":\n', encoding="utf-8")
             with self.assertRaises(value_audit.DryerAuditError):
                 self.records(root)
+
+
+
+class StandaloneDryerTests(unittest.TestCase):
+    logger = CollectionTests.logger
+
+    def collect(self, api, root, main_limit=100, bsr_limit=100):
+        return run_collection(api, settings(main_limit=main_limit, bsr_limit=bsr_limit), self.logger(), root,
+                              "l_test", "2026-10-14 10:00:00", operations(main_limit))
+
+    def test_sold_product_classification_ignores_recommendations_and_optional_parts(self):
+        cases = {
+            "Electric Dryer with Steam": "dryer",
+            "Electric Dryer with Steam + Smart Features": "dryer",
+            "Gas Dryer compatible with matching washer": "dryer",
+            "Electric Dryer with optional pedestal": "dryer",
+            "Electric Dryer with matching washer sold separately": "dryer",
+            "Electric Dryer with pedestal not included": "dryer",
+            "Electric Dryer with included pedestal": "bundle",
+            "Electric Dryer and power cord": "bundle",
+            "Electric Dryer + Refrigerator": "bundle",
+            "Electric Dryer with refrigerator": "bundle",
+            "Electric Dryer with matching washer": "bundle",
+            "Washer and Dryer Set": "bundle",
+            "Electric Dryer 2-piece Package": "bundle",
+            "All-in-One Washer Dryer Combo": "combo",
+            "Stacked Laundry Center": "combo",
+            "LG WashTower": "combo",
+            "Dryer pedestal": "other",
+            "Top-Load Washer": "washer",
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(rules.product_kind({"description": title}), expected)
+        product = {"description": "Electric Dryer", "recommendations": [{"description": "Washer Dryer Set"}],
+                   "accessories": [{"description": "Pedestal"}]}
+        self.assertTrue(rules.product_classification(product)["eligible"])
+        packaged = dict(product, bundleProducts=[{"omniItemId": "1000", "description": "Dryer"},
+                                                {"omniItemId": "2000", "description": "Other appliance", "auth": "PRIVATE_DO_NOT_COPY"}])
+        self.assertEqual(rules.product_kind(packaged), "bundle")
+        self.assertNotIn("PRIVATE_DO_NOT_COPY", json.dumps(rules.classification_evidence(packaged)))
+        product["isBundle"] = True
+        self.assertEqual(rules.product_kind(product), "bundle")
+        self.assertEqual(rules.product_kind({"description": "Electric Dryer", "specs": [
+            {"key": "Package Quantity", "value": "2"}]}), "bundle")
+
+    def test_settings_and_bat_default_300_with_overrides(self):
+        self.assertEqual(rules.Settings().main_limit, 300)
+        self.assertEqual(rules.Settings.from_env({}).main_limit, 300)
+        self.assertEqual(rules.Settings.from_env({"LOWES_DRYER_MAIN_LIMIT": "120"}).main_limit, 120)
+        bat = Path(__file__).with_name("lowes_dryer_daily_task.bat").read_text(encoding="utf-8")
+        self.assertIn('if not defined LOWES_DRYER_MAIN_LIMIT set "LOWES_DRYER_MAIN_LIMIT=300"', bat)
+
+    def test_clear_exclusions_both_lists_skip_apis_and_keep_original_ranks(self):
+        api = FakeAPI()
+        names = ["Top-Load Washer", "All-In-One Washer Dryer Combo", "Washer and Dryer Set",
+                 "Electric Dryer with included pedestal"]
+        for index, name in enumerate(names):
+            api.main_cards[index] = card(1000 + index, name, sponsored=True)
+            api.bsr_cards[index] = card(1000 + index, name, sponsored=True)
+        with scratch() as root:
+            rows, summary = self.collect(api, root)
+            self.assertEqual((summary["counts"]["main"], summary["counts"]["bsr"]), (100, 96))
+            for item in map(str, range(1000, 1004)):
+                self.assertNotIn(item, {row["item"] for row in rows})
+                self.assertEqual(api.calls[("productdetail", item)], 0)
+                self.assertEqual(api.calls[("reviews", item)], 0)
+            records = value_audit.read_records(root / "audit" / "value_audit.jsonl")
+            excluded = [json.loads(line) for line in (root / "audit" / "excluded_items.jsonl").read_text().splitlines()]
+            self.assertEqual(len(excluded), 4)
+            self.assertTrue(all(set(record["occurrences"]) == {"main", "bsr"} for record in excluded))
+            final = next(record for record in records if record["item"] == "1054")
+            self.assertEqual(final["occurrences"]["bsr"]["original_rank"], 5)
+            self.assertEqual(final["final_values"]["bsr_rank"], 1)
+            self.assertTrue(check_run(root)["selection"]["verified"])
+
+    def test_detail_bundle_shared_between_lists_is_fetched_once_and_has_no_reviews(self):
+        class DetailBundle(FakeAPI):
+            def get(self, path, label, item="", *args, **kwargs):
+                result = super().get(path, label, item, *args, **kwargs)
+                if label == "productdetail" and item == "1000":
+                    result.payload = detail(item, name="Electric Dryer with included pedestal")
+                return result
+        api = DetailBundle()
+        api.main_cards[0] = card(1000, "Unclear appliance")
+        api.bsr_cards[0] = card(1000, "Unclear appliance")
+        with scratch() as root:
+            rows, summary = self.collect(api, root)
+            self.assertNotIn("1000", {row["item"] for row in rows})
+            self.assertEqual((summary["counts"]["main"], summary["counts"]["bsr"]), (100, 99))
+            self.assertEqual(api.calls[("productdetail", "1000")], 1)
+            self.assertEqual(api.calls[("reviews", "1000")], 0)
+            excluded = next(json.loads(line) for line in (root / "audit" / "excluded_items.jsonl").read_text().splitlines()
+                            if json.loads(line)["item"] == "1000")
+            self.assertEqual(excluded["classification"]["source"], "productdetail")
+            self.assertIn("pedestal", excluded["classification"]["evidence"]["description"])
+            self.assertTrue(check_run(root)["selection"]["verified"])
+
+    def test_bsr_filter_and_dedup_stay_inside_displayed100(self):
+        api = FakeAPI()
+        api.bsr_cards = [card(i, "All-In-One Washer Dryer Combo" if i < 3010 else None) for i in range(3000, 3120)]
+        api.bsr_cards[11] = card(3010)
+        with scratch() as root:
+            rows, summary = self.collect(api, root)
+            self.assertEqual(summary["bsr_displayed"], 100)
+            self.assertEqual(summary["counts"]["bsr"], 89)
+            self.assertEqual(api.calls[("productdetail", "3100")], 0)
+            self.assertNotIn("3100", {row["item"] for row in rows})
+            self.assertEqual(sorted(row["bsr_rank"] for row in rows if row["bsr_rank"] is not None), list(range(1, 90)))
+            self.assertTrue(check_run(root)["selection"]["verified"])
+
+    def test_main_300_refills_after_listing_and_detail_exclusions(self):
+        class Main300(FakeAPI):
+            def get(self, path, label, item="", *args, **kwargs):
+                result = super().get(path, label, item, *args, **kwargs)
+                if label == "productdetail" and 3020 <= int(item) < 3030:
+                    result.payload = detail(item, specs=[], name="Top-Load Washer")
+                return result
+        api = Main300()
+        api.main_cards = [card(i, "Washer" if i < 3010 else "Washer Dryer Combo" if i < 3020
+                               else "Unclear appliance" if i < 3030 else None, sponsored=i == 3030)
+                          for i in range(3000, 3330)]
+        api.bsr_cards = [card(i) for i in range(3100, 3200)]
+        with scratch() as root:
+            rows, summary = self.collect(api, root, main_limit=300)
+            self.assertEqual((len(rows), summary["counts"]["main"], summary["counts"]["bsr"]), (300, 300, 100))
+            self.assertEqual(summary["counts"]["shared"], 100)
+            self.assertEqual(summary["exclusions"]["products"], 30)
+            self.assertEqual(summary["collection_status"], "complete")
+            self.assertEqual(sum(n for (label, _), n in api.calls.items() if label == "reviews"), 300)
+            self.assertEqual(api.calls[("productdetail", "3100")], 1)
+            self.assertEqual(api.calls[("reviews", "3020")], 0)
+            self.assertTrue(check_run(root)["selection"]["verified"])
+
+    def test_main_source_exhaustion_below300_is_complete(self):
+        api = FakeAPI()
+        api.main_cards = [card(i, "Washer Dryer Combo" if i < 1012 else None) for i in range(1000, 1260)]
+        with scratch() as root:
+            rows, summary = self.collect(api, root, main_limit=300)
+            self.assertEqual(summary["counts"]["main"], 248)
+            self.assertEqual(summary["main_shortfall"], 52)
+            self.assertEqual(summary["main_end_reason"], "source_exhausted")
+            self.assertEqual(summary["collection_status"], "complete")
+            self.assertTrue(check_run(root)["csv_valid"])
+
+    def test_unconfirmed_failed_detail_excluded_with_evidence_and_partial_status(self):
+        api = FakeAPI()
+        api.main_cards[0] = card(1000, "Unclear appliance")
+        api.bsr_cards[0] = card(1000, "Unclear appliance")
+        api.detail_failures.add("1000")
+        with scratch() as root:
+            rows, summary = self.collect(api, root)
+            self.assertNotIn("1000", {row["item"] for row in rows})
+            self.assertEqual(summary["collection_status"], "partial_failure")
+            self.assertEqual(api.calls[("productdetail", "1000")], 1)
+            self.assertEqual(api.calls[("reviews", "1000")], 0)
+            failures = json.loads((root / "audit" / "failures.json").read_text())
+            self.assertEqual(failures[0]["stage"], "classification")
+            self.assertEqual(failures[0]["action"], "excluded_unconfirmed_kind")
+            self.assertTrue(check_run(root)["selection"]["verified"])
+
+    def test_all_non_targets_yield_valid_empty_outputs(self):
+        api = FakeAPI()
+        api.main_cards = [card(i, "Washer Dryer Combo") for i in range(1000, 1100)]
+        api.bsr_cards = list(api.main_cards)
+        with scratch() as root:
+            rows, summary = self.collect(api, root, main_limit=300)
+            self.assertEqual(rows, [])
+            self.assertEqual(summary["collection_status"], "complete")
+            self.assertFalse(any(label in {"productdetail", "reviews"} for label, _ in api.calls))
+            checked = check_run(root)
+            self.assertTrue(checked["csv_valid"])
+            self.assertTrue(checked["value_audit"]["final_values_complete"])
+            self.assertEqual(checked["counts"]["rows"], 0)
+
+    def test_region_store_zip_is_not_delivery_zip_and_private_fields_are_ignored(self):
+        s = settings()
+        payload = detail(1000)
+        node = payload["productDetails"]["1000"]
+        node["location"] = {"zipcode": "99503", "storeNumber": "3413", "cookie": "PRIVATE_DO_NOT_COPY"}
+        payload["storeDetails"] = {"id": "0289", "zip": "99503", "state": "AK", "auth": "PRIVATE_DO_NOT_COPY"}
+        unverified = rules.region_evidence(payload, "1000", s, "289", "productdetail")
+        self.assertEqual(unverified["status"], "unverified")
+        self.assertEqual(unverified["response"]["store"]["zip"], "99503")
+        self.assertEqual(unverified["request"]["delivery_zip"], "10010")
+        self.assertNotIn("PRIVATE_DO_NOT_COPY", json.dumps(unverified))
+        node["deliveryZipCode"] = "10010"
+        self.assertEqual(rules.region_evidence(payload, "1000", s, "289", "productdetail")["status"], "delivery_zip_match")
+        node["deliveryZipCode"] = "60601"
+        self.assertEqual(rules.region_evidence(payload, "1000", s, "289", "productdetail")["status"], "delivery_zip_mismatch")
+
+    def test_region_is_connected_to_jsonl_and_offline_report_without_extra_apis(self):
+        class RegionAPI(FakeAPI):
+            def get(self, path, label, item="", *args, **kwargs):
+                result = super().get(path, label, item, *args, **kwargs)
+                if label == "productdetail":
+                    result.payload["storeDetails"] = {"zip": "99503", "state": "AK"}
+                    if item == "1001":
+                        result.payload["productDetails"][item]["deliveryZipCode"] = "10010"
+                    if item == "1002":
+                        result.payload["productDetails"][item]["deliveryZipCode"] = "60601"
+                return result
+        api = RegionAPI()
+        api.main_cards = [card(i) for i in range(1000, 1003)]
+        api.bsr_cards = list(api.main_cards)
+        with scratch() as root:
+            rows, summary = self.collect(api, root, main_limit=3, bsr_limit=3)
+            self.assertEqual(summary["region"]["detail_delivery_zip_status"],
+                             {"unverified": 1, "delivery_zip_match": 1, "delivery_zip_mismatch": 1})
+            self.assertEqual(summary["collection_status"], "partial_failure")
+            records = value_audit.read_records(root / "audit" / "value_audit.jsonl")
+            self.assertEqual(records[0]["region"]["main"]["request"]["delivery_zip"], "10010")
+            self.assertEqual(check_run(root)["region"], summary["region"])
+            self.assertEqual({label for label, _ in api.calls}, {"main", "bsr", "productdetail", "reviews"})
+
+    def test_price_presence_rules_do_not_modify_values_and_preserve_zero(self):
+        for selling, original, saving, reasons in (
+            (499, None, None, []), (0, None, None, []), (499, 719, 220, []),
+            (499, 719, None, ["missing_savings_with_both_prices"]),
+            (None, 719, 220, ["missing_selling_with_savings"]),
+            (0, 719, 0, []),
+        ):
+            row = dict(final_row(), final_sku_price=selling, original_sku_price=original, savings=saving)
+            before = dict(row)
+            self.assertEqual([w["reason"] for w in rules.price_combination_warnings(row)], reasons)
+            self.assertEqual(row, before)
+
+    def test_price_warnings_in_jsonl_summary_and_checker_without_filling_missing_prices(self):
+        class PriceAPI(FakeAPI):
+            def get(self, path, label, item="", *args, **kwargs):
+                result = super().get(path, label, item, *args, **kwargs)
+                if label == "productdetail":
+                    price = result.payload["productDetails"][item]["mfePrice"]["price"]
+                    if item in {"1000", "1001"}:
+                        price["savings"]["totalSaving"] = None
+                    if item == "1000":
+                        price["additionalData"]["wasPrice"] = None
+                    if item == "1002":
+                        price["additionalData"]["sellingPrice"] = None
+                return result
+        api = PriceAPI()
+        api.main_cards = [card(i) for i in range(1000, 1003)]
+        api.main_cards[0]["location"]["price"].update(wasPrice=None, totalSaving=None)
+        api.main_cards[1]["location"]["price"]["totalSaving"] = None
+        api.main_cards[2]["location"]["price"]["sellingPrice"] = None
+        api.bsr_cards = list(api.main_cards)
+        with scratch() as root:
+            rows, summary = self.collect(api, root, main_limit=3, bsr_limit=3)
+            self.assertEqual(len(summary["price_checks"]), 2)
+            self.assertIsNone(rows[0]["original_sku_price"])
+            self.assertIsNone(rows[0]["savings"])
+            self.assertIsNone(rows[1]["savings"])
+            self.assertIsNone(rows[2]["final_sku_price"])
+            checked = check_run(root)
+            self.assertEqual(checked["price_checks"], summary["price_checks"])
+            records = value_audit.read_records(root / "audit" / "value_audit.jsonl")
+            self.assertEqual(records[0]["price_checks"], [])
+            self.assertEqual(len(records[1]["price_checks"]), 1)
+
+    def test_checker_identifies_non_target_in_final_even_when20_values_match(self):
+        api = FakeAPI()
+        api.main_cards = [card(1000)]
+        api.bsr_cards = list(api.main_cards)
+        with scratch() as root:
+            self.collect(api, root, main_limit=1, bsr_limit=1)
+            path = root / "audit" / "value_audit.jsonl"
+            record = json.loads(path.read_text())
+            record["product_kind"] = "combo"
+            record["classification"]["eligible"] = False
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with self.assertRaises(value_audit.DryerAuditError) as error:
+                check_run(root)
+            self.assertEqual(error.exception.differences[0]["item"], "1000")
+            self.assertEqual(error.exception.differences[0]["column"], "product_kind")
+
+    def test_interrupt_preserves_exclusions_and_inflight_listing(self):
+        class Interrupted(FakeAPI):
+            def get(self, path, label, item="", *args, **kwargs):
+                if label == "productdetail" and item == "1001":
+                    raise KeyboardInterrupt()
+                return super().get(path, label, item, *args, **kwargs)
+        api = Interrupted()
+        api.main_cards[0] = card(1000, "Washer Dryer Combo")
+        api.main_cards[1] = card(1001, "Unclear appliance")
+        with scratch() as root:
+            with self.assertRaises(KeyboardInterrupt):
+                self.collect(api, root)
+            excluded = json.loads((root / "audit" / "excluded_items.jsonl").read_text())
+            self.assertEqual(excluded["item"], "1000")
+            records = {r["item"]: r for r in value_audit.read_records(root / "audit" / "value_audit.jsonl")}
+            self.assertEqual(records["1000"]["status"], "excluded")
+            self.assertEqual(records["1001"]["status"], "pending_selection")
+            self.assertFalse((root / "output" / "final_output.csv").exists())
+
+    def test_region_switching_scales_with_pages_not_product_count(self):
+        class SwitchAPI(FakeAPI):
+            def __init__(self):
+                super().__init__()
+                self.switches = []
+            def set_region(self, store):
+                super().set_region(store)
+                self.switches.append(store)
+        api = SwitchAPI()
+        with scratch() as root:
+            _, summary = self.collect(api, root)
+            self.assertLessEqual(len(api.switches), 2 * (summary["main_pages"] + summary["bsr_pages"]) + 4)
+
+    def test_conflicting_list_classification_stops_before_output_and_reviews(self):
+        api = FakeAPI()
+        api.bsr_cards[0] = card(1000, "Top-Load Washer")
+        with scratch() as root:
+            with self.assertRaisesRegex(CollectionError, "conflicting_product_classification"):
+                self.collect(api, root)
+            self.assertFalse((root / "output" / "final_output.csv").exists())
+            self.assertEqual(sum(n for (label, _), n in api.calls.items() if label == "reviews"), 0)
 
 
 if __name__ == "__main__":

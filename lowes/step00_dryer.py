@@ -28,7 +28,7 @@ class SettingsError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    main_limit: int = 100
+    main_limit: int = 300
     bsr_limit: int = 100
     page_size: int = 24
     max_main_pages: int = 30
@@ -86,7 +86,7 @@ class Settings:
                 raise SettingsError(f"invalid setting: {name}") from None
 
         return cls(
-            main_limit=integer("LOWES_DRYER_MAIN_LIMIT", 100),
+            main_limit=integer("LOWES_DRYER_MAIN_LIMIT", 300),
             bsr_limit=integer("LOWES_DRYER_BSR_LIMIT", 100),
             max_main_pages=integer("LOWES_DRYER_MAX_MAIN_PAGES", 30),
             attempts=integer("LOWES_DRYER_MAX_ATTEMPTS", 3),
@@ -317,37 +317,94 @@ def category_text(value):
     return public_text(value)
 
 
-def product_kind(product):
-    """Use explicit title/taxonomy/spec evidence, not brand/model heuristics."""
-    name = normalized_key(first_value(product.get("description"), product.get("name")))
-    categories = normalized_key(category_text(product.get("categories", {})))
-    appliance = " ".join(normalized_key(s["value"]) for s in spec_entries(product)
+def classification_evidence(product):
+    """Allowlist only the actual product's identity/taxonomy/package fields."""
+    keys = {"appliance type", "product type", "package quantity", "number of pieces",
+            "bundle type", "package type", "dryer load type"}
+    return {"description": public_text(product.get("description")),
+            "name": public_text(product.get("name")),
+            "pdURL": public_text(product.get("pdURL")),
+            "categories": category_text(product.get("categories", {})),
+            "package_fields": {key: product[key] for key in ("isBundle", "isPackage", "isCollection")
+                               if isinstance(product.get(key), bool)},
+            "type": public_text(product.get("type")),
+            "package_components": {key: [{field: public_text(component.get(field))
+                                           for field in ("omniItemId", "modelId", "description")}
+                                          for component in product[key] if isinstance(component, dict)]
+                                   for key in ("bundleProducts", "packageProducts", "bundleComponents", "packageComponents")
+                                   if isinstance(product.get(key), list)},
+            "specs": [entry for entry in spec_entries(product)
+                      if normalized_key(entry["key"]) in keys
+                      or normalized_key(entry["key"]).startswith(("dryer capacity", "washer dryer capacity",
+                                                                  "washer and dryer capacity"))]}
+
+
+def product_classification(product):
+    """Classify the sold SKU, never recommendations or a parent laundry breadcrumb."""
+    evidence = classification_evidence(product)
+    raw_name = public_text(first_value(product.get("description"), product.get("name")))
+    name = normalized_key(raw_name)
+    # Optional/compatible/matching products do not belong to this sold SKU.
+    note = re.search(r"\b(?:compatible with|works with|for use with|recommended|optional)\b", name)
+    if note:
+        name = name[:note.start()].strip()
+    separate = re.search(r"\b(?:with|and|plus)\b[^,;]*\b(?:sold separately|not included)\b", name)
+    if separate:
+        name = name[:separate.start()].strip()
+    evidence["classification_title"] = name
+    categories = normalized_key(evidence["categories"])
+    appliance = " ".join(normalized_key(s["value"]) for s in evidence["specs"]
                          if normalized_key(s["key"]) == "appliance type")
-    specs, _ = dryer_specs(product)
+    def result(kind, reason):
+        return {"kind": kind, "eligible": kind == "dryer", "reason": reason, "evidence": evidence}
+    if "/collections/" in public_text(product.get("pdURL")):
+        return result("bundle", "collection_card")
+    if any(evidence["package_fields"].values()) or normalized_key(evidence["type"]) in {"bundle", "package", "collection", "set"}:
+        return result("bundle", "explicit_package_flag")
+    components = [entry for entries in evidence["package_components"].values() for entry in entries]
+    identities = {entry["omniItemId"] or entry["modelId"] or entry["description"] for entry in components}
+    identities.discard("")
+    if len(identities) > 1:
+        return result("bundle", "multiple_package_products")
+    if re.search(r"\s\+\s", raw_name):
+        companion_title = normalized_key(raw_name.split("+", 1)[1])
+        if re.search(r"\b(?:dryer|washer|pedestal|power cord|refrigerator|freezer|microwave|dishwasher|oven|range|air purifier|air conditioner)\b", companion_title):
+            return result("bundle", "multiple_products_in_title")
+    for spec in evidence["specs"]:
+        key, value = normalized_key(spec["key"]), normalized_key(spec["value"])
+        if key in {"package quantity", "number of pieces"} and re.fullmatch(r"\d+", value) and int(value) > 1:
+            return result("bundle", "multiple_piece_package")
+        if key in {"bundle type", "package type", "product type"} and value in {"bundle", "package", "set", "laundry pair"}:
+            return result("bundle", "explicit_package_spec")
+    if re.search(r"\b(?:bundle|bundled|package|set)\b|\b[2-9]\s*(?:piece|pc)\b|\blaundry pair\b", name):
+        return result("bundle", "package_in_product_title")
+    companion = r"(?:pedestal|power cord|cord kit|installation kit|vent kit|stacking kit|washer|washing machine|refrigerator|freezer|microwave|dishwasher|oven|range|air purifier|air conditioner)"
+    if re.search(r"\b(?:with|and|plus|including|includes)\s+(?:(?:an?|the|included|matching)\s+)?(?:\d+\s+)?" + companion + r"\b", name):
+        return result("bundle", "dryer_with_other_product")
     title = name + " " + appliance
-    combo = bool(re.search(r"\bwasher\b.*\bdryer\b|\bdryer\b.*\bwasher\b", title)
-                 or "laundry center" in title)
-    # A device with a bundled pedestal/cord remains a device when its specs prove it.
-    if specs["loading_type"] or specs["capacity"] or re.search(r"\b(?:electric|gas) dryer\b", appliance):
-        return "combo" if combo else "dryer"
+    if (re.search(r"\bwashers?\b.*\bdryers?\b|\bdryers?\b.*\bwashers?\b", title)
+            or re.search(r"\blaundry (?:center|centre|tower)\b|\bwash ?tower\b", title)):
+        return result("combo", "washer_dryer_combination")
+    if re.search(r"all in one.*washer.*dryer|washer dryer combo|laundry center|laundry tower", categories):
+        return result("combo", "integrated_product_category")
     if re.search(r"\b(?:hair dryer|stacking kit|dryer cord|dryer duct|dryer vent kit|pedestal)\b", name):
-        return "other"
-    if combo:
-        return "combo"
+        return result("other", "accessory_or_non_laundry_dryer")
     if re.search(r"\bwashers?\b|\bwashing machines?\b", title) and not re.search(r"\bdryers?\b", title):
-        return "washer"
-    if re.search(r"\bdryers?\b", title):
-        return "dryer"
-    # A parent breadcrumb 'Washers & Dryers' is not evidence of a standalone dryer.
-    if re.search(r"all in one.*washer.*dryer|laundry center", categories):
-        return "combo"
+        return result("washer", "standalone_washer")
+    specs, _ = dryer_specs(product)
+    if re.search(r"\bdryers?\b", title) or specs["loading_type"] or specs["capacity"]:
+        return result("dryer", "standalone_dryer_evidence")
     if re.search(r"\bwashing machines?\b", categories):
-        return "washer"
-    category_washer = bool(re.search(r"\bwashers?\b", categories))
-    category_dryer = bool(re.search(r"\bdryers?\b", categories))
-    if category_washer != category_dryer:
-        return "washer" if category_washer else "dryer"
-    return "unknown"
+        return result("washer", "washing_machine_category")
+    washer = bool(re.search(r"\bwashers?\b", categories))
+    dryer = bool(re.search(r"\bdryers?\b", categories))
+    if washer != dryer:
+        return result("washer" if washer else "dryer", "exclusive_product_category")
+    return result("unknown", "product_kind_unconfirmed")
+
+
+def product_kind(product):
+    return product_classification(product)["kind"]
 
 
 def parse_card(card, page, position, occurrence_rank):
@@ -370,8 +427,11 @@ def parse_card(card, page, position, occurrence_rank):
         "rating": rating_source(product.get("rating")), "review_count": review_count_source(product.get("reviewCount")),
         "sponsored": str(product.get("sponsored", card.get("sponsored", False))).lower() in {"true", "1"}
         if isinstance(product.get("sponsored", card.get("sponsored", False)), (str, bool, int)) else False,
-        "kind": product_kind(product), "_listing_product": {
-            "description": public_text(product.get("description")),
+        "kind": product_kind(product), "_classification": dict(product_classification(product), source="listing"), "_listing_product": {
+            "description": public_text(product.get("description")), "name": public_text(product.get("name")),
+            "pdURL": path, "type": public_text(product.get("type")),
+            **{key: product[key] for key in ("bundleProducts", "packageProducts", "bundleComponents", "packageComponents") if isinstance(product.get(key), list)},
+            **{key: product[key] for key in ("isBundle", "isPackage", "isCollection") if isinstance(product.get(key), bool)},
             "categories": product.get("categories") or {}, "specs": spec_entries(product),
         },
     }
@@ -396,7 +456,7 @@ def select_main(rows, limit):
         if not item or item in seen:
             continue
         seen.add(item)
-        if row.get("kind") in {"washer", "other"} or "/collections/" in row.get("product_url", ""):
+        if row.get("kind") != "dryer" or "/collections/" in row.get("product_url", ""):
             continue
         selected = dict(row, main_rank=len(result) + 1, page_type="main", selection_source="main")
         result.append(selected)
@@ -415,6 +475,8 @@ def select_bsr(rows, limit):
         if not item or item in seen:
             continue
         seen.add(item)
+        if row.get("kind") != "dryer" or "/collections/" in row.get("product_url", ""):
+            continue
         result.append(dict(row, bsr_rank=len(result) + 1,
                            original_bsr_rank=row["original_rank"], page_type="bsr"))
     return result
@@ -518,7 +580,7 @@ def finalize_dryer(row, batch_id, crawl_dt, legacy_finalize):
     return {key: None if value == "" else value for key, value in output.items()}
 
 
-def validate_rows(rows, main_limit=None, bsr_limit=None):
+def validate_rows(rows, main_limit=None, bsr_limit=None, allow_empty=False):
     seen = set()
     ranks = {"main_rank": [], "bsr_rank": []}
     batches = set()
@@ -550,7 +612,7 @@ def validate_rows(rows, main_limit=None, bsr_limit=None):
                 ranks[column].append(rank)
         if row.get("main_rank") in (None, "") and row.get("bsr_rank") in (None, ""):
             raise ValueError("product has neither rank")
-    if len(batches) != 1 or not rows:
+    if (rows and len(batches) != 1) or (not rows and not allow_empty):
         raise ValueError("one nonempty batch is required")
     for column, values in ranks.items():
         if sorted(values) != list(range(1, len(values) + 1)):
@@ -604,3 +666,45 @@ def coerce_db_value(column, value, data_type):
     if data_type in {"text", "character varying", "character"}:
         return str(value)
     raise ValueError(f"unsupported DB type for column: {column}")
+
+
+
+def price_combination_warnings(row):
+    """Validate presence only; do not calculate or change any collected prices."""
+    present = lambda value: value not in (None, "")
+    selling, original, saving = (present(row.get(c)) for c in
+                                  ("final_sku_price", "original_sku_price", "savings"))
+    warnings = []
+    if selling and original and not saving:
+        warnings.append({"item": row["item"], "sku": row.get("sku"),
+                         "reason": "missing_savings_with_both_prices", "column": "savings"})
+    if saving and not selling:
+        warnings.append({"item": row["item"], "sku": row.get("sku"),
+                         "reason": "missing_selling_with_savings", "column": "final_sku_price"})
+    return warnings
+
+
+def region_evidence(payload, item, settings, store, api):
+    """Public region metadata only. Store/local ZIP is not a delivery ZIP."""
+    root = payload if isinstance(payload, dict) else {}
+    details = root.get("productDetails") if isinstance(root.get("productDetails"), dict) else {}
+    node = details.get(str(item)) if isinstance(details.get(str(item)), dict) else root
+    location = node.get("location") if isinstance(node.get("location"), dict) else {}
+    store_details = root.get("storeDetails") if isinstance(root.get("storeDetails"), dict) else {}
+    def scalars(obj, names):
+        return {key: public_text(obj[key]) for key in names
+                if isinstance(obj.get(key), (str, int)) and not isinstance(obj.get(key), bool)}
+    delivery = []
+    for path, obj in (("root", root), ("product", node), ("location", location)):
+        for key, value in scalars(obj, ("deliveryZipCode", "deliveryZip", "shippingZipCode")).items():
+            delivery.append({"path": path + "." + key, "value": value})
+    zips = {entry["value"] for entry in delivery}
+    status = "unverified" if not zips else "delivery_zip_match" if zips == {settings.zip_code} else "delivery_zip_mismatch"
+    return {"request": {"delivery_zip": settings.zip_code, "state": settings.state,
+                         "store_id": str(store).zfill(4), "nearby_store": settings.nearby_store, "api": api},
+            "response": {"delivery": delivery,
+                         "location": scalars(location, ("zipcode", "zipCode", "storeNumber", "state")),
+                         "store": scalars(store_details, ("id", "storeNumber", "zip", "zipCode", "state"))},
+            "status": status,
+            "reason": "no_explicit_delivery_zip" if not zips else "explicit_delivery_zip",
+            "price_region_verified": False}

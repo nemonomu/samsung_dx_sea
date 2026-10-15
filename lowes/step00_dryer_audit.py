@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 import uuid
 
-from .step00_dryer import COLUMNS, detail_product, normalized_key, positive_id
+from .step00_dryer import (COLUMNS, classification_evidence, detail_product, normalized_key,
+                           positive_id, price_combination_warnings)
 
 
 class DryerAuditError(ValueError):
@@ -50,7 +51,7 @@ def project_listing(card):
     return {**{key: raw_scalar(product.get(key)) for key in (
         "omniItemId", "modelId", "brand", "description", "pdURL", "rating", "reviewCount")},
         "price": {key: raw_scalar(price.get(key)) for key in ("sellingPrice", "wasPrice", "totalSaving")},
-        "specs": projected_specs(product)}
+        "specs": projected_specs(product), "classification_evidence": classification_evidence(product)}
 
 
 def project_detail(payload, item):
@@ -66,7 +67,7 @@ def project_detail(payload, item):
                   "wasPrice": raw_scalar(additional.get("wasPrice")),
                   "totalSaving": raw_scalar(savings.get("totalSaving"))},
         "price_schema": "present" if isinstance(mfe.get("price"), dict) else "absent_or_invalid",
-        "specs": projected_specs(product)}
+        "specs": projected_specs(product), "classification_evidence": classification_evidence(product)}
 
 
 def project_reviews(payload):
@@ -99,11 +100,14 @@ def fallback_listing(source):
 def source_record(source, response, reviews, batch_id, status="detail_received", main=None, bsr=None):
     item = source["omni_item_id"]
     selected = source.get("_audit_listing") or fallback_listing(source)
-    listing_type = source.get("selection_source") or source.get("page_type") or "main"
+    listing_type = source.get("selection_source") or source.get("page_type") or source.get("_list_type") or "main"
     detail = project_detail(response.payload, item) if response and response.ok else None
     return {"schema_version": 1, "item": item, "sku": source.get("model_id") or None,
             "batch_id": batch_id, "status": status, "selection_source": listing_type,
-            "product_kind": source.get("kind"),
+            "product_kind": source.get("kind"), "classification": source.get("_classification"),
+            "region": {"main": main.get("_listing_region") if main else source.get("_listing_region") if listing_type == "main" else None,
+                       "bsr": bsr.get("_listing_region") if bsr else source.get("_listing_region") if listing_type == "bsr" else None,
+                       "productdetail": getattr(response, "region", None)},
             "source_values": {"listing": selected,
                 "main": main.get("_audit_listing") if main else selected if listing_type == "main" else None,
                 "bsr": bsr.get("_audit_listing") if bsr else selected if listing_type == "bsr" else None,
@@ -230,6 +234,7 @@ def value_record(source, row, audit, response, reviews, output, batch_id, crawl_
                                null_reason=null_reason)
         fields[column]["source_spec_reason"] = reason
     record["fields"] = {column: fields[column] for column in COLUMNS}
+    record["price_checks"] = price_combination_warnings(output)
     return record
 
 
@@ -241,6 +246,11 @@ class AuditJournal:
         self.flush()
 
     def upsert(self, record):
+        previous = self.records.get(record["item"], {})
+        for section in ("source_values", "occurrences", "api", "region"):
+            for listing_type in ("main", "bsr"):
+                if record.get(section, {}).get(listing_type) is None and previous.get(section, {}).get(listing_type) is not None:
+                    record.setdefault(section, {})[listing_type] = previous[section][listing_type]
         self.records[record["item"]] = record
         self.flush()
 
@@ -258,11 +268,13 @@ class AuditJournal:
             record["source_values"][listing_type] = source.get("_audit_listing") or fallback_listing(source)
             record["occurrences"][listing_type] = {key: source.get(key) for key in ("page", "rank_in_page", "original_rank")}
             record["api"][listing_type] = source.get("_listing_api")
+            record.setdefault("region", {})[listing_type] = source.get("_listing_region")
         self.flush()
 
     def finish(self, rows):
         final_by_id = {row["item"]: row for row in rows}
         for item, record in self.records.items():
+            record["selection_complete"] = True
             if item not in final_by_id:
                 record.update(status="excluded", final_values=None, fields=None)
                 record.setdefault("exclusion_reason", "outside_final_targets")
@@ -347,7 +359,7 @@ def audit_summary(records):
                                       if record.get("fields") and record["fields"][column]["value"] is None))
                     for column in COLUMNS}
     return {"products": len(records), "statuses": statuses,
-            "final_values_complete": statuses.get("final", 0) > 0 and all(record["status"] in {"final", "excluded"} for record in records),
+            "final_values_complete": bool(records) and (statuses.get("final", 0) > 0 or all(record.get("selection_complete") for record in records)) and all(record["status"] in {"final", "excluded"} for record in records),
             "null_reasons": null_reasons}
 
 
@@ -372,3 +384,44 @@ def compare_csv(records, rows):
     if differences:
         raise DryerAuditError("audit_csv_mismatch", differences)
     return {"audit_csv_match": True, "compared_columns": list(COLUMNS), "products": len(rows)}
+
+
+
+class ExclusionJournal(AuditJournal):
+    """Separate, atomic exclusion evidence; also accepts collection cards without IDs."""
+    def capture(self, source, batch_id, response=None):
+        item = positive_id(source.get("omni_item_id")) or None
+        key = item or source.get("product_url")
+        classification = source.get("_classification") or {}
+        previous = self.records.get(key, {})
+        record = {"item": item, "sku": source.get("model_id") or None,
+                  "product_url": source.get("product_url"), "batch_id": batch_id,
+                  "reason": classification.get("reason", "product_kind_unconfirmed"),
+                  "kind": source.get("kind"), "classification": classification,
+                  "occurrences": dict(previous.get("occurrences", {})),
+                  "api": dict(previous.get("api", {}))}
+        listing_type = source.get("_list_type", "main")
+        record["occurrences"][listing_type] = {k: source.get(k) for k in ("page", "rank_in_page", "original_rank")}
+        record["api"][listing_type] = source.get("_listing_api")
+        if response is not None:
+            record["api"]["productdetail"] = api_summary(response)
+        elif previous.get("api", {}).get("productdetail"):
+            record["api"]["productdetail"] = previous["api"]["productdetail"]
+        self.records[key] = record
+        self.flush()
+
+
+def region_summary(records):
+    counts = Counter()
+    results = []
+    for record in records:
+        if record["status"] != "final":
+            continue
+        region = record.get("region") or {}
+        detail = region.get("productdetail")
+        status = (detail or {}).get("status", "unverified")
+        counts[status] += 1
+        results.append({"item": record["item"], "sku": record.get("sku"), "status": status,
+                        "reason": (detail or {}).get("reason", "no_detail_region_evidence")})
+    return {"detail_delivery_zip_status": dict(counts), "price_region_verified": False,
+            "results": results}

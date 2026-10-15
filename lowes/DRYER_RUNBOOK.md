@@ -21,7 +21,7 @@ cd C:\samsung_dx_sea
 .\lowes\lowes_dryer_daily_task.bat
 ```
 
-기본값은 우편번호 **10010**, 메인 대상 최대 **100개**, Dryers BSR 표시 **1~100위**임.
+기본값은 우편번호 **10010**, 메인 대상 최대 **300개**, Dryers BSR 표시 **1~100위**임.
 메인은 Top Sellers(`sortBy_featured`), BSR은 `sortBy_bestSellers` API를 사용함.
 기존 LDY의 매장 환경 설정을 재사용하고, 우편번호는 상속된 값과 관계없이 10010을 적용함.
 기존 코드 기본 매장은 메인 1674, 상세 289임. `LOWES_API_STORE_ID`가 설정돼 있으면 양쪽에 적용함.
@@ -33,13 +33,21 @@ cd C:\samsung_dx_sea
 기본 BAT은 `public.ldy_dryer_retail_test`에 적재함.
 테이블 생성·변경, 다른 배치 삭제, 다른 크롤러 실행은 포함하지 않음.
 
-메인의 확실한 단독 세탁기와 비대상 제품은 제외하고, 건조기·일체형의 광고는 포함함.
-여러 SKU를 묶은 `/collections/` 카드는 기존 LDY처럼 개별 상품 대상에서 제외함.
-종류가 애매하면 상세를 확인하며, 확인 실패는 검수 경고로 남김.
-BSR은 해당 카테고리에 표시된 상품 전체를 포함함.
-상품 ID 중복은 첫 노출을 유지하고 목록별 순위를 다시 부여함.
-공통 상품은 한 번의 상세 수집 대상으로 묶고, 한 행에 두 순위를 저장함. 최종 행 수는 최대 200개임.
-중복 때문에 BSR 고유 상품 수가 100개보다 적어도 101위를 가져와 채우지 않음.
+메인·BSR 모두 **단독 건조기만** 포함하며 해당 제품의 Sponsored 광고도 포함함.
+세탁기·건조기 세트, 건조기와 다른 상품의 묶음, 세탁건조 일체형, 단독 세탁기는 제외함.
+실제 판매 상품의 이름·사양·분류·묶음 표시로 판단하며, 추천·호환·선택품·별매 문구만으로 제외하지 않음.
+여러 SKU를 묶은 `/collections/` 카드도 제외하며 숫자 상품 ID가 없어도 목록 오류로 취급하지 않음.
+목록에서 명확한 비대상은 상세·리뷰를 호출하지 않음. 나머지는 상세로 확인한 뒤 대상 순위를 확정함.
+상세 응답은 캐시해 메인·BSR 공통 상품과 이후 값 수집에 재사용하며, 비대상은 리뷰를 호출하지 않음.
+상세 실패 시 목록에 단독 건조기 근거가 있으면 확보한 값으로 유지함.
+목록으로도 종류를 확인할 수 없는 상품은 제외 근거와 API 실패·미확인 사유를 남기며 일부 실패로 보고함.
+상품 ID 중복은 첫 노출을 유지하고 중복·비대상 제거 후 목록별 연속 순위를 다시 부여함.
+메인은 유효 상품 최대 300개를 채우거나 사이트 목록이 끝날 때까지 진행함.
+BSR은 **표시 1~100위**만 확인한 뒤 중복·비대상을 제외함. 100개 미만이어도 101위 이후로 보충하지 않음.
+`original_rank`·`original_bsr_rank` 및 JSONL `occurrences`로 제외 전 노출 순위를 추적할 수 있음.
+공통 상품은 한 행에 두 순위를 저장함. 기본 한도에서 최종 행 수는 최대 400개임.
+별도 환경변수 입력 없이 위 단독 BAT만 실행하면 됨.
+수집 제한은 `LOWES_DRYER_MAIN_LIMIT`·`LOWES_DRYER_BSR_LIMIT` 설정으로 변경 가능함. 이미 설정된 값이 있으면 BAT 기본값보다 우선하므로 시작 로그의 `main_limit`·`bsr_limit`를 확인함.
 
 최종 컬럼은 요청한 20개임. `id`는 실제 테이블의 자동 생성 규칙을 따름.
 텍스트 가격은 기존 LDY처럼 `$499` 형식이며, DB가 숫자형이면 적재 전에 숫자로 변환함.
@@ -50,7 +58,7 @@ BSR은 해당 카테고리에 표시된 상품 전체를 포함함.
 평가 수는 리뷰 수와 같으며, 실제 0과 미수집 NULL을 구분함.
 음수 가격·리뷰 수, 소수 리뷰 수, 0~5 범위를 벗어난 평점은 사용하지 않고 검수 경고로 남김.
 정상 모델명을 다른 식별값으로 교체하지 않고, 목록·상세 모델 불일치는 경고로 남김.
-상세에서 메인 전용 비대상 상품으로 확인되면 리뷰 호출은 생략함. BSR 상품은 계속 수집함.
+메인·BSR 모두 상세에서 비대상으로 확인되면 제외하고 리뷰 호출을 생략함.
 API 응답에 다른 정보가 함께 올 수 있지만 배송·픽업·리뷰 본문 등을 별도로 추출·적재하지 않음.
 
 ## 결과와 로그 위치
@@ -68,6 +76,7 @@ C:\samsung_dx_sea\lowes\data\dryer\<YYYYMMDD>\<batch_id>\
   output\final_targets.csv
   output\final_output.csv           정확히 20개 컬럼, id는 자동 생성 전 빈칸
   audit\spec_audit.csv               사양명·원본값·정규화값·NULL 사유·조회 매장
+  audit\excluded_items.jsonl         제외 상품 ID·SKU·사유·판정 원본·목록별 원래 순위·API 상태
   audit\value_audit.jsonl            상품 ID별 원본값·최종 20개 값·출처·정리 과정·NULL 사유
   audit\failures.json                최종 실패 API·HTTP 상태·재시도 수·영향 컬럼·실제 NULL 컬럼
   audit\quality_warnings.json        미분류·모델 불일치·사양 충돌 등
@@ -84,6 +93,7 @@ API 응답 전체·쿠키·인증 헤더·DB 접속 값은 결과 파일이나 �
 JSONL은 현재 응답의 필요한 공개 상품값만 선택해 기록하며, 별도 쇼핑몰 API를 호출하지 않음.
 
 종료 코드는 **0 정상**, **2 일부 실패·품질 경고**, **1 실패**, **130 중단**임.
+유효 대상이 0개이면 헤더와 검수 파일을 저장하고 DB 적재를 생략함(`db_skip_reason=no_eligible_products`).
 2여도 확보한 값은 테스트 테이블에 적재될 수 있음. `manifest.json`의 `db_loaded`로 적재 여부를 확인함.
 메인 대상이 부족하면 실제 건수와 부족 사유를 기록함. 목록 호출 실패·반복 페이지 등은 정상 완료로 처리하지 않음.
 BSR이 요청한 표시 순위에 도달하기 전에 비정상적으로 끝나면 실패로 보고함.
@@ -97,11 +107,15 @@ BSR이 요청한 표시 순위에 도달하기 전에 비정상적으로 끝나�
 - `final_values`: 최종 CSV에 들어가는 20개 값. 자동 생성 전 `id`는 NULL임.
 - `fields`: 컬럼마다 원본값, 사용한 출처, 정리 규칙, 최종값, NULL 사유를 보여줌.
 - `api`: 목록·상세·리뷰 API의 상태와 시도 수. 리뷰 본문·헤더·응답 전체는 포함하지 않음.
+- `classification`: 실제 판매 상품의 판정 결과·원본 근거·사용 출처.
+- `region`: 요청 배송 ZIP·매장 ID와 응답의 공개 지역 항목.
+- `price_checks`: 가격 항목 간 누락 조합. 기존 가격값을 변경하거나 계산하지 않음.
 
 예를 들어 목록 가격이 499, 상세 가격이 599이면 두 값을 보관하고,
 `final_sku_price`의 출처가 목록이며 최종값이 `$499`임을 확인할 수 있음.
 리뷰 수는 상세 통계 우선·목록 보완이며, 실제 0은 NULL 사유 없이 0으로 기록됨.
-일체형 공용 용량은 원본값이 있어도 `shared_capacity_only` 사유와 최종 NULL을 기록함.
+일체형은 적재 대상에서 제외하며 원본 판정 근거는 제외 자료에 남김.
+대상 건조기의 용량이 공용 사양으로만 제공되면 `shared_capacity_only` 사유와 최종 NULL을 기록함.
 원천 부재·잘못된 값·수집 실패·가격 동일로 원래 가격 제거·목록에 없는 순위 등을 구분함.
 국가·계정은 `fixed`, 순위·주차는 `derived`, 날짜·배치는 `run_metadata`, id는 `db_generated`로 구분함.
 
@@ -141,7 +155,9 @@ python -m lowes.step14_dryer_db_load --csv "<run_root>\output\final_output.csv" 
 ```
 
 첫 명령은 외부 접속 없이 JSONL 확정값과 CSV의 전체 20개 컬럼을 대조하고,
-CSV 컬럼·중복·순위·리뷰 수 일치·누락 사유도 검사함. 미확정 JSONL은 정상 대조로 처리하지 않음.
+CSV 컬럼·중복·순위·리뷰 수 일치·누락 사유도 검사함.
+새 회차는 목록 CSV에서 제외·순위를 다시 계산하고, 제외 자료와 최종 상품이 겹치지 않는지도 검사함.
+수정 전 회차도 기존 20개 컬럼 대조는 가능하며 `selection.verified=false`·`legacy_selection_policy`로 구분함. 미확정 JSONL은 정상 대조로 처리하지 않음.
 둘째 명령은 DB를 읽어서 해당 배치의 가격·평점·리뷰 수·메타정보까지 CSV와 비교함.
 DB 자동 생성 id는 NULL 여부·배치 내 중복을 따로 검사하며 나머지 19개 컬럼을 자료형에 맞춰 대조함.
 자동 생성 규칙이 아닌 id는 CSV값과 직접 대조함. 가격의 소수·용량과 평점의 실수 저장 오차도 고려함.
@@ -202,6 +218,39 @@ DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
 python -m unittest -q lowes.test_dryer lowes.test_step00_uc
 ```
 
-신규 검사는 가짜 API 응답과 가짜 DB 연결로 100/100 제한·병합·사양·실패 유지·트랜잭션을 확인함.
+신규 검사는 가짜 API 응답과 가짜 DB 연결로 100/100 및 300/100 설정·제외·병합·사양·실패 유지·트랜잭션을 확인함.
 환경 파일·실제 쇼핑몰·실제 DB는 열지 않음. 오프라인 통과가 원격 수집 성공을 뜻하지는 않음.
 배송·픽업 검사는 건조기 필수 검사에 포함하지 않음. 기존 REF·LDY 검사 파일과 코드는 유지함.
+
+
+## 가격·지역과 제외 자료 확인
+
+가격 추출은 기존 목록 우선·상세 보완을 유지함. 장바구니 담기와 `pricingDataList` 보완은 실행하지 않음.
+판매가만 있고 원가·할인이 없는 상품은 정상임.
+원가·판매가가 있는데 할인액이 없으면 `missing_savings_with_both_prices`,
+할인액이 있는데 판매가가 없으면 `missing_selling_with_savings`로 검수 경고를 남김.
+이 경고는 `quality_warnings.json`, 상품별 JSONL `price_checks`, 오프라인 검수 출력에서 확인함.
+값을 추측하거나 할인액을 계산해 채우지 않으며, 현재 사이트 가격을 과거 수집값의 정답으로 사용하지 않음.
+
+지역 기록은 기존 응답만 사용하며 추가 배송·매장 API는 호출하지 않음.
+`region.request.delivery_zip`은 요청한 10010이고 `region.response.store`는 응답 매장의 공개 정보임.
+매장 ZIP이나 의미가 명확하지 않은 `location.zipcode`가 10010과 달라도 배송 ZIP 오류로 단정하지 않음.
+명시된 배송 ZIP이 있으면 `delivery_zip_match` 또는 `delivery_zip_mismatch`로 기록함.
+명시된 배송 ZIP이 없으면 `unverified`임. 배송 ZIP 일치만으로 가격 적용 지역까지 확정하지 않음.
+`price_region_verified=false`는 가격 지역 미검증을 뜻하며 정상 적용이 확인됐다는 뜻이 아님.
+실제 사이트 응답의 지역 의미와 값은 원격 재수집 후 검수해야 함.
+
+제외 사유별 건수는 다음과 같이 확인함.
+
+```powershell
+$dryerRunRoot = '<run_root>'
+Get-Content -LiteralPath "$dryerRunRoot\audit\excluded_items.jsonl" -Encoding UTF8 |
+    ForEach-Object { $_ | ConvertFrom-Json } |
+    Group-Object reason | Select-Object Name, Count
+python -m lowes.lowes_dryer_check --run-root "$dryerRunRoot"
+```
+
+`excluded_items.jsonl`에는 목록에서 명확하게 제외한 상품도 기록됨.
+상품 ID가 없는 묶음 카드는 `item=null`이며 상품 URL·이름·사유로 추적함.
+수집 중에도 제외 자료와 원본 JSONL을 저장하므로 중단 회차의 근거를 확인할 수 있음.
+원래 목록에서 한도 밖이었던 상품은 `value_audit.jsonl`에서 `outside_final_targets`로 구분될 수 있음.
