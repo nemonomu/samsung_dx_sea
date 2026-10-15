@@ -21,7 +21,7 @@ cd C:\samsung_dx_sea
 .\lowes\lowes_dryer_daily_task.bat
 ```
 
-기본값은 우편번호 **10010**, 메인 대상 최대 **300개**, Dryers BSR 표시 **1~100위**임.
+기본값은 우편번호 **10010**, 메인 대상 최대 **300개**, Dryers BSR 표시 **1~100위**, 상품 동시 처리 **최대 2개**임.
 메인은 Top Sellers(`sortBy_featured`), BSR은 `sortBy_bestSellers` API를 사용함.
 기존 LDY의 매장 환경 설정을 재사용하고, 우편번호는 상속된 값과 관계없이 10010을 적용함.
 기존 코드 기본 매장은 메인 1674, 상세 289임. `LOWES_API_STORE_ID`가 설정돼 있으면 양쪽에 적용함.
@@ -48,6 +48,36 @@ BSR은 **표시 1~100위**만 확인한 뒤 중복·비대상을 제외함. 100�
 공통 상품은 한 행에 두 순위를 저장함. 기본 한도에서 최종 행 수는 최대 400개임.
 별도 환경변수 입력 없이 위 단독 BAT만 실행하면 됨.
 수집 제한은 `LOWES_DRYER_MAIN_LIMIT`·`LOWES_DRYER_BSR_LIMIT` 설정으로 변경 가능함. 이미 설정된 값이 있으면 BAT 기본값보다 우선하므로 시작 로그의 `main_limit`·`bsr_limit`를 확인함.
+
+## 상품 동시 처리와 안전성
+
+BAT만 실행하면 `LOWES_DRYER_DETAIL_CONCURRENCY=2`가 기본 적용됨. 매회 설정 입력은 필요 없음.
+설정값은 **1 또는 2**만 허용하며, 기존에 1이 설정돼 있으면 순차 처리함.
+순차 처리로 비교할 때만 다음을 사용함. 비교 후 이 PowerShell 설정을 제거하면 BAT 기본값 2로 복귀함.
+
+```powershell
+$env:LOWES_DRYER_DETAIL_CONCURRENCY = '1'
+.\lowes\lowes_dryer_daily_task.bat
+Remove-Item Env:\LOWES_DRYER_DETAIL_CONCURRENCY
+```
+
+목록의 상세 대상 판정과 최종 상세·리뷰 단계에서 상품을 최대 2개까지 처리함.
+상품 내부에서는 상세 응답 확보(기존 캐시 재사용 포함) → 리뷰 API 순서임.
+먼저 끝난 작업의 자리에 다음 상품을 넣으며, 마지막 1개와 홀수 개수도 정상 처리함.
+기존 `PAGE_WAIT`는 최종 처리 작업별 대기로 유지하고, 목록 페이지 대기·재시도 설정도 유지함.
+메인 한도에 가까워지면 진행 중인 상품이 차지할 대상 수까지 예약해 불필요한 상세 요청을 막음.
+
+Python 스레드를 늘려 Selenium을 공유하지 않음. 단일 Python 실행 흐름에서 브라우저 명령을 보내고,
+브라우저 안의 API 요청만 겹치게 실행함. 요청마다 고유 번호로 응답을 회수함.
+대체 매장 조회가 필요하면 진행 중인 요청을 마친 뒤 지역 설정을 바꾸고, 조회 후 원래 매장으로 복구함.
+상품별 응답·재시도 상태는 분리하고, JSONL·CSV·로그는 한 흐름에서 기록함.
+완료 순서와 관계없이 최종 CSV는 기존 상품 순서·메인/BSR 순위를 유지함.
+진행 로그의 `[상세] 완료/전체`는 실제 처리 완료 건수이며 상품 ID가 표시됨.
+중단 시 완료 상품과 이미 받은 상세 원본은 JSONL에 남고 진행 중인 브라우저 요청은 취소함.
+
+시작 로그의 `detail_concurrency=2`, `[상세 시작] ... concurrency=2`와
+`collection_summary.json`의 `settings.detail_concurrency`로 적용값을 확인함.
+동시 처리로 전체 실행 시간이 얼마나 줄어드는지는 원격 수집 결과로 측정해야 함.
 
 최종 컬럼은 요청한 20개임. `id`는 실제 테이블의 자동 생성 규칙을 따름.
 텍스트 가격은 기존 LDY처럼 `$499` 형식이며, DB가 숫자형이면 적재 전에 숫자로 변환함.
@@ -207,7 +237,8 @@ DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
 
 환경 설정 이름: `LOWES_DRYER_MAIN_LIMIT`, `LOWES_DRYER_BSR_LIMIT`(1~100),
 `LOWES_DRYER_MAX_MAIN_PAGES`, `LOWES_DRYER_MAX_ATTEMPTS`, `LOWES_DRYER_API_TIMEOUT`,
-`LOWES_DRYER_RETRY_WAIT`, `LOWES_DRYER_PAGE_WAIT`, `LOWES_DRYER_SEED_WAIT`, `LOWES_DRYER_HEADLESS`.
+`LOWES_DRYER_RETRY_WAIT`, `LOWES_DRYER_PAGE_WAIT`, `LOWES_DRYER_SEED_WAIT`, `LOWES_DRYER_HEADLESS`,
+`LOWES_DRYER_DETAIL_CONCURRENCY`(기본 2, 허용 1~2).
 배치 이름을 지정하려면 `LOWES_DRYER_BATCH_ID`를 사용함. 기본 배치 형식은 기존 LDY의 `l_YYMMDD_HHMMSS`임.
 지역 설정·DB 연결은 기존 런타임 로더로 전달하며 비밀 설정 파일 내용을 출력할 필요 없음.
 건조기 기본 BAT은 테스트 테이블을 사용함. 본테이블 전환은 검수·별도 승인 후 진행함.
@@ -215,11 +246,13 @@ DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
 ## 로컬 오프라인 검사
 
 ```powershell
-python -m unittest -q lowes.test_dryer lowes.test_step00_uc
+python -m unittest -q lowes.test_dryer lowes.test_dryer_concurrency lowes.test_step00_uc
 ```
 
 신규 검사는 가짜 API 응답과 가짜 DB 연결로 100/100 및 300/100 설정·제외·병합·사양·실패 유지·트랜잭션을 확인함.
 환경 파일·실제 쇼핑몰·실제 DB는 열지 않음. 오프라인 통과가 원격 수집 성공을 뜻하지는 않음.
+동시 처리 검사는 지연·역순 응답, 1/2/3/7개 및 홀수 개수, 최대 동시 수,
+순차/동시 최종값·원본·순위 일치, 실패·재시도 격리, 대체 매장 전환, 중단 시 기록 보존을 포함함.
 배송·픽업 검사는 건조기 필수 검사에 포함하지 않음. 기존 REF·LDY 검사 파일과 코드는 유지함.
 
 

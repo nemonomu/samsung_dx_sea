@@ -30,6 +30,7 @@ class SettingsError(ValueError):
 class Settings:
     main_limit: int = 300
     bsr_limit: int = 100
+    detail_concurrency: int = 2
     page_size: int = 24
     max_main_pages: int = 30
     attempts: int = 3
@@ -58,6 +59,8 @@ class Settings:
             raise SettingsError("dryer ZIP must be 10010")
         if self.main_limit < 1 or not 1 <= self.bsr_limit <= 100:
             raise SettingsError("main_limit must be positive; bsr_limit must be 1..100")
+        if self.detail_concurrency not in (1, 2):
+            raise SettingsError("detail_concurrency must be 1 or 2")
         if self.page_size != 24 or self.max_main_pages < 1 or self.attempts < 1:
             raise SettingsError("invalid pagination/retry settings")
         waits = (self.retry_wait, self.page_wait, self.seed_wait)
@@ -88,6 +91,7 @@ class Settings:
         return cls(
             main_limit=integer("LOWES_DRYER_MAIN_LIMIT", 300),
             bsr_limit=integer("LOWES_DRYER_BSR_LIMIT", 100),
+            detail_concurrency=integer("LOWES_DRYER_DETAIL_CONCURRENCY", 2),
             max_main_pages=integer("LOWES_DRYER_MAX_MAIN_PAGES", 30),
             attempts=integer("LOWES_DRYER_MAX_ATTEMPTS", 3),
             timeout=integer("LOWES_DRYER_API_TIMEOUT", 45),
@@ -488,6 +492,9 @@ def detail_product(payload, item):
     node = (payload.get("productDetails") or {}).get(str(item))
     if not isinstance(node, dict) or not isinstance(node.get("product"), dict) or not node["product"]:
         raise ValueError("missing_detail_product")
+    response_item = positive_id(node["product"].get("omniItemId"))
+    if response_item and response_item != str(item):
+        raise ValueError("detail_product_id_mismatch")
     return node["product"], node
 
 

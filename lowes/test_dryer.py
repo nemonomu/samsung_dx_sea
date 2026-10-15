@@ -485,6 +485,9 @@ class FakeAPI:
         self.review_failures = set()
         self.repeated_main = False
 
+    async def get_async(self, *args, **kwargs):
+        return self.get(*args, **kwargs)
+
     def open(self, url):
         pass
 

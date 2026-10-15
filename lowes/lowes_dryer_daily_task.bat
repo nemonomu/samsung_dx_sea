@@ -5,6 +5,7 @@ set "PYTHONUNBUFFERED=1"
 set "PYTHONUTF8=1"
 if not defined LOWES_DRYER_MAIN_LIMIT set "LOWES_DRYER_MAIN_LIMIT=300"
 if not defined LOWES_DRYER_BSR_LIMIT set "LOWES_DRYER_BSR_LIMIT=100"
+if not defined LOWES_DRYER_DETAIL_CONCURRENCY set "LOWES_DRYER_DETAIL_CONCURRENCY=2"
 echo Lowe's dryer test: ZIP=10010. Limits and run path appear in the runtime log.
 python -u -m lowes.lowes_dryer %*
 set "DRYER_EXIT_CODE=%ERRORLEVEL%"

@@ -4,6 +4,7 @@ Importing this module is offline. Runtime imports the existing settings loader;
 payloads stay in memory and only public product/spec projections are saved.
 """
 import argparse
+import asyncio
 from collections import Counter
 import csv
 from dataclasses import asdict, dataclass
@@ -26,6 +27,7 @@ from .step00_dryer import (
 )
 from .step00_dryer_audit import (AuditJournal, ExclusionJournal, project_listing, region_summary,
                                   source_record, value_record)
+from .step00_dryer_concurrency import RegionGate, browser_fetch, run_jobs
 
 
 OCCURRENCE_COLUMNS = (
@@ -112,6 +114,53 @@ class BrowserAPI:
     def __init__(self, settings, logger):
         self.settings, self.logger, self.driver = settings, logger, None
         self.active_store = None
+        self._async_loop = None
+        self._region_gate = None
+
+    def region_gate(self):
+        loop = asyncio.get_running_loop()
+        if self._async_loop is not loop:
+            self._async_loop, self._region_gate = loop, RegionGate()
+        return self._region_gate
+
+    async def get_async(self, path, label, item="", sku="", validator=None, store=""):
+        # One Python thread owns this driver. Network requests alone overlap.
+        async with self.region_gate().request():
+            result = APIResult(store=store)
+            for attempt in range(1, self.settings.attempts + 1):
+                response = await browser_fetch(self.driver, path, self.settings.timeout)
+                result = self.validated_result(response, attempt, validator, store)
+                if result.ok:
+                    return result
+                self.log_retry(label, item, sku, result)
+                if attempt < self.settings.attempts:
+                    await asyncio.sleep(self.settings.retry_wait)
+            return result
+
+    @staticmethod
+    def validated_result(response, attempt, validator, store):
+        if not isinstance(response, dict):
+            response = {"status": "browser", "reason": "invalid_browser_result"}
+        status, reason = response.get("status"), response.get("reason", "")
+        payload = response.get("payload")
+        if status == 200 and not reason:
+            try:
+                if validator:
+                    validator(payload)
+            except ValueError as exc:
+                reason = str(exc)
+            except Exception as exc:
+                reason = "invalid_payload_" + type(exc).__name__
+        if status != 200 and not reason:
+            reason = "http_error"
+        if payload is None and not reason:
+            reason = "missing_payload"
+        return APIResult(payload if not reason else None, status, attempt, reason, store)
+
+    def log_retry(self, label, item, sku, result):
+        self.logger.warning("[API 재시도] api=%s item=%s sku=%s status=%s attempt=%s/%s reason=%s",
+                            label, item or "-", sku or "-", result.status, result.attempts,
+                            self.settings.attempts, result.reason)
 
     def launch(self):
         import undetected_chromedriver as uc
@@ -175,27 +224,10 @@ class BrowserAPI:
                     response = {"status": "browser", "reason": "invalid_browser_result"}
             except Exception as exc:
                 response = {"status": "browser", "reason": type(exc).__name__}
-            status, reason = response.get("status"), response.get("reason", "")
-            payload = response.get("payload")
-            if status == 200 and not reason:
-                try:
-                    if validator:
-                        validator(payload)
-                except ValueError as exc:
-                    # Validators in step00_dryer raise controlled schema labels.
-                    reason = str(exc)
-                except Exception as exc:
-                    reason = "invalid_payload_" + type(exc).__name__
-            if status != 200 and not reason:
-                reason = "http_error"
-            if payload is None and not reason:
-                reason = "missing_payload"
-            result = APIResult(payload if not reason else None, status, attempt, reason, store)
+            result = self.validated_result(response, attempt, validator, store)
             if result.ok:
                 return result
-            self.logger.warning("[API 재시도] api=%s item=%s sku=%s status=%s attempt=%s/%s reason=%s",
-                                label, item or "-", sku or "-", status, attempt,
-                                self.settings.attempts, reason)
+            self.log_retry(label, item, sku, result)
             if attempt < self.settings.attempts:
                 time.sleep(self.settings.retry_wait)
         return result
@@ -234,6 +266,30 @@ def fetch_detail(api, settings, source, logger):
             api.set_region(previous_store)
 
 
+async def fetch_detail_async(api, settings, source, logger):
+    item, sku = source["omni_item_id"], source.get("model_id", "")
+    primary = await api.get_async(detail_url(item, settings), "productdetail", item, sku,
+                                  lambda payload: detail_product(payload, item), settings.detail_store)
+    primary.region = region_evidence(primary.payload, item, settings, settings.detail_store, "productdetail")
+    if primary.ok or not settings.alt_store_enabled or settings.alt_store.lstrip("0") == settings.detail_store.lstrip("0"):
+        return primary, []
+    logger.warning("[상세 대체 매장] item=%s sku=%s primary_status=%s alt_store=%s ZIP=%s",
+                   item, sku or "-", primary.status, settings.alt_store, settings.zip_code)
+    # Drain all normal requests before changing the shared browser's region.
+    async with api.region_gate().exclusive():
+        previous_store = api.active_store or settings.detail_store
+        try:
+            api.set_region(settings.alt_store, alternate=True)
+            alternate = await api.get_async(detail_url(item, settings, settings.alt_store),
+                "productdetail_alt", item, sku, lambda payload: detail_product(payload, item), settings.alt_store)
+            alternate.region = region_evidence(alternate.payload, item, settings, settings.alt_store, "productdetail_alt")
+            alternate.attempts += primary.attempts
+            return alternate, [{"item": item, "api": "productdetail_primary", **primary.summary(),
+                                "recovered": alternate.ok}]
+        finally:
+            api.set_region(previous_store)
+
+
 def resolve_candidate(api, settings, source, logger, detail_cache, on_detail=None):
     """Resolve before ranking; later detail enrichment reuses this one request."""
     item = source["omni_item_id"]
@@ -244,6 +300,11 @@ def resolve_candidate(api, settings, source, logger, detail_cache, on_detail=Non
         api.set_region(settings.detail_store)
     response, recovered = detail_cache.get(item) or fetch_detail(api, settings, source, logger)
     detail_cache[item] = (response, recovered)
+    apply_classification(source, response, logger, cached, on_detail)
+
+
+def apply_classification(source, response, logger, cached, on_detail):
+    item = source["omni_item_id"]
     listing = source["_classification"]
     if response.ok:
         verdict = product_classification(detail_product(response.payload, item)[0])
@@ -261,6 +322,32 @@ def resolve_candidate(api, settings, source, logger, detail_cache, on_detail=Non
     logger.info("[대상 판정] list=%s item=%s sku=%s kind=%s reason=%s detail_status=%s cached=%s",
                 source.get("_list_type"), item, source.get("model_id") or "-", source["kind"],
                 verdict["reason"], response.status, cached)
+
+
+def resolve_candidates(api, settings, candidates, logger, detail_cache, first_classification,
+                       on_detail=None, eligible_count=0, limit=None):
+    if not candidates:
+        return eligible_count
+    api.set_region(settings.detail_store)
+    cached_ids = set(detail_cache)
+
+    async def job(source):
+        item = source["omni_item_id"]
+        return detail_cache[item] if item in detail_cache else await fetch_detail_async(api, settings, source, logger)
+
+    def completed(source, result):
+        nonlocal eligible_count
+        item = source["omni_item_id"]
+        response, _ = result
+        detail_cache[item] = result
+        apply_classification(source, response, logger, item in cached_ids, on_detail)
+        first_classification[item] = source["_classification"]
+        if source["kind"] == "dryer":
+            eligible_count += 1
+
+    run_jobs(candidates, settings.detail_concurrency, job, completed,
+             can_start=lambda active: limit is None or eligible_count + active < limit)
+    return eligible_count
 
 
 def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, on_page=None):
@@ -281,6 +368,7 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
         if cards and signature in signatures:
             raise CollectionError("main_repeated_page")
         signatures.add(signature)
+        candidates = []
         for position, card in enumerate(cards, 1):
             row = parse_card(card, page, position, offset + position)
             row.update(_audit_listing=project_listing(card), _listing_api=result.summary(), _list_type="main",
@@ -302,6 +390,8 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
                     on_page([row])
                 continue
             if not item:
+                resolve_candidates(api, settings, candidates, logger, detail_cache,
+                    first_classification, on_detail, eligible_count, settings.main_limit)
                 if on_page:
                     on_page(rows)
                 logger.error("[목록 오류] stage=main page=%s position=%s sku=%s reason=missing_product_id",
@@ -312,13 +402,17 @@ def collect_main(api, settings, logger, run_dir, detail_cache, on_detail=None, o
             else:
                 if on_page:
                     on_page([row])
-                if eligible_count < settings.main_limit:
-                    resolve_candidate(api, settings, row, logger, detail_cache, on_detail)
-                if row["kind"] == "dryer":
-                    eligible_count += 1
+                if row["kind"] in {"dryer", "unknown"}:
+                    candidates.append(row)
                 first_classification[item] = row["_classification"]
                 seen_ids.add(item)
             rows.append(row)
+        eligible_count = resolve_candidates(api, settings, candidates, logger, detail_cache,
+            first_classification, on_detail, eligible_count, settings.main_limit)
+        for row in rows:
+            verdict = first_classification.get(row["omni_item_id"])
+            if verdict:
+                row.update(kind=verdict["kind"], _classification=verdict)
         targets = select_main(rows, settings.main_limit)
         if on_page:
             on_page(rows)
@@ -379,6 +473,7 @@ def collect_bsr(api, settings, logger, run_dir, on_page=None, detail_cache=None,
         if cards and signature in signatures:
             raise CollectionError("bsr_repeated_page")
         signatures.add(signature)
+        candidates = []
         for position, card in enumerate(cards[:settings.bsr_limit - len(rows)], 1):
             row = parse_card(card, page, position, len(rows) + 1)
             row.update(_audit_listing=project_listing(card), _listing_api=result.summary(), _list_type="bsr",
@@ -390,6 +485,8 @@ def collect_bsr(api, settings, logger, run_dir, on_page=None, detail_cache=None,
             elif not item and row["kind"] in {"washer", "other", "combo", "bundle"} and row["product_url"]:
                 pass
             elif not item:
+                resolve_candidates(api, settings, candidates, logger, detail_cache,
+                                   first_classification, on_detail)
                 if on_page:
                     on_page(rows)
                 raise CollectionError("bsr_missing_product_id")
@@ -398,11 +495,18 @@ def collect_bsr(api, settings, logger, run_dir, on_page=None, detail_cache=None,
             else:
                 if on_page:
                     on_page([row])
-                resolve_candidate(api, settings, row, logger, detail_cache, on_detail)
+                if row["kind"] in {"dryer", "unknown"}:
+                    candidates.append(row)
                 first_classification[item] = row["_classification"]
             if item:
                 first_classification.setdefault(item, row["_classification"])
             rows.append(row)
+        resolve_candidates(api, settings, candidates, logger, detail_cache,
+                           first_classification, on_detail)
+        for row in rows:
+            verdict = first_classification.get(row["omni_item_id"])
+            if verdict:
+                row.update(kind=verdict["kind"], _classification=verdict)
         if on_page:
             on_page(rows)
         pages.append({"page": page, "offset": offset, "rows": len(cards), "collected": len(rows),
@@ -502,7 +606,7 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     logger.info("[병합] main=%s bsr=%s shared=%s total=%s", len(main), len(bsr),
                 len(main) + len(bsr) - len(targets), len(targets))
     write_csv(run_dir / "output" / "final_targets.csv", targets, OCCURRENCE_COLUMNS)
-    logger.info("[상세 시작] total=%s", len(targets))
+    logger.info("[상세 시작] total=%s concurrency=%s", len(targets), settings.detail_concurrency)
     api.set_region(settings.detail_store)
     failures, quality, spec_audit, enriched = [], [], [], []
     recovered_requests = [entry for response, recovered in cache.values() for entry in recovered]
@@ -515,14 +619,24 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     for record in exclusions.records.values():
         if record["kind"] == "unknown":
             quality.append({"item": record["item"], "reason": record["reason"]})
-    for index, source in enumerate(targets, 1):
-        previous_quality_count = len(quality)
+    completed_count = 0
+
+    async def detail_job(source):
         item, sku = source["omni_item_id"], source.get("model_id", "")
-        response, recovered = cache.get(item) or fetch_detail(api, settings, source, logger)
+        response, recovered = cache[item] if item in cache else await fetch_detail_async(api, settings, source, logger)
         journal.upsert(source_record(source, response, None, batch_id,
                                      main=main_by_id.get(item), bsr=bsr_by_id.get(item)))
+        reviews = await api.get_async(reviews_url(item), "reviews", item, sku, validate_reviews)
+        return response, recovered, reviews
+
+    def detail_completed(source, results):
+        nonlocal completed_count
+        previous_quality_count = len(quality)
+        item, sku = source["omni_item_id"], source.get("model_id", "")
+        response, recovered, reviews = results
+        if item not in cache:
+            recovered_requests.extend(recovered)
         actual_kind = source["kind"]
-        reviews = api.get(reviews_url(item), "reviews", item, sku, validate_reviews)
         try:
             row, audit = enrich_row(source, response.payload if response.ok else None,
                                      reviews.payload if reviews.ok else None)
@@ -575,15 +689,16 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
                                    "serving_store": response.store, "loading_type": row.get("loading_type"),
                                    "capacity": row.get("capacity")})
         enriched.append(row)
+        completed_count += 1
         for warning in quality[previous_quality_count:]:
             logger.warning("[검수 경고] item=%s reason=%s column=%s",
                            warning["item"], warning["reason"], warning.get("column", "-"))
         logger.info("[상세] %s/%s (%.1f%%) item=%s api_failure_products=%s elapsed=%.1fs",
-                    index, len(targets), 100 * index / len(targets), item,
+                    completed_count, len(targets), 100 * completed_count / len(targets), item,
                     len({f["item"] for f in failures}), time.monotonic() - started)
         write_csv(run_dir / "audit" / "spec_audit.csv", spec_audit, AUDIT_COLUMNS)
         write_json(run_dir / "audit" / "failures.json", failures)
-        time.sleep(settings.page_wait)
+    run_jobs(targets, settings.detail_concurrency, detail_job, detail_completed, wait=settings.page_wait)
     retained_main = main
     final_targets = operations["merge"](retained_main, bsr)
     by_id = {r["omni_item_id"]: r for r in enriched}
@@ -691,8 +806,8 @@ def main(argv=None):
     write_json(root / "manifest.json", manifest)
     api = BrowserAPI(settings, logger)
     stage = "browser"
-    logger.info("[시작] batch=%s ZIP=10010 main_limit=%s bsr_limit=%s run_root=%s",
-                batch_id, settings.main_limit, settings.bsr_limit, root)
+    logger.info("[시작] batch=%s ZIP=10010 main_limit=%s bsr_limit=%s detail_concurrency=%s run_root=%s",
+                batch_id, settings.main_limit, settings.bsr_limit, settings.detail_concurrency, root)
     try:
         api.launch()
         stage = "collection"
