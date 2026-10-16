@@ -5,11 +5,12 @@ from datetime import datetime
 from decimal import Decimal
 import json
 import math
+import os
 from pathlib import Path
 import re
 
 from .step00_dryer import (
-    COLUMNS, TEST_TABLE, PRODUCTION_TABLE, coerce_db_value, table_parts, validate_rows,
+    COLUMNS, DEFAULT_TABLE, TEST_TABLE, PRODUCTION_TABLE, coerce_db_value, table_parts, validate_rows,
 )
 from .step00_dryer_audit import difference
 
@@ -51,6 +52,10 @@ def inspect_columns(cur, schema, table):
     missing = set(COLUMNS) - result.keys()
     if missing:
         raise DryerDBError("missing dryer columns: " + ",".join(sorted(missing)))
+    required_extra = [column for column, meta in result.items() if column not in COLUMNS
+                      and meta["nullable"] == "NO" and meta["default"] is None and meta["identity"] != "YES"]
+    if required_extra:
+        raise DryerDBError("required table columns outside dryer contract: " + ",".join(sorted(required_extra)))
     return result
 
 
@@ -73,7 +78,7 @@ def prepare_insert(rows, metadata):
     return columns, values
 
 
-def load_batch(rows, logger=None, table=TEST_TABLE, allow_production=False, connection=None):
+def load_batch(rows, logger=None, table=DEFAULT_TABLE, allow_production=True, connection=None):
     counts = validate_rows(rows)
     schema, name = table_parts(table, allow_production)
     qualified = identifier(schema) + "." + identifier(name)
@@ -171,7 +176,7 @@ def public_db_value(value):
     return "unsupported_db_value_type"
 
 
-def verify_batch(rows, table=TEST_TABLE, allow_production=False, connection=None):
+def verify_batch(rows, table=DEFAULT_TABLE, allow_production=True, connection=None):
     counts = validate_rows(rows)
     schema, name = table_parts(table, allow_production)
     qualified = identifier(schema) + "." + identifier(name)
@@ -226,17 +231,60 @@ def verify_batch(rows, table=TEST_TABLE, allow_production=False, connection=None
             conn.close()
 
 
+def table_for_csv(path, batch_id, explicit=None, env=None):
+    """Keep historical test CSVs on their recorded table unless overridden."""
+    env = env if env is not None else {}
+    chosen = explicit or env.get("LOWES_DRYER_TABLE")
+    if not chosen:
+        path = Path(path)
+        recorded = set()
+        legacy_settings = False
+        if path.parent.name == "output":
+            root = path.parent.parent
+            for filename in ("manifest.json", "db_load_summary.json", "collection_summary.json"):
+                metadata_path = root / filename
+                if not metadata_path.exists():
+                    continue
+                try:
+                    meta = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                except (ValueError, OSError):
+                    raise DryerDBError("dryer table metadata unreadable") from None
+                if meta.get("batch_id") != batch_id:
+                    raise DryerDBError("CSV/table metadata batch mismatch")
+                candidates = (meta.get("table"), (meta.get("db") or {}).get("table"),
+                              (meta.get("settings") or {}).get("target_table"))
+                recorded.update(value for value in candidates if value)
+                if filename == "collection_summary.json" and "target_table" not in (meta.get("settings") or {}):
+                    legacy_settings = True
+        if not recorded and legacy_settings:
+            recorded.add(TEST_TABLE)
+        if len(recorded) > 1:
+            raise DryerDBError("conflicting dryer table metadata; select --table explicitly")
+        chosen = next(iter(recorded), DEFAULT_TABLE)
+    table_parts(chosen, allow_production=True)
+    return chosen
+
+
+def runtime_table(path, batch_id, explicit=None):
+    from .step00_config import load_env
+    load_env(Path(__file__).resolve().parent.parent / ".env")
+    return table_for_csv(path, batch_id, explicit, os.environ)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Load or verify a dryer CSV batch")
     parser.add_argument("--csv", required=True, type=Path)
     parser.add_argument("--verify-only", action="store_true", help="read-only DB comparison")
-    parser.add_argument("--table", choices=[TEST_TABLE, PRODUCTION_TABLE], default=TEST_TABLE)
-    parser.add_argument("--allow-production", action="store_true")
+    parser.add_argument("--table", choices=[TEST_TABLE, PRODUCTION_TABLE],
+                        help="override; otherwise LOWES_DRYER_TABLE, saved run table, production default")
+    parser.add_argument("--allow-production", action="store_true",
+                        help="legacy compatibility; production is now the default")
     args = parser.parse_args(argv)
     try:
         rows = read_rows(args.csv)
+        table = runtime_table(args.csv, rows[0]["batch_id"], args.table)
         fn = verify_batch if args.verify_only else load_batch
-        result = fn(rows, table=args.table, allow_production=args.allow_production)
+        result = fn(rows, table=table, allow_production=table == PRODUCTION_TABLE)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:

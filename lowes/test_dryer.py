@@ -386,7 +386,7 @@ class DBTests(unittest.TestCase):
         result = loader.load_batch([final_row()], connection=conn)
         deletes = [(c.args[0], c.args[1]) for c in cur.execute.call_args_list if c.args[0].startswith("DELETE")]
         self.assertEqual(len(deletes), 1)
-        self.assertIn('"public"."ldy_dryer_retail_test"', deletes[0][0])
+        self.assertIn('"public"."ldy_dryer_retail"', deletes[0][0])
         self.assertEqual(deletes[0][1], ("l_test", "Lowes"))
         self.assertEqual(result["inserted"], 1)
         self.assertEqual(conn.__exit__.call_args.args, (None, None, None))
@@ -406,11 +406,11 @@ class DBTests(unittest.TestCase):
                 loader.load_batch([final_row()], connection=conn)
             self.assertIsNotNone(conn.__exit__.call_args.args[0])
 
-    def test_production_and_foreign_table_not_implicitly_loaded(self):
+    def test_production_denial_and_foreign_table_remain_guarded(self):
         with patch.object(loader, "connect_db") as connect:
             for table in (rules.PRODUCTION_TABLE, "public.ldy_retail_com"):
                 with self.assertRaises(ValueError):
-                    loader.load_batch([final_row()], table=table)
+                    loader.load_batch([final_row()], table=table, allow_production=False)
             connect.assert_not_called()
 
     def test_missing_column_or_required_manual_id_not_silently_omitted(self):
@@ -763,7 +763,8 @@ class CollectionTests(unittest.TestCase):
             raise RuntimeError("PRIVATE_SETUP_PAYLOAD")
         with scratch() as root:
             try:
-                with patch.dict(sys.modules, {"lowes.step00_config": SimpleNamespace(load_env=fail)}):
+                with patch.dict(sys.modules, {"lowes.step00_config": SimpleNamespace(load_env=fail)}), \
+                     patch("lowes.step15_dryer_email_notify._send_existing_lowes", return_value=False):
                     self.assertEqual(collector_main(["--run-root", str(root)]), 1)
                 text = (root / "logs" / "dryer.log").read_text(encoding="utf-8")
                 self.assertIn("RuntimeError", text)

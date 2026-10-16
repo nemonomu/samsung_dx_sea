@@ -5,7 +5,7 @@ payloads stay in memory and only public product/spec projections are saved.
 """
 import argparse
 import asyncio
-from collections import Counter
+from collections import ChainMap, Counter
 import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -19,7 +19,7 @@ import time
 from urllib.parse import quote, urlsplit
 
 from .step00_dryer import (
-    BASE_URL, BSR_URL, COLUMNS, Settings, bsr_url, detail_product, detail_url,
+    BASE_URL, BSR_URL, COLUMNS, DEFAULT_TABLE, PRODUCTION_TABLE, TEST_TABLE, Settings, SettingsError, bsr_url, detail_product, detail_url,
     enrich_row, finalize_dryer, listing_page, listing_url, next_offsets,
     parse_card, positive_id, product_classification, product_kind, region_evidence,
     price_combination_warnings, reviews_url, select_bsr, select_main, validate_reviews,
@@ -28,6 +28,7 @@ from .step00_dryer import (
 from .step00_dryer_audit import (AuditJournal, ExclusionJournal, project_listing, region_summary,
                                   source_record, value_record)
 from .step00_dryer_concurrency import RegionGate, browser_fetch, run_jobs
+from .step15_dryer_email_notify import notify_run
 
 
 OCCURRENCE_COLUMNS = (
@@ -776,38 +777,60 @@ def run_collection(api, settings, logger, run_dir, batch_id, crawl_dt, operation
     return final_rows, summary
 
 
+def finish_run(root, manifest, logger):
+    manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    write_json(root / "manifest.json", manifest)
+    try:
+        manifest["notification"] = notify_run(root, manifest, logger)
+        write_json(root / "manifest.json", manifest)
+    except Exception as exc:
+        # Notification or its file writes must never overwrite the pipeline result.
+        logger.warning("[메일 실패] type=%s collection_status=%s", type(exc).__name__, manifest["status"])
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Lowe's dryer test collection")
+    parser = argparse.ArgumentParser(description="Lowe's standalone dryer production collection")
     parser.add_argument("--collect-only", action="store_true", help="write CSV/audits without DB access")
     parser.add_argument("--run-root", type=Path)
+    parser.add_argument("--table", choices=[PRODUCTION_TABLE, TEST_TABLE], help="override dryer table")
     args = parser.parse_args(argv)
     now = datetime.now()
+    batch_id = "l_" + now.strftime("%y%m%d_%H%M%S")
+    target_table = args.table
     try:
         # Existing loader keeps connection settings within the runtime process.
         from .step00_config import load_env
         load_env(Path(__file__).resolve().parent.parent / ".env")
-        settings = Settings.from_env(os.environ)
+        settings_env = ChainMap({"LOWES_DRYER_TABLE": args.table}, os.environ) if args.table else os.environ
+        requested_table = settings_env.get("LOWES_DRYER_TABLE", DEFAULT_TABLE)
+        target_table = requested_table if requested_table in (PRODUCTION_TABLE, TEST_TABLE) else None
+        requested_batch = os.getenv("LOWES_DRYER_BATCH_ID") or batch_id
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", requested_batch):
+            raise SettingsError("invalid dryer batch ID")
+        batch_id = requested_batch
+        settings = Settings.from_env(settings_env)
     except Exception as exc:
         failed_root = args.run_root or Path(__file__).resolve().parent / "data" / "dryer" / now.strftime("%Y%m%d") / ("setup_failed_" + now.strftime("%H%M%S"))
         logger = create_logger(failed_root / "logs" / "dryer.log")
         reason = getattr(exc, "public_reason", "configuration_load_failed")
         logger.error("[설정 실패] type=%s stage=settings reason=%s", type(exc).__name__, reason)
-        write_json(failed_root / "manifest.json", {
+        failed_manifest = {
             "status": "failed", "failed_stage": "settings", "error_type": type(exc).__name__, "reason": reason,
-            "started_at": now.isoformat(timespec="seconds"), "run_root": str(failed_root)})
+            "batch_id": batch_id, "table": target_table,
+            "collect_only": args.collect_only, "db_loaded": False,
+            "started_at": now.isoformat(timespec="seconds"), "run_root": str(failed_root)}
+        finish_run(failed_root, failed_manifest, logger)
         return 1
-    batch_id = os.getenv("LOWES_DRYER_BATCH_ID") or "l_" + now.strftime("%y%m%d_%H%M%S")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", batch_id):
-        raise ValueError("invalid dryer batch ID")
     root = args.run_root or Path(__file__).resolve().parent / "data" / "dryer" / now.strftime("%Y%m%d") / batch_id
     logger = create_logger(root / "logs" / "dryer.log")
     manifest = {"batch_id": batch_id, "run_root": str(root), "started_at": now.isoformat(timespec="seconds"),
-                "status": "running", "db_loaded": False}
+                "status": "running", "db_loaded": False, "table": settings.target_table,
+                "collect_only": args.collect_only}
     write_json(root / "manifest.json", manifest)
     api = BrowserAPI(settings, logger)
     stage = "browser"
-    logger.info("[시작] batch=%s ZIP=10010 main_limit=%s bsr_limit=%s detail_concurrency=%s run_root=%s",
-                batch_id, settings.main_limit, settings.bsr_limit, settings.detail_concurrency, root)
+    logger.info("[시작] batch=%s ZIP=10010 main_limit=%s bsr_limit=%s detail_concurrency=%s table=%s run_root=%s",
+                batch_id, settings.main_limit, settings.bsr_limit, settings.detail_concurrency, settings.target_table, root)
     try:
         api.launch()
         stage = "collection"
@@ -819,7 +842,8 @@ def main(argv=None):
         if not args.collect_only and rows:
             stage = "db_load"
             from .step14_dryer_db_load import load_batch
-            loaded = load_batch(rows, logger=logger)
+            loaded = load_batch(rows, logger=logger, table=settings.target_table,
+                                allow_production=settings.target_table == PRODUCTION_TABLE)
             manifest.update(db_loaded=True, db=loaded)
             write_json(root / "db_load_summary.json", loaded)
         if not rows:
@@ -845,8 +869,7 @@ def main(argv=None):
         return 1
     finally:
         api.close()
-        manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        write_json(root / "manifest.json", manifest)
+        finish_run(root, manifest, logger)
 
 
 if __name__ == "__main__":

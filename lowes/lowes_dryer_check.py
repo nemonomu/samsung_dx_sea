@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .step00_dryer import price_combination_warnings, select_bsr, select_main, validate_rows
 from .step00_dryer_audit import DryerAuditError, audit_summary, compare_csv, read_records, region_summary
-from .step14_dryer_db_load import read_rows
+from .step14_dryer_db_load import read_rows, table_for_csv
 
 
 
@@ -86,6 +86,7 @@ def check_run(root):
     if "price_checks" in summary and price_checks != summary["price_checks"]:
         raise DryerAuditError("price_check_summary_mismatch")
     return {"csv_valid": True, "batch_id": summary["batch_id"], "counts": counts,
+            "target_table": table_for_csv(root / "output" / "final_output.csv", summary["batch_id"]),
             "selection": selection, "price_checks": price_checks, "region": region_summary(value_records),
             "value_audit": {**value_check, **audit_summary(value_records), "path": str(audit_path)},
             "bsr_displayed": summary["bsr_displayed"], "collection_status": summary["collection_status"],

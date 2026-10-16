@@ -1,4 +1,4 @@
-# Lowe’s 건조기 테스트 실행
+# Lowe’s 건조기 운영 실행
 
 개발 브랜치는 `lowes-dryer`. 원격 저장소에 이 브랜치를 반영하고 전환한 다음 실행함.
 아래 명령은 원격 PC의 저장소 루트 `C:\samsung_dx_sea` 기준임.
@@ -30,7 +30,7 @@ cd C:\samsung_dx_sea
 브라우저를 초기 접속한 뒤 같은 사이트 API로 목록·상세·리뷰 통계를 수집함.
 상품 상세 페이지 이동, 리뷰 본문 여러 페이지, 추천·배송 API 수집은 필요 컬럼에 포함되지 않음.
 로그에는 브라우저 버전·요청 지역·페이지·상세 진행률·오류·적재 결과가 표시됨.
-기본 BAT은 `public.ldy_dryer_retail_test`에 적재함.
+기본 BAT은 **`public.ldy_dryer_retail` 본테이블**에 적재함.
 테이블 생성·변경, 다른 배치 삭제, 다른 크롤러 실행은 포함하지 않음.
 
 메인·BSR 모두 **단독 건조기만** 포함하며 해당 제품의 Sponsored 광고도 포함함.
@@ -48,6 +48,51 @@ BSR은 **표시 1~100위**만 확인한 뒤 중복·비대상을 제외함. 100�
 공통 상품은 한 행에 두 순위를 저장함. 기본 한도에서 최종 행 수는 최대 400개임.
 별도 환경변수 입력 없이 위 단독 BAT만 실행하면 됨.
 수집 제한은 `LOWES_DRYER_MAIN_LIMIT`·`LOWES_DRYER_BSR_LIMIT` 설정으로 변경 가능함. 이미 설정된 값이 있으면 BAT 기본값보다 우선하므로 시작 로그의 `main_limit`·`bsr_limit`를 확인함.
+
+## 통합 실행과 테이블 선택
+
+스케줄러가 호출하는 기존 `bby3_lowes2.bat` 파일명을 유지함. 스케줄러 설정 변경은 필요 없음.
+
+```powershell
+cd C:\samsung_dx_sea
+.\bby3_lowes2.bat
+```
+
+실행 순서는 **BBY REF → LDY → TV → DRYER → Lowe's REF → LDY → DRYER**임.
+기존 품목의 실패 후 다음 품목을 계속 실행하는 정책과 마지막 비정상 종료 코드 반영 정책을 유지함.
+Ctrl+C 중단 코드는 130으로 처리하고 남은 품목을 건너뜀.
+건조기는 전용 BAT으로만 연결하며 메일을 통합 BAT에서 다시 보내지 않음.
+통합 로그는 `C:\samsung_dx_sea\task_logs\bby3_lowes2_<실행시각>.log`임.
+건조기 상세 진행·메일 결과는 아래 회차별 `logs\dryer.log`에 기록됨.
+
+신규 수집의 테이블 선택은 `--table` → `LOWES_DRYER_TABLE` → 본테이블 기본값 순서임.
+단독 BAT·통합 BAT 모두 같은 Python 설정을 사용함. 시작 로그의 `table=`을 확인함.
+명시적으로 테스트 테이블을 사용할 때만 다음처럼 실행함.
+
+```powershell
+.\lowes\lowes_dryer_daily_task.bat --table public.ldy_dryer_retail_test
+```
+
+본테이블·테스트 테이블 상수와 허용 목록은 구분해서 유지함. 다른 테이블은 거부함.
+수집 당시 대상은 `manifest.json.table`, `collection_summary.json.settings.target_table`에 기록됨.
+테이블·필수 컬럼·자료형·id 자동 생성 검사는 적재 전에 수행함. 테이블 생성·기존 테스트 데이터 이동은 하지 않음.
+
+## 완료 메일
+
+기존 Lowe's `step15_email_notify.email_config`·`send_email`과 안전한 설정 로더를 재사용함.
+수신자와 SMTP 설정도 기존 Lowe's 환경 설정을 따르며, 별도 인증정보를 만들거나 출력하지 않음.
+REF·LDY의 최소 건수 경고를 건조기에 적용하지 않음. 목록 소진이나 제외로 300/100개 미만인 정상 회차는 정상으로 안내함.
+
+수집·적재 결과를 확정한 뒤 건조기 품목·배치·실제 적재 테이블·확인된 적재 건수·메인/BSR/공통 건수·수집과 적재 소요 시간을 보냄.
+일부 실패·전체 실패·중단은 `[Warning]`, `--collect-only`는 DB 미적재임을 표시함.
+메일 실패는 수집·적재 결과와 종료 코드를 바꾸지 않음.
+기존 설정 `LOWES_EMAIL_NOTIFY=0`은 발송 끄기, `LOWES_EMAIL_DRY_RUN=1`은 본문 생성만 수행함.
+
+발송 근거는 `output\email_notify_manifest.json`이며, 회차 `manifest.json.notification`에서도 결과를 확인함.
+주소·인증정보·SMTP 예외 원문은 이 파일이나 로그에 기록하지 않음.
+동일 배치·테이블의 발송 완료 기록이 있으면 다시 보내지 않으며, 단독·통합 실행 모두 이 처리를 사용함.
+SMTP 응답을 받기 전에 끊기는 경우에는 실제 배달 여부를 확정할 수 없으므로 `sending`·`delivery_unknown` 상태를 자동 재발송하지 않음.
+발송 중 잠금이 남으면 `notification_locked`로 기록함. 이런 경우 발송함·기록을 확인한 뒤 수동으로 조치해야 하며 자동 중복 재발송하지 않음.
 
 ## 상품 동시 처리와 안전성
 
@@ -99,6 +144,7 @@ C:\samsung_dx_sea\lowes\data\dryer\<YYYYMMDD>\<batch_id>\
   manifest.json
   collection_summary.json
   db_load_summary.json              기본 적재가 성공한 경우 생성
+  output\email_notify_manifest.json  메일 제목·본문·건수·발송 결과, 인증정보 없음
   main\main_occurrences.csv
   main\main_targets.csv
   bsr\bsr_occurrences.csv
@@ -124,7 +170,7 @@ JSONL은 현재 응답의 필요한 공개 상품값만 선택해 기록하며, 
 
 종료 코드는 **0 정상**, **2 일부 실패·품질 경고**, **1 실패**, **130 중단**임.
 유효 대상이 0개이면 헤더와 검수 파일을 저장하고 DB 적재를 생략함(`db_skip_reason=no_eligible_products`).
-2여도 확보한 값은 테스트 테이블에 적재될 수 있음. `manifest.json`의 `db_loaded`로 적재 여부를 확인함.
+2여도 확보한 값은 선택한 테이블(기본 본테이블)에 적재될 수 있음. `manifest.json`의 `table`·`db_loaded`로 대상과 적재 여부를 확인함.
 메인 대상이 부족하면 실제 건수와 부족 사유를 기록함. 목록 호출 실패·반복 페이지 등은 정상 완료로 처리하지 않음.
 BSR이 요청한 표시 순위에 도달하기 전에 비정상적으로 끝나면 실패로 보고함.
 
@@ -189,6 +235,11 @@ CSV 컬럼·중복·순위·리뷰 수 일치·누락 사유도 검사함.
 새 회차는 목록 CSV에서 제외·순위를 다시 계산하고, 제외 자료와 최종 상품이 겹치지 않는지도 검사함.
 수정 전 회차도 기존 20개 컬럼 대조는 가능하며 `selection.verified=false`·`legacy_selection_policy`로 구분함. 미확정 JSONL은 정상 대조로 처리하지 않음.
 둘째 명령은 DB를 읽어서 해당 배치의 가격·평점·리뷰 수·메타정보까지 CSV와 비교함.
+CSV 재적재·DB 검수의 테이블 선택은 `--table` → `LOWES_DRYER_TABLE` → 회차에 기록된 테이블 → 본테이블 기본값 순서임.
+이전 테스트 회차는 기존 `db_load_summary.json` 또는 이전 형식의 설정 기록을 따라 테스트 테이블을 사용함.
+따라서 기존 테스트 CSV를 위 명령으로 검수·재적재한다고 본테이블로 자동 이동하지 않음.
+기록끼리 테이블이나 배치가 충돌하면 접속 전에 중단하며, 필요한 경우 `--table`로 의도한 대상을 명시함.
+예: `python -m lowes.step14_dryer_db_load --csv "<run_root>\output\final_output.csv" --verify-only --table public.ldy_dryer_retail_test`.
 DB 자동 생성 id는 NULL 여부·배치 내 중복을 따로 검사하며 나머지 19개 컬럼을 자료형에 맞춰 대조함.
 자동 생성 규칙이 아닌 id는 CSV값과 직접 대조함. 가격의 소수·용량과 평점의 실수 저장 오차도 고려함.
 불일치는 `differences`에 상품 ID·컬럼·예상값·실제값·사유를 표시하며 종료 코드는 1임.
@@ -204,12 +255,12 @@ SELECT batch_id, count(*) AS rows,
        count(*) FILTER (WHERE main_rank IS NOT NULL AND bsr_rank IS NOT NULL) AS shared_rows,
        count(*) FILTER (WHERE loading_type IS NULL) AS loading_null,
        count(*) FILTER (WHERE capacity IS NULL) AS capacity_null
-FROM public.ldy_dryer_retail_test
+FROM public.ldy_dryer_retail
 WHERE account_name = 'Lowes' AND batch_id = '실제_batch_id'
 GROUP BY batch_id;
 
 SELECT item, count(*)
-FROM public.ldy_dryer_retail_test
+FROM public.ldy_dryer_retail
 WHERE account_name = 'Lowes' AND batch_id = '실제_batch_id'
 GROUP BY item HAVING count(*) > 1;
 ```
@@ -227,6 +278,7 @@ python -m lowes.step14_dryer_db_load --csv "<run_root>\output\final_output.csv"
 ```
 
 단독 CSV 적재는 원래 수집 회차의 `manifest.json`을 갱신하지 않음.
+수동 재적재·DB 검수는 수집 완료 메일을 다시 발송하지 않음.
 재적재 성공 여부와 최종값 일치는 같은 CSV에 `--verify-only`를 붙여 별도로 확인함.
 
 DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
@@ -239,18 +291,21 @@ DB 연결 없이 수집·CSV만 확인하려면 다음 명령을 사용함.
 `LOWES_DRYER_MAX_MAIN_PAGES`, `LOWES_DRYER_MAX_ATTEMPTS`, `LOWES_DRYER_API_TIMEOUT`,
 `LOWES_DRYER_RETRY_WAIT`, `LOWES_DRYER_PAGE_WAIT`, `LOWES_DRYER_SEED_WAIT`, `LOWES_DRYER_HEADLESS`,
 `LOWES_DRYER_DETAIL_CONCURRENCY`(기본 2, 허용 1~2).
+적재 대상은 `LOWES_DRYER_TABLE` 또는 `--table`로 지정할 수 있으며 기본은 본테이블임.
 배치 이름을 지정하려면 `LOWES_DRYER_BATCH_ID`를 사용함. 기본 배치 형식은 기존 LDY의 `l_YYMMDD_HHMMSS`임.
 지역 설정·DB 연결은 기존 런타임 로더로 전달하며 비밀 설정 파일 내용을 출력할 필요 없음.
-건조기 기본 BAT은 테스트 테이블을 사용함. 본테이블 전환은 검수·별도 승인 후 진행함.
+건조기 기본 BAT은 본테이블을 사용함. 테스트 테이블은 명시적 선택 또는 과거 회차 기록으로 구분함.
 
 ## 로컬 오프라인 검사
 
 ```powershell
-python -m unittest -q lowes.test_dryer lowes.test_dryer_concurrency lowes.test_step00_uc
+python -m unittest -q lowes.test_dryer lowes.test_dryer_concurrency lowes.test_dryer_operations lowes.test_step00_uc
 ```
 
 신규 검사는 가짜 API 응답과 가짜 DB 연결로 100/100 및 300/100 설정·제외·병합·사양·실패 유지·트랜잭션을 확인함.
 환경 파일·실제 쇼핑몰·실제 DB는 열지 않음. 오프라인 통과가 원격 수집 성공을 뜻하지는 않음.
+메일 검사도 가짜 발송 함수를 사용하며 실제 SMTP에는 연결하지 않음.
+통합 BAT 검사는 임시 폴더의 복사본과 가짜 품목 BAT만 실행하고 운영 수집기는 실행하지 않음.
 동시 처리 검사는 지연·역순 응답, 1/2/3/7개 및 홀수 개수, 최대 동시 수,
 순차/동시 최종값·원본·순위 일치, 실패·재시도 격리, 대체 매장 전환, 중단 시 기록 보존을 포함함.
 배송·픽업 검사는 건조기 필수 검사에 포함하지 않음. 기존 REF·LDY 검사 파일과 코드는 유지함.

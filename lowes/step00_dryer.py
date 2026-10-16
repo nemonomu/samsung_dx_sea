@@ -12,6 +12,7 @@ BASE_URL = "https://www.lowes.com"
 BSR_URL = BASE_URL + "/best-sellers/appliances/washers-dryers/dryers/4294857980"
 TEST_TABLE = "public.ldy_dryer_retail_test"
 PRODUCTION_TABLE = "public.ldy_dryer_retail"
+DEFAULT_TABLE = PRODUCTION_TABLE
 COLUMNS = (
     "id", "country", "account_name", "item", "sku", "retailer_sku_name",
     "product_url", "count_of_reviews", "star_rating", "count_of_star_ratings",
@@ -31,6 +32,7 @@ class Settings:
     main_limit: int = 300
     bsr_limit: int = 100
     detail_concurrency: int = 2
+    target_table: str = DEFAULT_TABLE
     page_size: int = 24
     max_main_pages: int = 30
     attempts: int = 3
@@ -55,6 +57,8 @@ class Settings:
     alt_store_enabled: bool = True
 
     def __post_init__(self):
+        if self.target_table not in (TEST_TABLE, PRODUCTION_TABLE):
+            raise SettingsError("target_table must be the dryer production or test table")
         if self.zip_code != "10010":
             raise SettingsError("dryer ZIP must be 10010")
         if self.main_limit < 1 or not 1 <= self.bsr_limit <= 100:
@@ -92,6 +96,7 @@ class Settings:
             main_limit=integer("LOWES_DRYER_MAIN_LIMIT", 300),
             bsr_limit=integer("LOWES_DRYER_BSR_LIMIT", 100),
             detail_concurrency=integer("LOWES_DRYER_DETAIL_CONCURRENCY", 2),
+            target_table=env.get("LOWES_DRYER_TABLE", DEFAULT_TABLE),
             max_main_pages=integer("LOWES_DRYER_MAX_MAIN_PAGES", 30),
             attempts=integer("LOWES_DRYER_MAX_ATTEMPTS", 3),
             timeout=integer("LOWES_DRYER_API_TIMEOUT", 45),
