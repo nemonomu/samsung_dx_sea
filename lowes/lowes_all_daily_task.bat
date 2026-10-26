@@ -2,8 +2,8 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM Lowes all-category daily orchestrator runner.
-REM Order: LDY -> REF (stops on first failure).
-REM Invokes lowes/lowes_orchestrator with --all per category.
+REM Order: LDY -> REF -> DRYER (stops on first failure).
+REM Invokes the orchestrator for LDY/REF and the dedicated dryer daily runner.
 
 cd /d "%~dp0.."
 set "REPO_ROOT=%CD%"
@@ -17,7 +17,7 @@ set "TASK_LOG=%TASK_LOG_DIR%\all_daily_%RUN_TS%.log"
 
 echo ==================================================
 echo Lowes all-category daily task started
-echo order=LDY REF
+echo order=LDY REF DRYER
 echo cwd=%CD%
 echo task_log=%TASK_LOG%
 echo ==================================================
@@ -25,13 +25,13 @@ echo ==================================================
 (
   echo ==================================================
   echo Lowes all-category daily task started
-  echo order=LDY REF
+  echo order=LDY REF DRYER
   echo cwd=%CD%
   echo ts=%RUN_TS%
   echo ==================================================
 ) > "%TASK_LOG%"
 
-for %%C in (LDY REF) do (
+for %%C in (LDY REF DRYER) do (
   echo.
   echo ================================================== >> "%TASK_LOG%"
   echo Lowes %%C task queued at %RUN_TS% >> "%TASK_LOG%"
@@ -40,7 +40,11 @@ for %%C in (LDY REF) do (
   echo ==================================================
   echo Lowes %%C task started
   echo ==================================================
-  call "%~dp0_lowes_daily_task.bat" %%C "%TASK_LOG%"
+  if "%%C"=="DRYER" (
+    call "%~dp0lowes_dryer_daily_task.bat"
+  ) else (
+    call "%~dp0_lowes_daily_task.bat" %%C "%TASK_LOG%"
+  )
   set "EXIT_CODE=!ERRORLEVEL!"
   if not "!EXIT_CODE!"=="0" (
     echo.
