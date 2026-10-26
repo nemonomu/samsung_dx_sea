@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 set "BBY_ROOT=%CD%"
-set "CHAIN_ORDER=BBY:REF LDY TV DRYER / LOWES:REF LDY"
+set "CHAIN_ORDER=BBY:REF LDY TV DRYER / LOWES:REF LDY DRYER"
 set "OVERALL_EXIT_CODE=0"
 set "FAILURE_COUNT=0"
 set "FAILURES="
@@ -16,7 +16,7 @@ for /f %%i in ('powershell -NoProfile -Command "[int][double]::Parse((Get-Date -
 set "CHAIN_LOG=%CHAIN_LOG_DIR%\bby3_lowes2_%CHAIN_TS%.log"
 
 echo ==================================================
-echo BBY4+Lowes2 daily task started
+echo BBY4+Lowes3 daily task started
 echo order=%CHAIN_ORDER%
 echo continue_on_category_failure=true
 echo bby_root=%BBY_ROOT%
@@ -24,7 +24,7 @@ echo chain_log=%CHAIN_LOG%
 echo ==================================================
 (
   echo ==================================================
-  echo BBY4+Lowes2 daily task started
+  echo BBY4+Lowes3 daily task started
   echo order=%CHAIN_ORDER%
   echo continue_on_category_failure=true
   echo bby_root=%BBY_ROOT%
@@ -55,6 +55,12 @@ if defined LOWES_DAILY_TASK_BAT (
   call :record_failure LOWES_DAILY_RUNNER 9002
 )
 
+call :run_lowes_dryer
+if "!CATEGORY_EXIT!"=="130" goto :interrupted
+if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
+if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
+call :record_failure LOWES_DRYER !CATEGORY_EXIT!
+
 for /f %%i in ('powershell -NoProfile -Command "[int][double]::Parse((Get-Date -UFormat %%s))"') do set "CHAIN_END_EPOCH=%%i"
 set /a CHAIN_ELAPSED_SEC=CHAIN_END_EPOCH-CHAIN_START_EPOCH
 
@@ -63,15 +69,15 @@ echo ==================================================
 >>"%CHAIN_LOG%" echo.
 >>"%CHAIN_LOG%" echo ==================================================
 if "%FAILURE_COUNT%"=="0" (
-  echo BBY4+Lowes2 daily task completed successfully
-  >>"%CHAIN_LOG%" echo BBY4+Lowes2 daily task completed successfully
+  echo BBY4+Lowes3 daily task completed successfully
+  >>"%CHAIN_LOG%" echo BBY4+Lowes3 daily task completed successfully
 ) else (
-  echo BBY4+Lowes2 daily task completed with failures
+  echo BBY4+Lowes3 daily task completed with failures
   echo failed_count=%FAILURE_COUNT%
-  echo failures=%FAILURES%
-  >>"%CHAIN_LOG%" echo BBY4+Lowes2 daily task completed with failures
+  echo failures=!FAILURES!
+  >>"%CHAIN_LOG%" echo BBY4+Lowes3 daily task completed with failures
   >>"%CHAIN_LOG%" echo failed_count=%FAILURE_COUNT%
-  >>"%CHAIN_LOG%" echo failures=%FAILURES%
+  >>"%CHAIN_LOG%" echo failures=!FAILURES!
 )
 echo elapsed_sec=%CHAIN_ELAPSED_SEC%
 echo chain_log=%CHAIN_LOG%
@@ -84,12 +90,12 @@ exit /b %OVERALL_EXIT_CODE%
 :interrupted
 echo.
 echo ==================================================
-echo [interrupt] BBY4+Lowes2 stopped by Ctrl+C. Remaining categories skipped.
+echo [interrupt] BBY4+Lowes3 stopped by Ctrl+C. Remaining categories skipped.
 echo chain_log=%CHAIN_LOG%
 echo ==================================================
 >>"%CHAIN_LOG%" echo.
 >>"%CHAIN_LOG%" echo ==================================================
->>"%CHAIN_LOG%" echo [interrupt] BBY4+Lowes2 stopped by Ctrl+C. Remaining categories skipped.
+>>"%CHAIN_LOG%" echo [interrupt] BBY4+Lowes3 stopped by Ctrl+C. Remaining categories skipped.
 >>"%CHAIN_LOG%" echo ==================================================
 exit /b 130
 
@@ -153,6 +159,34 @@ if "%BBY3_LOWES2_DRY_RUN%"=="1" (
 ) else (
   pushd "%BBY_ROOT%"
   call "%LOWES_DAILY_TASK_BAT%" %CATEGORY% "%CHAIN_LOG%"
+  set "CATEGORY_EXIT=!ERRORLEVEL!"
+  popd
+)
+call :category_complete Lowes
+exit /b !CATEGORY_EXIT!
+
+:run_lowes_dryer
+set "CATEGORY=DRYER"
+set "CATEGORY_EXIT=0"
+set "CATEGORY_TASK_BAT=%BBY_ROOT%\lowes\lowes_dryer_daily_task.bat"
+for /f %%i in ('powershell -NoProfile -Command "[int][double]::Parse((Get-Date -UFormat %%s))"') do set "CATEGORY_START_EPOCH=%%i"
+echo.
+echo Lowes DRYER daily task started
+echo task_bat=%CATEGORY_TASK_BAT%
+>>"%CHAIN_LOG%" echo Lowes DRYER daily task started
+>>"%CHAIN_LOG%" echo task_bat=%CATEGORY_TASK_BAT%
+call :clear_bestbuy_env
+call :clear_lowes_env
+if "%BBY3_LOWES2_DRY_RUN%"=="1" (
+  echo [dry-run] call "%CATEGORY_TASK_BAT%"
+  >>"%CHAIN_LOG%" echo [dry-run] call "%CATEGORY_TASK_BAT%"
+) else if not exist "%CATEGORY_TASK_BAT%" (
+  set "CATEGORY_EXIT=9002"
+  echo [error] Lowes dryer daily runner missing.
+  >>"%CHAIN_LOG%" echo [error] Lowes dryer daily runner missing.
+) else (
+  pushd "%BBY_ROOT%"
+  call "%CATEGORY_TASK_BAT%"
   set "CATEGORY_EXIT=!ERRORLEVEL!"
   popd
 )
