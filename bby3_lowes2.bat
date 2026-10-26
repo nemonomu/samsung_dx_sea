@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 set "BBY_ROOT=%CD%"
-set "CHAIN_ORDER=BBY:REF LDY TV DRYER / LOWES:REF LDY DRYER"
+set "CHAIN_ORDER=LOWES:REF LDY DRYER / BBY:REF LDY TV DRYER"
 set "OVERALL_EXIT_CODE=0"
 set "FAILURE_COUNT=0"
 set "FAILURES="
@@ -32,14 +32,6 @@ echo ==================================================
   echo ==================================================
 ) > "%CHAIN_LOG%"
 
-for %%C in (REF LDY TV DRYER) do (
-  call :run_bestbuy_category %%C
-  if "!CATEGORY_EXIT!"=="130" goto :interrupted
-  if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
-  if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
-  call :record_failure BBY_%%C !CATEGORY_EXIT!
-)
-
 call :resolve_lowes_runner
 if defined LOWES_DAILY_TASK_BAT (
   for %%C in (REF LDY) do (
@@ -60,6 +52,14 @@ if "!CATEGORY_EXIT!"=="130" goto :interrupted
 if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
 if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
 call :record_failure LOWES_DRYER !CATEGORY_EXIT!
+
+for %%C in (REF LDY TV DRYER) do (
+  call :run_bestbuy_category %%C
+  if "!CATEGORY_EXIT!"=="130" goto :interrupted
+  if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
+  if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
+  call :record_failure BBY_%%C !CATEGORY_EXIT!
+)
 
 for /f %%i in ('powershell -NoProfile -Command "[int][double]::Parse((Get-Date -UFormat %%s))"') do set "CHAIN_END_EPOCH=%%i"
 set /a CHAIN_ELAPSED_SEC=CHAIN_END_EPOCH-CHAIN_START_EPOCH
