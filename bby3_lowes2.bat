@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 set "BBY_ROOT=%CD%"
-set "CHAIN_ORDER=LOWES:REF LDY DRYER / BBY:REF LDY TV DRYER"
+set "CHAIN_ORDER=LOWES:REF LDY DRYER / BBY:TV LDY DRYER REF"
 set "OVERALL_EXIT_CODE=0"
 set "FAILURE_COUNT=0"
 set "FAILURES="
@@ -53,7 +53,7 @@ if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
 if "!CATEGORY_EXIT!"=="3221225786" goto :interrupted
 call :record_failure LOWES_DRYER !CATEGORY_EXIT!
 
-for %%C in (REF LDY TV DRYER) do (
+for %%C in (TV LDY DRYER REF) do (
   call :run_bestbuy_category %%C
   if "!CATEGORY_EXIT!"=="130" goto :interrupted
   if "!CATEGORY_EXIT!"=="-1073741510" goto :interrupted
