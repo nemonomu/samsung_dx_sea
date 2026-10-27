@@ -7,6 +7,36 @@ from .step00_collection_recovery import (
 from .step01_stage_retry import listing_failure
 
 
+TARGET_OR_END_CATEGORIES = {"TV", "REF", "LDY"}
+
+
+def listing_exhausted(report, category):
+    """Only a published, verified end permits a below-target completion."""
+    return (category in TARGET_OR_END_CATEGORIES and report.get("target_or_end") is True
+            and report.get("status") == "complete" and report.get("reason") == "verified_end")
+
+
+def pagination_evidence(graph, page, page_size):
+    """Count original documents (including combos), never parsed/ad/deduped rows."""
+    data = graph.get("data") if isinstance(graph, dict) else None
+    data = data if isinstance(data, dict) else {}
+    search, detail = data.get("search"), data.get("detailedProductSearch")
+    total = search.get("numFound") if isinstance(search, dict) else None
+    if isinstance(total, str) and total.isascii() and total.isdecimal():
+        total = int(total)
+    if type(total) is not int or total < 0:
+        total = None
+    docs = detail.get("documents") if isinstance(detail, dict) else None
+    count = len(docs) if isinstance(docs, list) else None
+    valid_size = type(page_size) is int and page_size > 0
+    last_page = max(1, (total + page_size - 1) // page_size) if total is not None and valid_size else None
+    end_verified = (last_page == page and count is not None and valid_size
+                    and 0 <= count <= page_size
+                    and (page - 1) * page_size + count == total)
+    return dict(num_found=total, document_count=count, page_size=page_size,
+                last_page=last_page, end_verified=end_verified)
+
+
 def validate_page(graph, meta, rows):
     if str(meta.get("status_code")) != "200" or meta.get("error") or meta.get("parse_error"):
         return False, meta.get("error") or meta.get("parse_error") or f"http_{meta.get('status_code')}", False
@@ -64,6 +94,7 @@ def validate_page(graph, meta, rows):
 
 def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
     root = listing.RUN_ROOT
+    target_or_end = getattr(listing, "CATEGORY", "") in TARGET_OR_END_CATEGORIES
     evidence = Evidence(root, root.name, {"search_term": listing.SEARCH_TERM,
         "sort": listing.SEARCH_SORT, "pages": listing.SEARCH_PAGES,
         "organic_target": listing.LISTING_ORGANIC_TARGET,
@@ -71,7 +102,7 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
     budget = budget_factory(evidence)
     report = dict(status="running", accepted_pass=None, organic_count=0,
                   evidence_path=str(evidence.root), reason="", failed_page=None,
-                  listing_request_calls=0, offer_request_calls=0)
+                  listing_request_calls=0, offer_request_calls=0, target_or_end=target_or_end)
 
     def checkpoint():
         report["recovery_history"] = [e for e in evidence.events if e["event"] != "request"]
@@ -94,6 +125,10 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             meta = {"status_code": "ERR", "error": str(exc), "exception_type": type(exc).__name__,
                     "browser_diagnostics": getattr(exc, "bestbuy_browser_diagnostics", {})}
         ok, reason, empty = validate_page(graph, meta, rows)
+        pagination = pagination_evidence(graph, page, listing.ORGANIC_OFFSET)
+        if target_or_end and ok and empty and pagination["num_found"] is not None and not pagination["end_verified"]:
+            # An empty page contradicting an advertised total is not proof of exhaustion.
+            ok, reason, empty = False, "pagination_count_mismatch", False
         if not ok:
             report["last_failure"] = listing_failure(graph, meta, reason)
         event = evidence.request(payload, graph, page=page, pass_number=pass_number, probe=probe,
@@ -104,6 +139,7 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             raw_response_path=meta.get("response_path", ""),
             sku_order=[r.get("sku_id") for r in rows],
             order_hash=fingerprint([(r.get("sku_id"), r.get("organic_rank"), r.get("container_type")) for r in rows]),
+            pagination=pagination,
             graphql_errors=graph.get("errors", []) if isinstance(graph, dict) else [],
             browser_diagnostics=meta.get("browser_diagnostics", {}))
         meta["recovery_evidence"] = event["evidence_path"]
@@ -118,8 +154,10 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             rows_by_page, summaries, raw = {}, [], []
             seen = {}
             report["duplicates"] = []
+            report["pagination"] = {}
             organic = 0
             complete = False
+            verified_end = False
             page_limit = listing.LISTING_MAX_PAGES if listing.LISTING_ORGANIC_TARGET else listing.SEARCH_PAGES
             for page in range(1, page_limit + 1):
                 if budget.expired():
@@ -178,9 +216,15 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
                 summary["source"] = "browser_graphql_verified"
                 summaries.append(summary)
                 raw.append({"page": page, "meta": meta, "summary": summary})
-                report.update(organic_count=organic)
+                pagination = pagination_evidence(graph, page, listing.ORGANIC_OFFSET)
+                report.update(organic_count=organic, pagination=pagination)
+                verified_end = empty or (target_or_end and pagination["end_verified"])
+                if target_or_end and pagination["end_verified"]:
+                    evidence.emit("pagination_end", pass_number=pass_number, page=page,
+                                  reason="num_found_matches_documents", **pagination)
                 # Empty documents must be a verified response, never a transport failure.
-                if empty or (listing.LISTING_ORGANIC_TARGET and organic >= listing.LISTING_ORGANIC_TARGET):
+                # BestBuy returns NOT_FOUND beyond the last page, not necessarily [].
+                if verified_end or (listing.LISTING_ORGANIC_TARGET and organic >= listing.LISTING_ORGANIC_TARGET):
                     complete = True
                     break
             else:
@@ -190,7 +234,7 @@ def collect(listing, operation, browser_page, *, budget_factory=RecoveryBudget):
             if complete:
                 evidence.emit("complete", pass_number=pass_number, organic_count=organic)
                 report.update(status="validated", accepted_pass=pass_number, failed_page=None,
-                              reason="verified_end" if empty else "target_reached")
+                              reason="verified_end" if verified_end else "target_reached")
                 checkpoint()
                 return rows_by_page, summaries, raw, report
         raise CollectionIncomplete("listing_pass_limit")

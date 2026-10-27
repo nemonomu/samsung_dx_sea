@@ -461,6 +461,18 @@ def bsr_rank_complete():
     csv_path = root / "parsed" / "bsr_rank_map.csv"
     count = csv_count(csv_path)
     if count < 100:
+        from .step01_listing_recovery import listing_exhausted
+        report = read_json(root / "collection_status.json")
+        manifest = read_json(root / "manifest_bsr_rank.json")
+        if (listing_exhausted(report, os.getenv("BESTBUY_CATEGORY", "").strip().upper())
+                and csv_path.exists() and manifest.get("output_rows") == count
+                and report.get("organic_count") == count):
+            from .step00_collection_recovery import assert_ready, CollectionIncomplete
+            try:
+                assert_ready(root.parent, listing="bsr")
+            except CollectionIncomplete as exc:
+                return False, str(exc)
+            return True, f"bsr rows {count}/100; verified end"
         return False, f"bsr rows {count}/100"
     return True, f"bsr rows {count}"
 
@@ -512,6 +524,24 @@ def final_targets_complete():
     manifest = read_json(root / "bestbuy_final_targets.manifest.json")
     csv_path = root / "bestbuy_final_targets.csv"
     count = csv_unique_count(csv_path, "sku_id")
+    from .step01_listing_recovery import listing_exhausted
+    main_report = read_json(root.parent / "main" / "collection_status.json")
+    if (listing_exhausted(main_report, os.getenv("BESTBUY_CATEGORY", "").strip().upper())
+            and manifest.get("main_exhausted") is True
+            and manifest.get("listing_sources") == {
+                name: read_json(root.parent / name / "collection_status.json").get("evidence_path")
+                for name in ("main", "bsr")}
+            and csv_path.exists() and manifest.get("final_unique_sku_count") == count
+            and manifest.get("final_row_count") == csv_count(csv_path)):
+        from .step00_collection_recovery import assert_ready, CollectionIncomplete
+        for name in ("main", "bsr"):
+            if read_json(root.parent / name / "collection_status.json").get("status") != "complete":
+                return False, f"{name} listing incomplete"
+            try:
+                assert_ready(root.parent, listing=name)
+            except CollectionIncomplete as exc:
+                return False, str(exc)
+        return True, f"target unique {count}; verified end"
     if count < TARGET_SIZE:
         return False, f"target unique {count}/{TARGET_SIZE}"
     if manifest.get("needs_more_main_candidates") is True:
@@ -653,6 +683,15 @@ def run_step(step, dry_run=False, resume=False):
         env.update(SAFE_FULLRUN_DETAIL_ENV)
     category_overrides = {}
     category_key = env.get("BESTBUY_CATEGORY", "").strip().upper()
+    from .step01_listing_recovery import TARGET_OR_END_CATEGORIES
+    if step.name in {"main_list", "bsr_list"} and category_key in TARGET_OR_END_CATEGORIES:
+        # Count products, not a fixed 16/6 pages. The cap is a failure guard;
+        # reaching it without a target or a verified end never means success.
+        category_overrides.update({
+            "BESTBUY_LISTING_ORGANIC_TARGET": "300" if step.name == "main_list" else "100",
+            "BESTBUY_LISTING_MAX_PAGES": "100",
+        })
+        env.update(category_overrides)
     if step.name in {"main_list", "bsr_list"} and category_key in CATEGORY_SEARCH_TERMS:
         category_overrides["BESTBUY_SEARCH_TERM"] = CATEGORY_SEARCH_TERMS[category_key]
         env.update(category_overrides)

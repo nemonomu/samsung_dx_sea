@@ -673,9 +673,12 @@ def product_list_fields():
 
 
 def main():
-    from .step00_collection_recovery import assert_ready
+    from .step00_collection_recovery import assert_ready, read_json
+    from .step01_listing_recovery import listing_exhausted
     assert_ready(RUN_ROOT, listing=MAIN_RUN_ID)
     assert_ready(RUN_ROOT, listing=BSR_RUN_ID)
+    main_report = read_json(MAIN_ROOT / "collection_status.json")
+    main_exhausted = listing_exhausted(main_report, CATEGORY)
     started_at = now()
     main_input_rows = load_rows(MAIN_INPUT)
     bsr_rows = load_rows(BSR_INPUT)
@@ -741,7 +744,13 @@ def main():
         "final_row_count": len(final_rows),
         "final_unique_sku_count": len({row.get("sku_id") for row in final_rows if row.get("sku_id")}),
         "product_list_row_count": len(listing_rows),
-        "needs_more_main_candidates": len(main_rows) < main_selection_limit,
+        "needs_more_main_candidates": len(main_rows) < main_selection_limit and not main_exhausted,
+        "main_exhausted": main_exhausted,
+        "main_shortfall": max(0, main_selection_limit - len(main_rows)),
+        "listing_sources": {
+            name: read_json(RUN_ROOT / name / "collection_status.json").get("evidence_path")
+            for name in (MAIN_RUN_ID, BSR_RUN_ID)
+        },
         "krw_per_usd": KRW_PER_USD,
     }
     manifest_path = OUTPUT_CSV.with_suffix(".manifest.json")
