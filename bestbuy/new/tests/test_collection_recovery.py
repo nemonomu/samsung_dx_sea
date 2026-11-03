@@ -131,6 +131,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('"price"', text)
 
     def install_detail(self):
+        detail.output_review_counts.cache_clear()
+        detail.output_review_blank_keys.cache_clear()
+        self.addCleanup(detail.output_review_counts.cache_clear)
+        self.addCleanup(detail.output_review_blank_keys.cache_clear)
         for name in ("main", "bsr"):
             common.atomic_json(self.root / name / "collection_status.json", dict(status="complete"))
         base = self.root / "detail"
@@ -505,6 +509,103 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(row["count_of_reviews"], "15")
         self.assertEqual(row["final_sku_price"], "$999")
         self.assertIn("NULL 컬럼: detailed_review_content", common.recovery_notification("LDY", self.root)["body"])
+
+    def test_review_totals_rescue_observed_cases_and_do_not_abort_other_skus(self):
+        self.install_detail()
+        # The first two cases reproduce the independently observed HAR totals.
+        cases = {"6686978": (12, 11, 11, 4.6), "6687111": (15, 4, 4, 4.9),
+                 "short": (15, 8, 4, 4.8), "normal": (35, 35, 20, 4.5),
+                 "empty": (1, 0, 0, 5.0)}
+        targets = [dict(sku_id=sku, main_rank=i, review_count=str(values[0]))
+                   for i, (sku, values) in enumerate(cases.items(), 1)]
+        calls = []
+
+        def post(payloads, *args):
+            calls.append(payloads)
+            responses = [self.response(p) for p in payloads]
+            for p, response in zip(payloads, responses):
+                if p["operationName"] == "GetCompareProduct":
+                    continue
+                self.assertIn("{totalResults results{", p["query"])
+                sku = p["variables"]["skuId"]
+                aggregate, total, actual, rating = cases[sku]
+                product = response["data"]["productBySkuId"]
+                product["reviewInfo"] = dict(reviewCount=aggregate, averageRating=rating, recommendedPercent=100)
+                product["reviews"] = dict(totalResults=total, results=[dict(text=f"Review {i}") for i in range(actual)])
+            return 200, "", responses, {}, 0
+
+        fields = detail.sample_fields() + ["count_of_star_ratings", "star_rating", "recommendation_intent"]
+        with patch.object(detail, "browser_graphql_post", post), patch.object(detail, "sample_fields", return_value=fields):
+            report = recovery.run(detail, targets, targets, budget_factory=Clock().budget)
+            self.assertEqual(report["status"], "complete_with_warnings")
+            self.assertTrue(report["finalization_ready"])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls[1]), 1)  # Only the unresolved review is retried.
+            self.assertEqual(calls[1][0]["variables"]["skuId"], "short")
+            with detail.FINAL_OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as stream:
+                rows = {row["sku_id"]: row for row in csv.DictReader(stream)}
+            for sku, count in (("6686978", "11"), ("6687111", "4"), ("empty", "0")):
+                row = rows[sku]
+                self.assertEqual(row["count_of_reviews"], count)
+                self.assertEqual(row["count_of_star_ratings"], count)
+                self.assertEqual(float(row["star_rating"]), cases[sku][3])
+                self.assertEqual(detail.review_text_count_from_content(row["detailed_review_content"]), int(count))
+                state = report["items"][sku]["review"]
+                self.assertEqual(state["reason"], "verified_review_total_results")
+                self.assertTrue(state["review_count_corrected"])
+                self.assertEqual(state["review_count_original"], cases[sku][0])
+                self.assertEqual(state["review_total_results"], int(count))
+                target = next(t for t in targets if t["sku_id"] == sku)
+                self.assertFalse(detail.review_meta_needs_detail_batch_refill(target, sku))
+                self.assertFalse(detail.review_needs_retry(target))
+                meta = detail.read_json(detail.review_paths(sku)["meta"])
+                self.assertTrue(meta["review_count_corrected"])
+            self.assertEqual(rows["short"]["count_of_reviews"], "15")
+            self.assertEqual(rows["short"]["detailed_review_content"], "")
+            self.assertEqual(report["items"]["short"]["review"]["reason"], "review_partial_4_of_15")
+            self.assertEqual(report["items"]["short"]["review"]["request_attempt"], 2)
+            self.assertEqual(rows["normal"]["count_of_reviews"], "35")
+            self.assertEqual(detail.review_text_count_from_content(rows["normal"]["detailed_review_content"]), 20)
+
+    def test_untrusted_or_inconsistent_review_totals_do_not_rescue_short_lists(self):
+        self.install_detail()
+        target = dict(sku_id="6687111", review_count="15")
+        base = {"data": {"productBySkuId": {"skuId": "6687111",
+            "reviewInfo": {"reviewCount": 15, "averageRating": 4.9},
+            "reviews": {"totalResults": 4, "results": [{"text": "Body"} for _ in range(4)]}}}}
+        mutations = {
+            "missing_total": lambda p: p["reviews"].pop("totalResults"),
+            "null_total": lambda p: p["reviews"].update(totalResults=None),
+            "negative_total": lambda p: p["reviews"].update(totalResults=-4),
+            "fractional_total": lambda p: p["reviews"].update(totalResults=4.5),
+            "boolean_total": lambda p: p["reviews"].update(totalResults=True),
+            "text_total": lambda p: p["reviews"].update(totalResults="4"),
+            "too_many_bodies": lambda p: p["reviews"].update(totalResults=3),
+            "too_few_bodies": lambda p: p["reviews"].update(totalResults=5),
+            "blank_body": lambda p: p["reviews"]["results"][0].update(text=" "),
+            "wrong_sku": lambda p: p.update(skuId="different"),
+            "external_summary": lambda p: p["reviewInfo"].update(syndicatedReviewSummary={"totalReviewCount": 4}),
+            "syndicated_body": lambda p: p["reviews"]["results"][0].update(syndicationSource={"displayName": "Other"}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                item = copy.deepcopy(base)
+                mutate(item["data"]["productBySkuId"])
+                self.assertFalse(detail.review_count_validation(target, "6687111", item)["review_count_corrected"])
+                self.assertEqual(recovery.validate_operation(detail, "review", "6687111", item, target)[0], "failed")
+        item = copy.deepcopy(base)
+        item["errors"] = [{"message": "Incomplete response"}]
+        self.assertFalse(detail.review_count_validation(target, "6687111", item)["review_count_corrected"])
+        self.assertEqual(recovery.validate_operation(detail, "review", "6687111", item, target)[0], "failed")
+
+    def test_cached_review_query_is_upgraded_without_changing_filters(self):
+        self.install_detail()
+        old = detail.fallback_review20_payload("6687111")
+        old["query"] = old["query"].replace("totalResults ", "")
+        with patch.object(detail, "find_started_operation_from_payloads", return_value=copy.deepcopy(old)):
+            upgraded = detail.review20_payload_for_sku("6687111")
+        self.assertIn("reviews(filter:{pageSize:20}){totalResults results{", upgraded["query"])
+        self.assertEqual(detail.ensure_review_total_results_query(upgraded["query"]), upgraded["query"])
 
     def test_observed_buying_options_error_preserves_listing_prices_and_nulls_review(self):
         self.install_detail()

@@ -56,7 +56,8 @@ def validate_operation(d, stage, sku, item, target):
                 return "failed", "price_missing"
     if stage == "review":
         count = d.review_result_count_from_json(item)
-        expected = d.expected_review_text_count(target, sku)
+        validation = d.review_count_validation(target, sku, item)
+        expected = validation["review_text_count_expected"]
         if (product.get("reviewInfo") or {}).get("reviewCount") == 0:
             expected = 0
         actual = d.review_text_count_from_json(item)
@@ -64,6 +65,8 @@ def validate_operation(d, stage, sku, item, target):
             return "failed", "review_list_missing"
         if not d.review_text_count_is_sufficient(actual, expected):
             return "failed", f"review_partial_{actual}_of_{expected}"
+        if validation["review_count_corrected"]:
+            return ("empty" if count == 0 else "success"), "verified_review_total_results"
         return ("empty", "verified_empty") if count == 0 else ("success", "verified")
     if stage in {"compare", "compare_v2"}:
         recs = data.get("recommendationsV2" if stage == "compare_v2" else "recommendations")
@@ -183,6 +186,8 @@ def safe_output_row(d, target, states):
                 row[field] = None
     if states.get("review", {}).get("status") not in SUCCESS_STATES:
         row["detailed_review_content"] = None
+    else:
+        d.apply_verified_review_count(row, target, str(target["sku_id"]))
     if states.get("compare", {}).get("status") not in SUCCESS_STATES:
         row["retailer_sku_name_similar"] = None
     auxiliary_fields = {
@@ -336,6 +341,8 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                     outcome, why = validate_operation(d, stage, sku, response[index], target)
                     state.update(status=outcome, reason=why, status_code=code,
                                  evidence_path=event["evidence_path"], collected_at=utc_now(), response_received=True)
+                    if stage == "review":
+                        state.update(d.review_count_validation(target, sku, response[index]))
                     item = response[index]
                     errors = item.get("errors") if isinstance(item, dict) else []
                     state["error_paths"] = [".".join(map(str, e["path"])) for e in errors or []

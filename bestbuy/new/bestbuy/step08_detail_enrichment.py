@@ -3506,7 +3506,16 @@ def review20_payload(html_text):
     payload["query"] = payload["query"].replace("reviews(filter:{pageSize:5})", "reviews(filter:{pageSize:20})")
     payload["query"] = ensure_recommended_percent_query(payload.get("query") or "")
     payload["query"] = ensure_dotcom_display_status_query(payload.get("query") or "")
+    payload["query"] = ensure_review_total_results_query(payload["query"])
     return payload
+
+
+def ensure_review_total_results_query(query):
+    return re.sub(
+        r"(reviews\s*\([^)]*\)\s*\{)(?!\s*totalResults\b)",
+        r"\1totalResults ",
+        query,
+    )
 
 
 def ensure_recommended_percent_query(query):
@@ -3543,7 +3552,7 @@ PRODUCT_SCHEMA_REVIEW20_QUERY = (
     "reviewInfo{averageRating reviewCount recommendedPercent}"
     "specificationGroups{specifications{displayName value}}"
     "buyingOptions{description pdpUrl skuId type product{price(input:{salesChannel:$salesChannel}){customerPrice}}}"
-    "reviews(filter:{pageSize:20}){results{rating title text userNickname}}}}"
+    "reviews(filter:{pageSize:20}){totalResults results{rating title text userNickname}}}}"
 )
 
 
@@ -4082,6 +4091,7 @@ def review20_payload_for_sku(sku):
     payload["query"] = payload["query"].replace("reviews(filter:{pageSize:5})", "reviews(filter:{pageSize:20})")
     payload["query"] = ensure_recommended_percent_query(payload.get("query") or "")
     payload["query"] = ensure_dotcom_display_status_query(payload.get("query") or "")
+    payload["query"] = ensure_review_total_results_query(payload["query"])
     return payload
 
 
@@ -4299,7 +4309,7 @@ def fetch_detail(client, target):
                     )
                 review_count = review_result_count_from_json(review_response_json)
                 review_text_count = review_text_count_from_json(review_response_json)
-                expected_text_count = expected_review_text_count(target, sku)
+                expected_text_count = expected_review_text_count(target, sku, review_response_json)
                 review_ok = (
                     success
                     and review_count is not None
@@ -4728,7 +4738,7 @@ def fetch_detail_sku_batch(client, targets, force_retry=False, max_batch_attempt
                 )
             review_count = review_result_count_from_json(review_response_json)
             review_text_count = review_text_count_from_json(review_response_json)
-            expected_text_count = expected_review_text_count(target, sku)
+            expected_text_count = expected_review_text_count(target, sku, review_response_json)
             review_ok = (
                 success
                 and review_count is not None
@@ -4894,7 +4904,7 @@ def review_meta_needs_detail_batch_refill(target, sku):
         return False
     if not review_success(sku):
         return True
-    expected_text_count = min(expected_count, MAX_REVIEW_TEXTS)
+    expected_text_count = expected_review_text_count(target, sku)
     return not review_text_count_is_sufficient(review20_text_count(sku), expected_text_count)
 
 
@@ -4994,7 +5004,6 @@ def fetch_review20(client, target, force_retry=False, retry_label=""):
             continue
         review_count = 0
         review_text_count = 0
-        expected_text_count = expected_review_text_count(target, sku)
         error = ""
         if not response_json and transport != "browser_graphql":
             try:
@@ -5008,6 +5017,7 @@ def fetch_review20(client, target, force_retry=False, retry_label=""):
             review_text_count = text_count if text_count is not None else 0
             if response_json.get("errors"):
                 error = json.dumps(response_json.get("errors"), ensure_ascii=False, separators=(",", ":"))
+        expected_text_count = expected_review_text_count(target, sku, response_json)
         has_review_list = review_result_count_from_json(response_json) is not None
         enough_review_text = review_text_count_is_sufficient(review_text_count, expected_text_count)
         success = detail_status_code_int(response_status) == 200 and has_review_list and enough_review_text
@@ -5157,7 +5167,7 @@ def fetch_review20_batch(client, targets):
         item_text = json.dumps(item_json, ensure_ascii=False) if item_json else text
         review_count = 0
         review_text_count = 0
-        expected_text_count = expected_review_text_count(target, sku)
+        expected_text_count = expected_review_text_count(target, sku, item_json)
         item_error = error
         if item_json:
             count = review_result_count_from_json(item_json)
@@ -6093,11 +6103,65 @@ def expected_review_count(target, sku=None):
     return max(counts) if counts else None
 
 
-def expected_review_text_count(target, sku=None):
+def review_count_validation(target, sku=None, response_json=None):
+    """Rescue a short unfiltered review list only when its own total verifies it.
+
+    reviewInfo.reviewCount can differ from the written review list's total.
+    Keep that count unless a short list exactly satisfies the
+    independently returned reviews.totalResults (up to our text limit).
+    """
     count = expected_review_count(target, sku)
-    if count is None:
-        return None
-    return min(max(0, count), MAX_REVIEW_TEXTS)
+    if response_json is None:
+        response_json = read_json(review_paths(sku)["response_json"]) if sku else {}
+    response_json = response_json if isinstance(response_json, dict) else {}
+    data = response_json.get("data")
+    product = data.get("productBySkuId") if isinstance(data, dict) else {}
+    product = product if isinstance(product, dict) else {}
+    same_sku = bool(sku) and str(product.get("skuId") or "") == str(sku)
+    review_info = product.get("reviewInfo")
+    review_info = review_info if isinstance(review_info, dict) else {}
+    response_count = review_count_number(review_info.get("reviewCount")) if same_sku else None
+    if response_count == 0:
+        count = 0
+    elif response_count is not None:
+        count = max(count or 0, response_count)
+    expected = min(max(0, count), MAX_REVIEW_TEXTS) if count is not None else None
+    reviews = product.get("reviews") or {}
+    total = reviews.get("totalResults") if isinstance(reviews, dict) else None
+    # Do not coerce malformed, negative, boolean, or fractional totals to counts.
+    total = total if type(total) is int and total >= 0 else None
+    results = reviews.get("results") if isinstance(reviews, dict) else None
+    results = results if isinstance(results, list) and all(isinstance(r, dict) for r in results) else None
+    actual = review_text_count_from_reviews(results)
+    syndicated = is_external_review_source(target, review_info) or any(
+        review.get("syndicationSource") for review in results or [] if isinstance(review, dict)
+    )
+    corrected = bool(
+        same_sku and not response_json.get("errors") and not syndicated
+        and expected is not None and actual is not None and actual < expected
+        and total is not None and isinstance(results, list)
+        and len(results) == actual == min(total, MAX_REVIEW_TEXTS)
+    )
+    return {
+        "review_count_original": count,
+        "review_total_results": total,
+        "review_text_count_returned": actual,
+        "review_text_count_expected": min(total, MAX_REVIEW_TEXTS) if corrected else expected,
+        "review_count_corrected": corrected,
+    }
+
+
+def expected_review_text_count(target, sku=None, response_json=None):
+    return review_count_validation(target, sku, response_json)["review_text_count_expected"]
+
+
+def apply_verified_review_count(row, target, sku):
+    validation = review_count_validation(target, sku)
+    if validation["review_count_corrected"]:
+        count = int_commas(validation["review_total_results"])
+        row["count_of_reviews"] = count
+        row["count_of_star_ratings"] = count
+    return row
 
 
 def review20_text_count(sku):
@@ -6177,7 +6241,7 @@ def review_needs_retry(target):
         return expected_count is None or expected_count > 0
     if expected_count in (None, 0):
         return False
-    expected_text_count = min(expected_count, MAX_REVIEW_TEXTS)
+    expected_text_count = expected_review_text_count(target, sku)
     if not review_text_count_is_sufficient(review20_text_count(sku), expected_text_count):
         return True
     return False
@@ -6579,7 +6643,7 @@ def output_row(target):
             row[field] = ""
     for field, value in selector_values.items():
         row.setdefault(field, value)
-    return row
+    return apply_verified_review_count(row, target, sku)
 
 
 def build_outputs(targets):
