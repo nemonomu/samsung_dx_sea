@@ -59,6 +59,48 @@ class SelectedOfferPriceTests(unittest.TestCase):
         self.assertIsNone(extract_selected_offer_price(page(active_price='Currently unavailable.'), 'B0BZTB81QV'))
         self.assertIsNone(extract_selected_offer_price(page(active_price=''), 'B0BZTB81QV'))
 
+    def test_reads_new_price_when_price_and_form_are_outside_the_active_row(self):
+        # Minimized from the Roku PDP snapshot captured during mode 6 recovery.
+        tree = html.fromstring('''<main>
+          <div id="buyBoxAccordion">
+            <div id="newAccordionRow_0" class="buying-option a-accordion-active"></div>
+            <div id="usedAccordionRow" class="buying-option"></div>
+          </div>
+          <div id="apex_desktop">
+            <div id="apex_desktop_newAccordionRow">
+              <div id="corePriceDisplay_desktop_feature_div">
+                <span class="a-price priceToPay"><span aria-hidden="true">$149.99</span></span>
+              </div>
+            </div>
+            <div id="apex_desktop_usedAccordionRow" style="display:none">
+              <div id="corePriceDisplay_desktop_feature_div">
+                <span class="a-price priceToPay"><span aria-hidden="true">$142.49</span></span>
+              </div>
+            </div>
+          </div>
+          <div id="offerActions_desktop_newAccordionRow">
+            <form id="addToCart" action="/gp/product/handle-buy-box">
+              <input name="items[0.base][asin]" value="B0FV57TPWT">
+              <input name="items[0.base][customerVisiblePrice][displayString]" value="$149.99">
+            </form>
+          </div>
+          <div id="offerActions_desktop_usedAccordionRow">
+            <form id="addToCart" action="/gp/product/handle-buy-box">
+              <input name="items[0.base][asin]" value="B0FV57TPWT">
+              <input name="items[0.base][customerVisiblePrice][displayString]" value="$142.49">
+            </form>
+          </div>
+        </main>''')
+        asin = 'B0FV57TPWT'
+        self.assertEqual(extract_selected_offer_price(tree, asin), '$149.99')
+        self.assertIsNone(extract_selected_offer_price(tree, 'B0BZTB81QV'))
+        new_area = tree.xpath("//*[@id='apex_desktop_newAccordionRow']")[0]
+        new_area.set('style', 'display: none;')
+        self.assertIsNone(extract_selected_offer_price(tree, asin))
+        new_area.attrib.pop('style')
+        new_area.xpath(".//span[@aria-hidden='true']")[0].text = '$142.49'
+        self.assertIsNone(extract_selected_offer_price(tree, asin))
+
     def test_detail_uses_selected_offer_only_after_existing_price_paths(self):
         from amazon.tv import amazon_tv_dt
 
