@@ -20,6 +20,11 @@ HIDDEN_CART_PRICE_MESSAGE = (
     "you can always remove it later."
 )
 GENERIC_SEE_PRICE_IN_CART_MESSAGE = "see price in cart"
+SELECTED_OFFER_PRICE_XPATH = (
+    ".//*[@id='corePrice_feature_div']"
+    "//*[contains(concat(' ', normalize-space(@class), ' '), ' apex-core-price-identifier ')]"
+    "//span[contains(concat(' ', normalize-space(@class), ' '), ' a-offscreen ')]/text()"
+)
 
 
 class CartPriceParseError(ValueError):
@@ -169,6 +174,38 @@ def _matching_pdp_add_to_cart_form(tree, asin):
             f"PDP returned {len(matching)} addToCart forms for ASIN {asin}"
         )
     return matching[0]
+
+
+def extract_selected_offer_price(tree, asin):
+    """Read a unique price from the active offer for the requested ASIN."""
+    rows = tree.xpath(
+        "//*[@id='buyBoxAccordion']"
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' a-accordion-active ')]"
+    )
+    if len(rows) != 1:
+        return None
+    try:
+        asin = normalize_asin(asin)
+        forms = rows[0].xpath(
+            ".//form[@id='addToCart' and contains(@action, '/gp/product/handle-buy-box')]"
+        )
+        if len(forms) != 1:
+            return None
+        form_asins = {
+            value.strip().upper()
+            for value in forms[0].xpath(".//input[@name='items[0.base][asin]']/@value")
+            if value.strip()
+        }
+        if form_asins != {asin}:
+            return None
+        prices = {
+            normalize_money(value)
+            for value in rows[0].xpath(SELECTED_OFFER_PRICE_XPATH)
+            if value.strip()
+        }
+    except CartPriceParseError:
+        return None
+    return prices.pop() if len(prices) == 1 else None
 
 
 def extract_pdp_offer_identity(tree, asin):

@@ -55,6 +55,7 @@ from amazon.tv.amazon_tv_cart_price import (
     extract_active_cart_offer_line,
     extract_ewc_cart_line,
     extract_pdp_offer_identity,
+    extract_selected_offer_price,
     hidden_pdp_price_trigger,
     is_hidden_pdp_price_state,
     parse_html,
@@ -1137,6 +1138,11 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
                     f"  [WARNING] Exact cart price rejected: "
                     f"item={item}, reason={exc}"
                 )
+
+            if not final_sku_price:
+                final_sku_price = extract_selected_offer_price(tree, item)
+                if final_sku_price:
+                    final_sku_price_source = 'selected_offer_xpath'
 
             # 장바구니 확인 후 복원된 PDP DOM을 기준으로 리뷰 섹션을 판단한다.
             review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
