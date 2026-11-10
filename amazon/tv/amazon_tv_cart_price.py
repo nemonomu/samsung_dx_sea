@@ -20,21 +20,6 @@ HIDDEN_CART_PRICE_MESSAGE = (
     "you can always remove it later."
 )
 GENERIC_SEE_PRICE_IN_CART_MESSAGE = "see price in cart"
-SELECTED_OFFER_PRICE_XPATH = (
-    ".//*[@id='corePrice_feature_div']"
-    "//*[contains(concat(' ', normalize-space(@class), ' '), ' apex-core-price-identifier ')]"
-    "//span[contains(concat(' ', normalize-space(@class), ' '), ' a-offscreen ')]/text()"
-)
-SPLIT_NEW_OFFER_PRICE_XPATH = (
-    "//*[@id='apex_desktop']//*[@id='apex_desktop_newAccordionRow']"
-    "//*[@id='corePriceDisplay_desktop_feature_div']"
-    "//span[contains(concat(' ', normalize-space(@class), ' '), ' priceToPay ')]"
-    "/span[@aria-hidden='true']"
-    "[not(ancestor-or-self::*[@hidden"
-    " or contains(concat(' ', normalize-space(@class), ' '), ' aok-hidden ')"
-    " or contains(translate(@style, ' ', ''), 'display:none')"
-    " or contains(translate(@style, ' ', ''), 'visibility:hidden')])]"
-)
 
 
 class CartPriceParseError(ValueError):
@@ -184,57 +169,6 @@ def _matching_pdp_add_to_cart_form(tree, asin):
             f"PDP returned {len(matching)} addToCart forms for ASIN {asin}"
         )
     return matching[0]
-
-
-def extract_selected_offer_price(tree, asin):
-    """Read a unique price from the active offer for the requested ASIN."""
-    rows = tree.xpath(
-        "//*[@id='buyBoxAccordion']"
-        "//*[contains(concat(' ', normalize-space(@class), ' '), ' a-accordion-active ')]"
-    )
-    if len(rows) != 1:
-        return None
-    try:
-        asin = normalize_asin(asin)
-        row = rows[0]
-        form_xpath = ".//form[@id='addToCart' and contains(@action, '/gp/product/handle-buy-box')]"
-        forms = row.xpath(form_xpath)
-        split_new_offer = not forms and row.get('id') == 'newAccordionRow_0'
-        if split_new_offer:
-            # Amazon can render the selected new offer's price and form in the center column.
-            form_scopes = tree.xpath("//*[@id='offerActions_desktop_newAccordionRow']")
-            if len(form_scopes) != 1:
-                return None
-            forms = form_scopes[0].xpath(form_xpath)
-            price_values = [node.text_content() for node in tree.xpath(SPLIT_NEW_OFFER_PRICE_XPATH)]
-        else:
-            price_values = row.xpath(SELECTED_OFFER_PRICE_XPATH)
-        if len(forms) != 1:
-            return None
-        form_asins = {
-            value.strip().upper()
-            for value in forms[0].xpath(".//input[@name='items[0.base][asin]']/@value")
-            if value.strip()
-        }
-        if form_asins != {asin}:
-            return None
-        prices = {
-            normalize_money(value)
-            for value in price_values
-            if value.strip()
-        }
-        if split_new_offer:
-            form_prices = {
-                normalize_money(value)
-                for value in forms[0].xpath(
-                    ".//input[@name='items[0.base][customerVisiblePrice][displayString]']/@value"
-                )
-            }
-            if prices != form_prices:
-                return None
-    except CartPriceParseError:
-        return None
-    return prices.pop() if len(prices) == 1 else None
 
 
 def extract_pdp_offer_identity(tree, asin):

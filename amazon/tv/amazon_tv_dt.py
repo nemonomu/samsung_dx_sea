@@ -55,11 +55,37 @@ from amazon.tv.amazon_tv_cart_price import (
     extract_active_cart_offer_line,
     extract_ewc_cart_line,
     extract_pdp_offer_identity,
-    extract_selected_offer_price,
     hidden_pdp_price_trigger,
     is_hidden_pdp_price_state,
+    normalize_money,
     parse_html,
 )
+
+
+def extract_pdp_body_price(page, asin):
+    """Read the rendered main selling price on the exact product page."""
+    prices = page.run_js(r'''
+        const asin = arguments[0];
+        const readAsin = path => path.match(/\/(?:dp|gp\/product)\/([a-z0-9]{10})(?:\/|$)/i)?.[1].toUpperCase();
+        const productIds = [...document.querySelectorAll('input#ASIN[name="ASIN"]')].map(node => node.value);
+        const canonical = (document.querySelector('link[rel="canonical"]')?.href || '').split(/[?#]/)[0];
+        if (!['www.amazon.com', 'amazon.com'].includes(location.hostname)
+            || readAsin(location.pathname) !== asin
+            || (productIds.length ? productIds.some(id => id !== asin) : readAsin(canonical) !== asin)) return [];
+
+        return [...document.querySelectorAll(
+            '#apex_desktop .apex-core-price-identifier .priceToPay > span[aria-hidden="true"]'
+        )].filter(node =>
+            !node.closest('#apex_desktop_usedAccordionRow')
+            && node.getClientRects().length && getComputedStyle(node).visibility === 'visible'
+        ).map(node => node.textContent.trim()).filter(Boolean);
+    ''', asin)
+    try:
+        unique = {normalize_money(price) for price in prices or []}
+    except CartPriceParseError:
+        return None
+    return unique.pop() if len(unique) == 1 else None
+
 
 # Dedicated trusted profile for Amazon detail collection.
 # Seed it once from regular Chrome, then preserve the authenticated
@@ -1112,37 +1138,38 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             final_sku_price_source = (
                 'xpath' if final_sku_price and '$' in final_sku_price else None
             )
-            try:
-                (
-                    final_sku_price,
-                    used_cart_price,
-                    cart_price_source,
-                    tree,
-                    cart_price_resolution,
-                ) = self.resolve_hidden_price_from_cart(
-                    tree,
-                    item,
-                    product_url,
-                    final_sku_price,
-                )
-                if used_cart_price:
-                    final_sku_price_source = cart_price_source
-                    self._record_cart_price_resolution(cart_price_resolution)
-                    print(
-                        f"  [CART PRICE] Hidden PDP resolved: "
-                        f"item={item}, price={final_sku_price}, "
-                        f"source={cart_price_source}"
-                    )
-            except CartPriceParseError as exc:
-                print(
-                    f"  [WARNING] Exact cart price rejected: "
-                    f"item={item}, reason={exc}"
-                )
-
             if not final_sku_price:
-                final_sku_price = extract_selected_offer_price(tree, item)
+                final_sku_price = extract_pdp_body_price(self.page, item)
                 if final_sku_price:
-                    final_sku_price_source = 'selected_offer_xpath'
+                    final_sku_price_source = 'pdp_body_price'
+
+            if not final_sku_price_source:
+                try:
+                    (
+                        final_sku_price,
+                        used_cart_price,
+                        cart_price_source,
+                        tree,
+                        cart_price_resolution,
+                    ) = self.resolve_hidden_price_from_cart(
+                        tree,
+                        item,
+                        product_url,
+                        final_sku_price,
+                    )
+                    if used_cart_price:
+                        final_sku_price_source = cart_price_source
+                        self._record_cart_price_resolution(cart_price_resolution)
+                        print(
+                            f"  [CART PRICE] Hidden PDP resolved: "
+                            f"item={item}, price={final_sku_price}, "
+                            f"source={cart_price_source}"
+                        )
+                except CartPriceParseError as exc:
+                    print(
+                        f"  [WARNING] Exact cart price rejected: "
+                        f"item={item}, reason={exc}"
+                    )
 
             # 장바구니 확인 후 복원된 PDP DOM을 기준으로 리뷰 섹션을 판단한다.
             review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
