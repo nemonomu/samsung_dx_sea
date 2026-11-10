@@ -4,12 +4,13 @@ Amazon TV Detail 페이지 크롤러 (UPDATE 전용)
 ================================================================================
 실행 모드
 ================================================================================
-- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3|4|5] [--start-id N]
-- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3|4|5] [--start-id N]
+- 운영: python amazon_tv_dt_update.py --batch-id <batch_id> [--mode 1|2|3|4|5|6] [--start-id N]
+- 테스트: python amazon_tv_dt_update.py --test --batch-id <batch_id> [--mode 1|2|3|4|5|6] [--start-id N]
 - batch_id 필수 (인자 또는 stdin)
 - mode: 1=item IS NULL (기본), 2=star_rating/count_of_star_ratings IS NULL, 3=둘 다,
         4=detailed_review_content IS NULL (리뷰 본문 백필),
-        5=number_of_units_purchased_past_month IS NULL (구매수 뱃지 백필)
+        5=number_of_units_purchased_past_month IS NULL (구매수 뱃지 백필),
+        6=--asins 목록 중 가격 미수집 상품만 상세 재수집
 
 ================================================================================
 주요 기능
@@ -61,6 +62,7 @@ setup_environment(__file__)
 from amazon.savings import build_amazon_extracted_data
 
 from common.base_crawler import BaseCrawler
+from amazon.tv.amazon_tv_cart_price import CartPriceParseError, normalize_asin, normalize_money
 from amazon.tv.amazon_tv_dt import AmazonTVDetailCrawler
 
 
@@ -77,16 +79,19 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
     MODE_BOTH = '3'
     MODE_DETAIL_REVIEW_NULL = '4'
     MODE_UNITS_NULL = '5'
+    MODE_PRICE_NULL = '6'
+    PRICE_MISSING_CONDITION = "NULLIF(BTRIM(final_sku_price), '') IS NULL AND redirect IS NOT TRUE"
     UPDATE_META_FIELDS = {
         'crawl_datetime': 'CURRENT_TIMESTAMP',
     }
 
-    def __init__(self, batch_id=None, start_id=None, mode=None, test_mode=False):
-        """batch_id: 필수, start_id: 특정 id 이후부터 조회, mode: 1/2/3, test_mode: True면 test_tv_retail_com 사용"""
+    def __init__(self, batch_id=None, start_id=None, mode=None, test_mode=False, asins=None):
+        """batch_id는 필수이며, 모드 6은 재수집할 ASIN 목록을 받는다."""
         super().__init__(batch_id=batch_id, test_mode=test_mode)
         self.require_amazon_login = True
         self.start_id = start_id
         self.mode = mode or self.MODE_ITEM_NULL
+        self.asins = list(asins or [])
 
         # UPDATE 모드는 재추출 검증용이라 캡처 불필요
         self.capture_enabled = False
@@ -125,6 +130,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             elif self.mode == self.MODE_UNITS_NULL:
                 condition = "AND number_of_units_purchased_past_month IS NULL"
                 mode_desc = "number_of_units_purchased_past_month IS NULL"
+            elif self.mode == self.MODE_PRICE_NULL:
+                condition = f"AND {self.PRICE_MISSING_CONDITION} AND item = ANY(%s)"
+                mode_desc = "final_sku_price missing for specified ASINs"
             else:
                 condition = "AND item IS NULL"
                 mode_desc = "item IS NULL"
@@ -144,8 +152,11 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             """
 
             params = [self.account_name, self.batch_id]
+            if self.mode == self.MODE_PRICE_NULL:
+                params.append(self.asins)
             if self.start_id:
-                query = query.replace("ORDER BY id", f"AND id >= {self.start_id} ORDER BY id")
+                query = query.replace("ORDER BY id", "AND id >= %s ORDER BY id")
+                params.append(self.start_id)
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -182,6 +193,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
         except Exception as e:
             print(f"[ERROR] Failed to load product list: {e}")
             traceback.print_exc()
+            if self.mode == self.MODE_PRICE_NULL:
+                raise
             return []
 
     def save_to_retail_com(self, product):
@@ -197,6 +210,16 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
         if not row_id:
             print(f"[ERROR] DB update failed: id가 없음")
             return False
+
+        price_recovery = self.mode == self.MODE_PRICE_NULL
+        if price_recovery:
+            if product.get('redirect') or product.get('item') not in self.asins:
+                return False
+            try:
+                recovered_price = normalize_money(product.get('final_sku_price'))
+            except CartPriceParseError:
+                print(f"[WARNING] Mode 6 skipped: no numeric price collected (id={row_id})")
+                return False
 
         if (
             self.mode == self.MODE_DETAIL_REVIEW_NULL
@@ -230,16 +253,25 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     **build_amazon_extracted_data(product, self.EXTRACTED_FIELDS),
                     **update_meta,
                 }
+            if price_recovery:
+                update_data['final_sku_price'] = recovered_price
 
             updates = [f"{key} = %s" for key in update_data]
             params = list(update_data.values())
             params.append(row_id)
             update_query = f"UPDATE {self.target_table} SET {', '.join(updates)} WHERE id = %s"
+            if price_recovery:
+                update_query += (
+                    " AND account_name = %s AND batch_id = %s AND item = %s AND product_url = %s"
+                    f" AND {self.PRICE_MISSING_CONDITION}"
+                )
+                params.extend((self.account_name, self.batch_id, product['item'], product['product_url']))
 
             cursor.execute(update_query, params)
+            updated = not price_recovery or cursor.rowcount == 1
             self.db_conn.commit()
             cursor.close()
-            return True
+            return updated
 
         except Exception as e:
             print(f"[ERROR] DB update failed: id={row_id}, {e}")
@@ -283,7 +315,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                                 raise RuntimeError(
                                     'Detail extraction incomplete - UPDATE skipped'
                                 )
-                            if self.mode != self.MODE_DETAIL_REVIEW_NULL:
+                            if self.mode not in (self.MODE_DETAIL_REVIEW_NULL, self.MODE_PRICE_NULL):
                                 self.upsert_item_mst(combined_data)
                             if self.save_to_retail_com(combined_data):
                                 total_updated += 1
@@ -325,7 +357,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                                         raise RuntimeError(
                                             'Detail extraction incomplete - UPDATE skipped'
                                         )
-                                    if self.mode != self.MODE_DETAIL_REVIEW_NULL:
+                                    if self.mode not in (self.MODE_DETAIL_REVIEW_NULL, self.MODE_PRICE_NULL):
                                         self.upsert_item_mst(combined_data)
                                     if self.save_to_retail_com(combined_data):
                                         total_updated += 1
@@ -375,7 +407,9 @@ def main():
     parser = argparse.ArgumentParser(description='Amazon TV Detail Update Crawler')
     parser.add_argument('--batch-id', type=str, help='Batch ID to process')
     parser.add_argument('--start-id', type=int, help='Start from this id (WHERE id >= start_id)')
-    parser.add_argument('--mode', type=str, choices=['1', '2', '3', '4', '5'], help='1: item IS NULL, 2: star_rating/count_of_star_ratings IS NULL, 3: both, 4: detailed_review_content IS NULL, 5: number_of_units_purchased_past_month IS NULL')
+    parser.add_argument('--mode', choices=['1', '2', '3', '4', '5', '6'],
+                        help='1: item, 2: ratings, 3: item/ratings, 4: reviews, 5: units, 6: missing price for --asins')
+    parser.add_argument('--asins', nargs='+', type=normalize_asin, help='ASIN allowlist required for mode 6')
     parser.add_argument('--test', action='store_true', help='Test 모드 — test_tv_retail_com 테이블에서 조회·UPDATE')
     args = parser.parse_args()
 
@@ -408,7 +442,7 @@ def main():
             return
 
     start_id = args.start_id
-    if not start_id:
+    if start_id is None:
         start_id_input = input("시작 id (엔터: 처음부터): ").strip()
         start_id = int(start_id_input) if start_id_input else None
 
@@ -420,11 +454,19 @@ def main():
         print("  3: 둘 다 (item IS NULL OR star_rating/count_of_star_ratings IS NULL)")
         print("  4: detailed_review_content IS NULL (리뷰 본문 미수집 재수집)")
         print("  5: number_of_units_purchased_past_month IS NULL (구매수 뱃지 재수집)")
+        print("  6: --asins 목록에서 가격이 빈 상품 상세 재수집")
         mode_input = input("모드 입력 (기본: 1): ").strip()
-        mode = mode_input if mode_input in ('1', '2', '3', '4', '5') else '1'
+        mode = mode_input if mode_input in ('1', '2', '3', '4', '5', '6') else '1'
 
-    crawler = AmazonTVDetailUpdateCrawler(batch_id=batch_id, start_id=start_id, mode=mode, test_mode=test_mode)
-    crawler.run()
+    price_recovery = mode == AmazonTVDetailUpdateCrawler.MODE_PRICE_NULL
+    if price_recovery != bool(args.asins):
+        parser.error('--asins is required for mode 6 and is only supported in that mode')
+    crawler = AmazonTVDetailUpdateCrawler(
+        batch_id=batch_id, start_id=start_id, mode=mode, test_mode=test_mode, asins=args.asins
+    )
+    success = crawler.run()
+    if price_recovery:
+        raise SystemExit(0 if success else 1)
     input("Press Enter to exit...")
 
 
