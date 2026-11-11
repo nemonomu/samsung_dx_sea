@@ -22,9 +22,10 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
+from amazon.tv.amazon_tv_listing import AmazonTVListingMixin
 
 
-class AmazonTVMainCrawler(AmazonBaseCrawler):
+class AmazonTVMainCrawler(AmazonTVListingMixin, AmazonBaseCrawler):
     def __init__(self, test_mode=True, batch_id=None):
         """초기화. test_mode: 테스트(True)/운영 모드(False), batch_id: 통합 크롤러에서 전달"""
         super().__init__()
@@ -215,7 +216,7 @@ class AmazonTVMainCrawler(AmazonBaseCrawler):
                         'discount_type': self.safe_extract_chain(item, 'discount_type'),
                         'main_rank': 0,  # save_products()에서 재할당
                         'page_number': page_number,
-                        'product_url': self.extract_product_url(item, 'https://www.amazon.com'),
+                        'product_url': self.extract_listing_product_url(item, page_number, idx),
                         'calendar_week': self.calendar_week,
                         'crawl_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'batch_id': self.batch_id

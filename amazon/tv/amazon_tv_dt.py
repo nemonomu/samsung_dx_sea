@@ -30,6 +30,7 @@ import traceback
 import re
 from datetime import datetime
 from lxml import html
+from DrissionPage.errors import BrowserConnectError, ContextLostError, PageDisconnectedError
 
 # 공통 환경 설정 (작업 디렉토리, 한글 출력, 경로 설정)
 _project_root = os.path.abspath(os.path.dirname(__file__))
@@ -64,7 +65,8 @@ from amazon.tv.amazon_tv_cart_price import (
 
 def extract_pdp_body_price(page, asin):
     """Read the rendered main selling price on the exact product page."""
-    prices = page.run_js(r'''
+    try:
+        prices = page.run_js(r'''
         const asin = arguments[0];
         const readAsin = path => path.match(/\/(?:dp|gp\/product)\/([a-z0-9]{10})(?:\/|$)/i)?.[1].toUpperCase();
         const productIds = [...document.querySelectorAll('input#ASIN[name="ASIN"]')].map(node => node.value);
@@ -79,7 +81,15 @@ def extract_pdp_body_price(page, asin):
             !node.closest('#apex_desktop_usedAccordionRow')
             && node.getClientRects().length && getComputedStyle(node).visibility === 'visible'
         ).map(node => node.textContent.trim()).filter(Boolean);
-    ''', asin)
+        ''', asin)
+    except (BrowserConnectError, ContextLostError, PageDisconnectedError, TimeoutError):
+        # A lost browser/context needs the existing product retry/restart path.
+        raise
+    except Exception as exc:
+        if 'timeout' in str(exc).lower() or 'time out' in str(exc).lower():
+            raise
+        print(f'  [WARNING] PDP body price failed: item={asin}, error={exc}; continuing price fallback')
+        return None
     try:
         unique = {normalize_money(price) for price in prices or []}
     except CartPriceParseError:
@@ -1364,7 +1374,8 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             
             # 타임아웃/리다이렉트/복구 실패는 run()의 전용 분기에서 처리한다.
             if (
-                "timeout" in error_msg
+                isinstance(e, (BrowserConnectError, ContextLostError, PageDisconnectedError, TimeoutError))
+                or "timeout" in error_msg
                 or "time out" in error_msg
                 or "redirect detected" in error_msg
                 or "amazon recovery unresolved" in error_msg

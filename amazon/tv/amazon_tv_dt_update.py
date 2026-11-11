@@ -203,6 +203,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
         부모 클래스의 run()이 self.save_to_retail_com()을 polymorphic하게 호출하므로
         같은 이름으로 오버라이드하면 UPDATE 모드로 동작.
         """
+        self._last_update_outcome = 'failed'
         if not product:
             return False
 
@@ -214,11 +215,13 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
         price_recovery = self.mode == self.MODE_PRICE_NULL
         if price_recovery:
             if product.get('redirect') or product.get('item') not in self.asins:
+                self._last_update_outcome = 'skipped'
+                print(f'[INFO] Mode 6 skipped: redirected or non-allowlisted item (id={row_id})')
                 return False
             try:
                 recovered_price = normalize_money(product.get('final_sku_price'))
             except CartPriceParseError:
-                print(f"[WARNING] Mode 6 skipped: no numeric price collected (id={row_id})")
+                print(f"[WARNING] Mode 6 failed: no numeric price collected (id={row_id})")
                 return False
 
         if (
@@ -271,6 +274,9 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             updated = not price_recovery or cursor.rowcount == 1
             self.db_conn.commit()
             cursor.close()
+            self._last_update_outcome = 'updated' if updated else 'skipped'
+            if price_recovery and not updated:
+                print(f'[INFO] Mode 6 skipped: row no longer matches recovery conditions (id={row_id})')
             return updated
 
         except Exception as e:
@@ -278,6 +284,22 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
             traceback.print_exc()
             self.db_conn.rollback()
             return False
+
+    def _save_crawled_update(self, combined_data, product):
+        """Classify the final outcome of one extraction without changing overwrite rules."""
+        if not combined_data:
+            return 'failed'
+        if combined_data.get('_detail_skip') == 'asin_mismatch':
+            print('[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵')
+            return 'skipped'
+        if combined_data is product:
+            raise RuntimeError('Detail extraction incomplete - UPDATE skipped')
+        if self.mode not in (self.MODE_DETAIL_REVIEW_NULL, self.MODE_PRICE_NULL):
+            self.upsert_item_mst(combined_data)
+        self._last_update_outcome = 'failed'
+        if self.save_to_retail_com(combined_data):
+            return 'updated'
+        return self._last_update_outcome
 
     def run(self):
         """UPDATE 모드 실행 — 에러 fallback save 안 함 (UPDATE만 가능하므로 의미 없음)"""
@@ -291,14 +313,16 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                 print("[ERROR] Initialization failed")
                 return False
 
+            outcomes = {'updated': 0, 'failed': 0, 'skipped': 0}
+            self.update_summary = outcomes
             product_list = self.load_product_list()
             if not product_list:
                 print("[INFO] No products to update")
+                print('[DONE] Processed: 0, Updated: 0, Failed: 0, Skipped: 0')
                 return True
 
-            total_updated = 0
-
             for i, product in enumerate(product_list, 1):
+                outcome = 'failed'
                 try:
                     sku_name = product.get('retailer_sku_name') or 'N/A'
                     product_url = product.get('product_url', 'N/A')
@@ -307,18 +331,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
                     print(f"  URL: {url_display}")
 
                     combined_data = self.crawl_detail(product)
-                    if combined_data:
-                        if combined_data.get('_detail_skip') == 'asin_mismatch':
-                            print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
-                        else:
-                            if combined_data is product:
-                                raise RuntimeError(
-                                    'Detail extraction incomplete - UPDATE skipped'
-                                )
-                            if self.mode not in (self.MODE_DETAIL_REVIEW_NULL, self.MODE_PRICE_NULL):
-                                self.upsert_item_mst(combined_data)
-                            if self.save_to_retail_com(combined_data):
-                                total_updated += 1
+                    outcome = self._save_crawled_update(combined_data, product)
 
                     time.sleep(random.uniform(2, 4))
 
@@ -335,6 +348,7 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
 
                     if "redirect detected" in error_msg:
                         print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
+                        outcome = 'skipped'
                         continue
 
                     if "amazon recovery unresolved" in error_msg:
@@ -349,19 +363,8 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
 
                         try:
                             combined_data = self.crawl_detail(product)
-                            if combined_data:
-                                if combined_data.get('_detail_skip') == 'asin_mismatch':
-                                    print("[INFO] 리다이렉트 감지 - UPDATE 없이 현재 row 스킵")
-                                else:
-                                    if combined_data is product:
-                                        raise RuntimeError(
-                                            'Detail extraction incomplete - UPDATE skipped'
-                                        )
-                                    if self.mode not in (self.MODE_DETAIL_REVIEW_NULL, self.MODE_PRICE_NULL):
-                                        self.upsert_item_mst(combined_data)
-                                    if self.save_to_retail_com(combined_data):
-                                        total_updated += 1
-                            print(f"[SUCCESS] 재시도 성공")
+                            outcome = self._save_crawled_update(combined_data, product)
+                            print(f"[INFO] 재시도 완료: outcome={outcome}")
                             retry_success = True
                             break
                         except Exception as retry_e:
@@ -372,11 +375,17 @@ class AmazonTVDetailUpdateCrawler(AmazonTVDetailCrawler):
 
                     print("[INFO] 재시도 실패 - UPDATE 없이 현재 row 스킵")
                     continue
+                finally:
+                    outcomes[outcome] += 1
 
-            print(f"[DONE] Processed: {len(product_list)}, Updated: {total_updated}, Table: {self.target_table}, batch_id: {self.batch_id}")
+            print(f"[DONE] Processed: {len(product_list)}, Updated: {outcomes['updated']}, "
+                  f"Failed: {outcomes['failed']}, Skipped: {outcomes['skipped']}, "
+                  f"Table: {self.target_table}, batch_id: {self.batch_id}")
 
             self.print_spec_diff_summary()
 
+            if self.mode == self.MODE_PRICE_NULL:
+                return outcomes['updated'] > 0 and outcomes['failed'] == 0
             return True
 
         except Exception as e:
