@@ -107,7 +107,7 @@ BESTBUY_URLS = {
     "promotion_tv_home_theater": PROMOTION_TV_HOME_THEATER_URL,
     "trending_tvs_projectors": (
         "https://www.bestbuy.com/discover/trending-deals/"
-        "trending-deals-tvs-projectors/pcmcat1752523988655"
+        "trending-deals-all-tv-home-theater/pcmcat1690836748285"
     ),
 }
 

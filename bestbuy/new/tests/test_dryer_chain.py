@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[3]
-EXPECTED = ["BBY:REF", "BBY:LDY", "BBY:TV", "BBY:DRYER", "LOWES:REF", "LOWES:LDY"]
+EXPECTED = ["LOWES:REF", "LOWES:LDY", "LOWES:DRYER", "BBY:TV", "BBY:LDY", "BBY:DRYER", "BBY:REF"]
 
 
 @unittest.skipUnless(os.name == "nt", "Windows BAT execution")
@@ -19,15 +19,18 @@ class DryerChainTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(source.replace("\n", "\r\n").encode("ascii"))
 
-    def chain(self, root, dryer_code=0, dry_run=False, bby_code=0):
+    def chain(self, root, dryer_code=0, dry_run=False, bby_code=0,
+              lowes_dryer_code=0, bby_fail_category="REF"):
         shutil.copyfile(REPO / "bby3_lowes2.bat", root / "bby3_lowes2.bat")
         self.write_bat(root / "bestbuy/new/_bby_daily_task.bat", """@echo off
 setlocal
 if defined BESTBUY_DETAIL_LIMIT echo UNCLEARED_BBY>>"%MOCK_TRACE%"
+if "%BESTBUY_CATEGORY%"=="changed_inside_dryer" echo LEAKED_DRYER_ENV>>"%MOCK_TRACE%"
+if /i not "%CD%"=="%MOCK_ROOT%" echo LEAKED_BBY_CHILD_DIRECTORY>>"%MOCK_TRACE%"
 echo BBY:%~1>>"%MOCK_TRACE%"
 set "BESTBUY_CATEGORY=changed_inside_child"
 cd /d "%~dp0"
-if "%~1"=="REF" exit /b %MOCK_BBY_EXIT%
+if "%~1"=="%MOCK_BBY_FAIL_CATEGORY%" exit /b %MOCK_BBY_EXIT%
 exit /b 0
 """)
         self.write_bat(root / "bestbuy/new/bby_dryer_daily_task.bat", """@echo off
@@ -50,9 +53,30 @@ echo LOWES:%~1>>"%MOCK_TRACE%"
 cd /d "%~dp0"
 exit /b 0
 """)
-        env = dict(os.environ, LOWES_DAILY_TASK_BAT=str(lowes), MOCK_TRACE=str(root / "trace.txt"),
-                   MOCK_ROOT=str(root), MOCK_DRYER_EXIT=str(dryer_code), MOCK_BBY_EXIT=str(bby_code),
-                   BBY3_LOWES2_DRY_RUN="1" if dry_run else "0", BESTBUY_DETAIL_LIMIT="99", LOWES_DETAIL_LIMIT="99")
+        self.write_bat(root / "lowes/lowes_dryer_daily_task.bat", """@echo off
+setlocal
+if not "%~1"=="" echo UNEXPECTED_LOWES_DRYER_ARGUMENT>>"%MOCK_TRACE%"
+if defined BESTBUY_DETAIL_LIMIT echo UNCLEARED_BBY_FOR_LOWES_DRYER>>"%MOCK_TRACE%"
+if defined LOWES_DETAIL_LIMIT echo UNCLEARED_LOWES_DRYER>>"%MOCK_TRACE%"
+if /i not "%CD%"=="%MOCK_ROOT%" echo LEAKED_LOWES_DRYER_DIRECTORY>>"%MOCK_TRACE%"
+echo LOWES:DRYER>>"%MOCK_TRACE%"
+set "BESTBUY_CATEGORY=changed_inside_dryer"
+cd /d "%~dp0"
+exit /b %MOCK_LOWES_DRYER_EXIT%
+""")
+        env = os.environ.copy()
+        env.update({
+            "LOWES_DAILY_TASK_BAT": str(lowes),
+            "MOCK_TRACE": str(root / "trace.txt"),
+            "MOCK_ROOT": str(root),
+            "MOCK_DRYER_EXIT": str(dryer_code),
+            "MOCK_BBY_EXIT": str(bby_code),
+            "MOCK_BBY_FAIL_CATEGORY": bby_fail_category,
+            "MOCK_LOWES_DRYER_EXIT": str(lowes_dryer_code),
+            "BBY3_LOWES2_DRY_RUN": "1" if dry_run else "0",
+            "BESTBUY_DETAIL_LIMIT": "99",
+            "LOWES_DETAIL_LIMIT": "99",
+        })
         result = subprocess.run(["cmd.exe", "/d", "/c", "bby3_lowes2.bat"], cwd=root, env=env,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45)
         trace = (root / "trace.txt").read_text().splitlines() if (root / "trace.txt").exists() else []
@@ -60,46 +84,66 @@ exit /b 0
         self.assertEqual(len(logs), 1, result.stdout + result.stderr)
         return result, trace, logs[0].read_text()
 
-    def test_all_six_routes_preserve_existing_order_environment_and_directory(self):
+    def test_all_seven_routes_preserve_order_environment_and_directory(self):
         with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
             result, trace, log = self.chain(Path(directory))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(trace, EXPECTED)
-        self.assertEqual(len(re.findall(r"daily task exit_code=0 elapsed_sec=\d+", log)), 6)
+        self.assertEqual(len(re.findall(r"daily task exit_code=0 elapsed_sec=\d+", log)), len(EXPECTED))
         self.assertRegex(log, r"\nelapsed_sec=\d+")
 
-    def test_dryer_failure_continues_lowes_and_is_not_masked(self):
+    def test_bestbuy_dryer_failure_continues_remaining_bestbuy_and_is_not_masked(self):
         with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
             result, trace, log = self.chain(Path(directory), dryer_code=17)
         self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
         self.assertEqual(trace, EXPECTED)
         self.assertIn("BBY_DRYER(17)", log)
-        self.assertIn("Lowes LDY daily task exit_code=0", log)
+        self.assertIn("BestBuy REF daily task exit_code=0", log)
 
-    def test_existing_bby_failure_still_continues_dryer_and_lowes(self):
+    def test_bestbuy_tv_failure_continues_remaining_bestbuy_categories(self):
         with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
-            result, trace, log = self.chain(Path(directory), bby_code=19)
+            result, trace, log = self.chain(Path(directory), bby_code=19, bby_fail_category="TV")
         self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
         self.assertEqual(trace, EXPECTED)
-        self.assertIn("BBY_REF(19)", log)
+        self.assertIn("BBY_TV(19)", log)
+        self.assertIn("BestBuy REF daily task exit_code=0", log)
+
+    def test_lowes_dryer_failure_continues_bestbuy_and_is_not_masked(self):
+        with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
+            result, trace, log = self.chain(Path(directory), lowes_dryer_code=23)
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        self.assertEqual(trace, EXPECTED)
+        self.assertIn("LOWES_DRYER(23)", log)
+        self.assertIn("BestBuy REF daily task exit_code=0", log)
 
     def test_interrupt_codes_skip_remaining_products(self):
         for code in (130, -1073741510, 3221225786):
             with self.subTest(code=code), tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
                 result, trace, log = self.chain(Path(directory), dryer_code=code)
             self.assertEqual(result.returncode, 130, result.stdout + result.stderr)
-            self.assertEqual(trace, EXPECTED[:4])
+            self.assertEqual(trace, EXPECTED[:EXPECTED.index("BBY:DRYER") + 1])
             self.assertIn("Remaining categories skipped", log)
 
-    def test_dry_run_routes_six_without_executing_any_category(self):
+    def test_lowes_interrupt_codes_skip_remaining_products(self):
+        for code in (130, -1073741510, 3221225786):
+            with self.subTest(code=code), tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
+                result, trace, log = self.chain(Path(directory), lowes_dryer_code=code)
+            self.assertEqual(result.returncode, 130, result.stdout + result.stderr)
+            self.assertEqual(trace, EXPECTED[:EXPECTED.index("LOWES:DRYER") + 1])
+            self.assertIn("Remaining categories skipped", log)
+
+    def test_dry_run_routes_seven_without_executing_any_category(self):
         with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:
             result, trace, log = self.chain(Path(directory), dry_run=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(trace, [])
         planned = [line for line in log.splitlines() if line.startswith("[dry-run] call ")]
-        self.assertEqual(len(planned), 6)
-        self.assertIn('bby_dryer_daily_task.bat"', planned[3])
-        self.assertNotIn('bby_dryer_daily_task.bat" DRYER', planned[3])
+        self.assertEqual(len(planned), len(EXPECTED))
+        for route, filename in (("LOWES:DRYER", "lowes_dryer_daily_task.bat"),
+                                ("BBY:DRYER", "bby_dryer_daily_task.bat")):
+            command = planned[EXPECTED.index(route)]
+            self.assertIn(filename + '"', command)
+            self.assertNotIn(filename + '" DRYER', command)
 
     def test_actual_standalone_bat_help_restores_callers_directory_and_environment(self):
         with tempfile.TemporaryDirectory(prefix="bby_dryer_chain_") as directory:

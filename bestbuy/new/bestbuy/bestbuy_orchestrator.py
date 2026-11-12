@@ -10,6 +10,7 @@ from pathlib import Path
 from .step00_config import (
     DEFAULT_BESTBUY_RUN_ROOT,
     PROMOTION_TV_EXPECTED_MIN_ROWS,
+    bestbuy_category,
     bestbuy_dated_run_root,
     has_target_url,
     target_url,
@@ -491,28 +492,25 @@ def promotion_complete():
     return True, f"unique {count}"
 
 
-def tv_trending_source_configured():
-    if os.getenv("BESTBUY_CATEGORY", "").strip().upper() != "TV":
-        return True
-    if os.getenv("BESTBUY_TRENDING_URL", "").strip():
-        return True
-    if os.getenv("BESTBUY_TRENDING_SOURCE_PAYLOAD", "").strip():
-        return True
-    return any(
-        path.exists()
-        for path in (
-            Path("references/bestbuy_trending_tv_request.json"),
-            Path("references/bestbuy_trending_request.json"),
-        )
-    )
-
-
 def trending_complete():
     if not has_target_url("trend"):
-        return True, "no trend URL for category"
-    if not tv_trending_source_configured():
-        return True, "TV trending source is not exposed/configured"
+        return bestbuy_category() != "TV", "no trend URL for category"
     path = run_root() / "trending" / "parsed" / "trending_products.csv"
+    if bestbuy_category() == "TV":
+        from .step06_trending_deals import validate_tv_trending_rows
+
+        if read_json(run_root() / "trending" / "summary_skip.json").get("collection_failed"):
+            return False, "TV trending collection failed"
+        summary = read_json(run_root() / "trending" / "summary_browser_graphql.json")
+        if summary.get("success") is False:
+            return False, "TV trending collection did not succeed"
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            validate_tv_trending_rows(rows)
+        except (OSError, ValueError) as exc:
+            return False, f"TV trending needs collection: {type(exc).__name__}"
+        return True, f"unique {len(rows)}"
     count = csv_unique_count(path, "sku_id")
     if count <= 0:
         return False, "missing trending products"

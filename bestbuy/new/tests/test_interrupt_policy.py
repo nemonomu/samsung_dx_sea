@@ -42,9 +42,11 @@ class InterruptPolicyTests(unittest.TestCase):
 
     def test_combined_chain_stops_interrupt_but_keeps_normal_failure_continuation(self):
         source = (REPO_ROOT / "bby3_lowes2.bat").read_text(encoding="utf-8")
-        self.assertEqual(source.count('if "!CATEGORY_EXIT!"=="130" goto :interrupted'), 2)
+        for code in ("130", "-1073741510", "3221225786"):
+            self.assertEqual(source.count(f'if "!CATEGORY_EXIT!"=="{code}" goto :interrupted'), 3)
         self.assertIn("call :record_failure BBY_%%C !CATEGORY_EXIT!", source)
         self.assertIn("call :record_failure LOWES_%%C !CATEGORY_EXIT!", source)
+        self.assertIn("call :record_failure LOWES_DRYER !CATEGORY_EXIT!", source)
         self.assertIn("continue_on_category_failure=true", source)
         self.assertIn("exit /b 130", source)
 

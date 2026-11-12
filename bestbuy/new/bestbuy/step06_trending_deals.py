@@ -4,11 +4,14 @@ import json
 import os
 import re
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlsplit
 from datetime import datetime
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+
 from .step00_apollo import iter_apollo_push_payloads
+from .step00_collection_recovery import atomic_csv
 from .step00_browser_session import (
     add_intl_nosplash,
     browser_fetch_graphql,
@@ -35,7 +38,8 @@ SOURCE_PAYLOAD_FALLBACK_PATH = Path("references/bestbuy_trending_request.json")
 OUTPUT_CSV = Path(
     os.getenv(
         "BESTBUY_TRENDING_OUTPUT",
-        DEFAULT_BESTBUY_RUN_ROOT / "trending" / "parsed" / "trending_products.csv",
+        (RUN_ROOT if CATEGORY == "TV" else DEFAULT_BESTBUY_RUN_ROOT / "trending")
+        / "parsed" / "trending_products.csv",
     )
 )
 TRENDING_URL = TRENDING_URL_ENV or load_initial_urls().get("trending_tvs_projectors", "")
@@ -61,6 +65,11 @@ DEFAULT_TREND_SECTION = (
 TREND_SECTION = os.getenv("BESTBUY_TRENDING_SECTION", DEFAULT_TREND_SECTION)
 SKU_WINDOW = os.getenv("BESTBUY_TRENDING_SKU_WINDOW", "tail").strip().lower()
 BESTBUY_BASE_URL = "https://www.bestbuy.com"
+TV_DISCOVERY_URL = os.getenv(
+    "BESTBUY_TRENDING_DISCOVERY_URL",
+    "https://www.bestbuy.com/discover/trending-deals/"
+    "trending-deals-tvs-projectors/pcmcat1752523988655",
+).strip()
 
 
 def now():
@@ -440,14 +449,98 @@ def find_trending_started_operation(html_text):
     return None
 
 
-def browser_graphql():
-    if not TRENDING_URL:
-        raise RuntimeError("Set BESTBUY_TRENDING_URL or target_urls.trend before browser trending collection")
+class TvTrendingError(ValueError):
+    def __init__(self, message, attempts=None):
+        super().__init__(message)
+        self.attempts = attempts or []
 
-    raw_dir = RUN_ROOT / "raw" / "browser_graphql"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+
+def check_tv_page_access(html_text):
+    title = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    if title and "access denied" in clean_text(title.group(1)).lower():
+        raise TvTrendingError("TV trending browser received an access-denied page")
+
+
+def is_tv_trend_section(value):
+    text = clean_text(value)
+    return re.search(r"\btrending\s+deals\s+(?:in|on)\s+(?:tvs?|televisions?)\b", text, re.I) is not None
+
+
+def validate_tv_trending_rows(rows):
+    if not rows:
+        raise TvTrendingError("TV trending collection returned 0 rows")
+    seen = set()
+    for rank, row in enumerate(rows, 1):
+        sku = clean_text(row.get("sku_id"))
+        if not re.fullmatch(r"\d{7}", sku):
+            raise TvTrendingError("TV trending contains an invalid SKU")
+        if sku in seen:
+            raise TvTrendingError("TV trending contains duplicate SKUs")
+        seen.add(sku)
+        if str(row.get("trend_rank", "")).strip() != str(rank):
+            raise TvTrendingError("TV trending ranks must be consecutive from 1")
+        if not is_tv_trend_section(row.get("trend_section")):
+            raise TvTrendingError("TV trending section does not identify TV trending deals")
+        if not str(row.get("source", "")).endswith("spotlight_product_connection"):
+            raise TvTrendingError("TV trending rows require Spotlight product evidence")
+
+
+def find_tv_trending_link(html_text, base_url):
+    check_tv_page_access(html_text)
+    soup = BeautifulSoup(html_text, "html.parser")
+    for heading in soup.select("h1, h2, h3, h4, h5, h6, [role='heading']"):
+        label = clean_text(heading.get_text(" ", strip=True)).lower()
+        if "trending" not in label or not re.search(r"\bcategor(?:y|ies)\b", label):
+            continue
+        for region in heading.parents:
+            if region.name in {"body", "html"}:
+                break
+            candidates = set()
+            for link in region.find_all("a", href=True):
+                label = clean_text(link.get_text(" ", strip=True) or link.get("aria-label"))
+                if not re.match(r"^(?:tvs?|televisions?)\b", label, re.I):
+                    continue
+                url = urljoin(base_url, link["href"])
+                parts = urlsplit(url)
+                if (
+                    parts.scheme == "https"
+                    and parts.hostname in {"bestbuy.com", "www.bestbuy.com"}
+                    and parts.username is None
+                    and parts.path.startswith("/discover/trending-deals/")
+                ):
+                    candidates.add(url)
+            if len(candidates) > 1:
+                raise TvTrendingError("TV trending category link is ambiguous")
+            if candidates:
+                return candidates.pop()
+            if region.name in {"section", "main"} or region.get("role") == "region":
+                break
+    raise TvTrendingError("TV trending category link was not found in the trending categories section")
+
+
+def discover_tv_trending_url(page):
+    current = urlsplit(str(getattr(page, "url", "")))
+    discovery = urlsplit(TV_DISCOVERY_URL)
+    if (current.hostname, current.path) != (discovery.hostname, discovery.path):
+        page.get(add_intl_nosplash(TV_DISCOVERY_URL))
+        if BROWSER_WAIT_SECONDS:
+            time.sleep(BROWSER_WAIT_SECONDS)
+    return find_tv_trending_link(
+        browser_outer_html(page, timeout=BROWSER_JS_TIMEOUT), TV_DISCOVERY_URL
+    )
+
+
+def response_rows(response_json):
+    if isinstance(response_json, dict) and isinstance(response_json.get("__trending_rows"), list):
+        return response_json["__trending_rows"]
+    return parse_trending_products_from_graphql(response_json, LIMIT)
+
+
+def browser_graphql():
+    if CATEGORY != "TV":
+        return browser_graphql_once(TRENDING_URL)
+    errors = []
     page = None
-    browser_meta = {}
     try:
         page, browser_meta = create_browser_page(
             run_root=RUN_ROOT,
@@ -455,13 +548,54 @@ def browser_graphql():
             headless=BROWSER_HEADLESS,
             local_port=BROWSER_LOCAL_PORT,
         )
-        browser_url = add_intl_nosplash(TRENDING_URL)
+        for route in ("direct", "category_link"):
+            stage = "discovery" if route == "category_link" else "collection"
+            try:
+                url = TRENDING_URL if route == "direct" else discover_tv_trending_url(page)
+                stage = "collection"
+                response_json = browser_graphql_once(url, page=page, browser_meta=browser_meta)
+                rows = response_rows(response_json)
+                stage = "validation"
+                validate_tv_trending_rows(rows)
+                update_browser_summary(
+                    len(rows), collection_route=route, attempt_count=len(errors) + 1, attempt_errors=errors
+                )
+                return response_json
+            except Exception as exc:
+                failure = {"route": route, "stage": stage, "error_type": type(exc).__name__}
+                if isinstance(exc, TvTrendingError):
+                    failure["reason"] = str(exc)
+                errors.append(failure)
+    finally:
+        close_browser_page(page)
+    raise TvTrendingError("TV trending failed after direct and category-link attempts", errors)
+
+
+def browser_graphql_once(url, page=None, browser_meta=None):
+    if not url:
+        raise RuntimeError("Set BESTBUY_TRENDING_URL or target_urls.trend before browser trending collection")
+
+    raw_dir = RUN_ROOT / "raw" / "browser_graphql"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    owns_page = page is None
+    browser_meta = browser_meta or {}
+    try:
+        if owns_page:
+            page, browser_meta = create_browser_page(
+                run_root=RUN_ROOT,
+                name="trending_browser",
+                headless=BROWSER_HEADLESS,
+                local_port=BROWSER_LOCAL_PORT,
+            )
+        browser_url = add_intl_nosplash(url)
         page.get(browser_url)
         if BROWSER_WAIT_SECONDS:
             time.sleep(BROWSER_WAIT_SECONDS)
         html_text = browser_outer_html(page, timeout=BROWSER_JS_TIMEOUT)
         html_path = raw_dir / "trending_browser_page.html"
         html_path.write_text(html_text, encoding="utf-8", errors="replace")
+        if CATEGORY == "TV":
+            check_tv_page_access(html_text)
 
         html_rows = parse_trending_products_from_capture(html_text, {}, LIMIT)
         if html_rows:
@@ -471,7 +605,7 @@ def browser_graphql():
                 "started_at": now(),
                 "live": True,
                 "fetch_mode": "browser_page_payload",
-                "url": TRENDING_URL,
+                "url": url,
                 "browser_url": browser_url,
                 "endpoint": "",
                 "status_code": 200,
@@ -500,6 +634,8 @@ def browser_graphql():
                 payload = load_graphql_payload(payload_path)
                 payload_source = rel_path(payload_path)
         if payload is None:
+            if CATEGORY == "TV":
+                raise TvTrendingError("TV trending page did not expose Spotlight product data")
             raise RuntimeError(
                 "Trending browser page did not expose a SpotlightProduct GraphQL payload. "
                 "Save a captured request JSON and set BESTBUY_TRENDING_SOURCE_PAYLOAD."
@@ -509,7 +645,8 @@ def browser_graphql():
         envelope = browser_fetch_graphql(page, payload, timeout=BROWSER_JS_TIMEOUT)
         elapsed = round(time.perf_counter() - start, 3)
     finally:
-        close_browser_page(page)
+        if owns_page:
+            close_browser_page(page)
 
     status_code = int(envelope.get("status") or 0)
     text = str(envelope.get("body") or "")
@@ -528,7 +665,7 @@ def browser_graphql():
         "started_at": now(),
         "live": True,
         "fetch_mode": "browser_graphql",
-        "url": TRENDING_URL,
+        "url": url,
         "browser_url": browser_url,
         "endpoint": "/gateway/graphql",
         "status_code": status_code,
@@ -572,7 +709,7 @@ def write_skip_summary(reason):
     return summary
 
 
-def update_browser_summary(row_count):
+def update_browser_summary(row_count, **fields):
     path = RUN_ROOT / "summary_browser_graphql.json"
     if not path.exists():
         return
@@ -581,6 +718,7 @@ def update_browser_summary(row_count):
         return
     summary["row_count"] = row_count
     summary["success"] = bool(summary.get("success")) and row_count > 0
+    summary.update(fields)
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -606,16 +744,20 @@ def write_rows(path, rows):
 
 def write_failure_skip_summary(exc):
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
-    write_rows(OUTPUT_CSV, [])
+    if CATEGORY == "TV":
+        atomic_csv(write_rows, OUTPUT_CSV, [])
+        update_browser_summary(0)
+    else:
+        write_rows(OUTPUT_CSV, [])
     summary = {
         "started_at": now(),
         "live": True,
         "fetch_mode": FETCH_MODE,
-        "skipped": True,
+        "skipped": CATEGORY != "TV",
         "collection_failed": True,
         "reason": "trending collection failed; continuing pipeline with empty trending rows",
         "error_type": type(exc).__name__,
-        "error": str(exc),
+        "error": str(exc) if CATEGORY != "TV" or isinstance(exc, TvTrendingError) else "TV trending collection failed",
         "source_payload": rel_path(SOURCE_PAYLOAD_PATH),
         "source_payload_searched": [rel_path(path) for path in source_payload_candidates()],
         "row_count": 0,
@@ -623,6 +765,8 @@ def write_failure_skip_summary(exc):
         "call_count": 0,
         "csv": rel_path(OUTPUT_CSV),
     }
+    if CATEGORY == "TV":
+        summary["attempts"] = getattr(exc, "attempts", [])
     (RUN_ROOT / "summary_skip.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary
@@ -630,23 +774,17 @@ def write_failure_skip_summary(exc):
 
 def main():
     if not has_target_url("trend"):
+        if CATEGORY == "TV":
+            raise ValueError("TV trending URL is not configured")
         write_rows(OUTPUT_CSV, [])
         print(f"skipped trending: no trend URL for category -> {OUTPUT_CSV}")
         return
     if no_exposed_trending_source():
-        write_rows(OUTPUT_CSV, [])
-        summary = write_skip_summary(
-            "TV trending source is not exposed/configured; skipping step06 without collection"
-        )
-        print(json.dumps(summary, indent=2, ensure_ascii=False))
-        return
+        raise ValueError("TV trending source is not configured")
     rows = []
     if FETCH_MODE in {"auto", "browser", "browser_graphql"}:
         response_json = browser_graphql()
-        if isinstance(response_json, dict) and isinstance(response_json.get("__trending_rows"), list):
-            rows = response_json["__trending_rows"]
-        else:
-            rows = parse_trending_products_from_graphql(response_json, LIMIT)
+        rows = response_rows(response_json)
         if REQUIRE_ROWS and not rows:
             raise RuntimeError(
                 "Trending browser GraphQL returned 0 SpotlightProductConnection rows; "
@@ -657,15 +795,32 @@ def main():
             "BESTBUY_TRENDING_FETCH_MODE must be browser_graphql. "
             "ZenRows page/direct GraphQL fallback is disabled for trending collection."
         )
-    write_rows(OUTPUT_CSV, rows)
+    if CATEGORY == "TV":
+        validate_tv_trending_rows(rows)
+        atomic_csv(write_rows, OUTPUT_CSV, rows)
+        skip_path = RUN_ROOT / "summary_skip.json"
+        if skip_path.exists():
+            skip_path.write_text(json.dumps({
+                "skipped": False,
+                "collection_failed": False,
+                "row_count": len(rows),
+            }, indent=2), encoding="utf-8")
+    else:
+        write_rows(OUTPUT_CSV, rows)
     update_browser_summary(len(rows))
     print(f"wrote {len(rows)} rows -> {OUTPUT_CSV}")
     for row in rows:
         print(f"{row['trend_rank']}. {row['sku_id']} {row['retailer_sku_name']}")
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception as exc:
         write_failure_skip_summary(exc)
+        return 1 if CATEGORY == "TV" else 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
