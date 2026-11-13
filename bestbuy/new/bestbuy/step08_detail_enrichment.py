@@ -90,6 +90,9 @@ BROWSER_GRAPHQL_WAIT_SECONDS = max(
     float(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_WAIT_SECONDS", "8")),
 )
 BROWSER_GRAPHQL_JS_TIMEOUT = max(1, int(os.getenv("BESTBUY_DETAIL_BROWSER_GRAPHQL_JS_TIMEOUT", "120")))
+# Set only while the REF/LDY collection coordinator owns recovery.
+BROWSER_GRAPHQL_RECOVERY_MANAGED = False
+BROWSER_GRAPHQL_RECOVERY_REMAINING = None
 BROWSER_GRAPHQL_HEADLESS = env_bool("BESTBUY_DETAIL_BROWSER_GRAPHQL_HEADLESS", "1")
 BROWSER_GRAPHQL_LOCAL_PORT = env_int("BESTBUY_DETAIL_BROWSER_GRAPHQL_LOCAL_PORT", "0")
 # A peer-side HTTP/2 stream reset does not necessarily kill the browser session.
@@ -1750,6 +1753,7 @@ def open_detail_browser_page():
     global BROWSER_GRAPHQL_PAGE, BROWSER_GRAPHQL_META
     if BROWSER_GRAPHQL_PAGE is not None:
         return BROWSER_GRAPHQL_PAGE
+    detail_recovery_timeout(1)  # Do not start another browser after the coordinator deadline.
     base_name = detail_browser_base_name()
     process_name = (
         base_name
@@ -1779,6 +1783,7 @@ def open_detail_browser_page():
             "browser_recovery_profile_generation": BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION,
         }
     )
+    detail_recovery_timeout(1)  # Process startup itself is controlled by the browser backend.
     return BROWSER_GRAPHQL_PAGE
 
 
@@ -1803,6 +1808,15 @@ def recreate_detail_browser_page(*, fresh_profile=False):
     return open_detail_browser_page()
 
 
+def detail_recovery_timeout(timeout):
+    if BROWSER_GRAPHQL_RECOVERY_MANAGED and BROWSER_GRAPHQL_RECOVERY_REMAINING is not None:
+        remaining = BROWSER_GRAPHQL_RECOVERY_REMAINING()
+        if remaining <= 0:
+            raise DetailBrowserUnavailable("detail_transport_recovery_time_limit")
+        return min(timeout, remaining)
+    return timeout
+
+
 def read_detail_browser_state(page=None, timeout=None):
     page = page or BROWSER_GRAPHQL_PAGE
     if page is None:
@@ -1818,7 +1832,7 @@ def read_detail_browser_state(page=None, timeout=None):
         "readyState:String(document.readyState||''),title:String(document.title||''),"
         "bodyText:String(document.body?document.body.innerText:'').slice(0,1200)"
         "});",
-        timeout=js_timeout,
+        timeout=detail_recovery_timeout(js_timeout),
     )
     if isinstance(raw, dict):
         state = dict(raw)
@@ -1857,7 +1871,7 @@ def bootstrap_pdp_url(browser_url, expected_sku):
 
 def navigate_detail_browser(url, stage, timeout=None):
     timeout = BROWSER_BOOTSTRAP_TIMEOUT_SECONDS if timeout is None else max(1.0, float(timeout))
-    navigation_result = BROWSER_GRAPHQL_PAGE.get(url, timeout=timeout)
+    navigation_result = BROWSER_GRAPHQL_PAGE.get(url, timeout=detail_recovery_timeout(timeout))
     if navigation_result is not False:
         return navigation_result
     try:
@@ -1933,7 +1947,7 @@ def wait_for_detail_browser_state(
     timeout=None,
 ):
     timeout = BROWSER_BOOTSTRAP_TIMEOUT_SECONDS if timeout is None else max(0.1, float(timeout))
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + detail_recovery_timeout(timeout)
     last_state = {}
     last_error = ""
     while time.monotonic() < deadline:
@@ -2066,7 +2080,7 @@ def commit_detail_browser_session(state, session_kind):
             ),
             flush=True,
         )
-        time.sleep(BROWSER_GRAPHQL_WAIT_SECONDS)
+        time.sleep(detail_recovery_timeout(BROWSER_GRAPHQL_WAIT_SECONDS))
         settled_state = read_detail_browser_state(timeout=BROWSER_BOOTSTRAP_JS_TIMEOUT_SECONDS)
         expected_sku = browser_url_sku(state.get("href", "")) if session_kind == "pdp" else ""
         settled_error = detail_browser_state_error(
@@ -2216,6 +2230,8 @@ def ensure_detail_browser_session(browser_url, expected_sku="", *, require_pdp=T
         ("restart", False),
         ("fresh_profile", True),
     )
+    if BROWSER_GRAPHQL_RECOVERY_MANAGED:
+        attempts = attempts[:1]
     last_exc = None
     for attempt, (action, fresh_profile) in enumerate(attempts, 1):
         print(
@@ -2275,7 +2291,7 @@ def fetch_detail_browser_graphql_envelope(payload):
     envelope = browser_fetch_graphql(
         BROWSER_GRAPHQL_PAGE,
         payload,
-        timeout=BROWSER_GRAPHQL_JS_TIMEOUT,
+        timeout=detail_recovery_timeout(BROWSER_GRAPHQL_JS_TIMEOUT),
     )
     if not isinstance(envelope, dict):
         raise RuntimeError(f"browser fetch returned invalid envelope: {type(envelope).__name__}")
@@ -2342,9 +2358,10 @@ def browser_graphql_post(payload, referer_url, expected_sku=""):
                     last_exc = retry_exc
                     envelope = None
             if envelope is None:
-                BROWSER_GRAPHQL_CURRENT_URL = ""
-                BROWSER_GRAPHQL_SESSION_READY = False
-                BROWSER_GRAPHQL_SESSION_KIND = ""
+                if not BROWSER_GRAPHQL_RECOVERY_MANAGED:
+                    BROWSER_GRAPHQL_CURRENT_URL = ""
+                    BROWSER_GRAPHQL_SESSION_READY = False
+                    BROWSER_GRAPHQL_SESSION_KIND = ""
                 raise DetailBrowserUnavailable(
                     f"BestBuy browser GraphQL transport unavailable after {len(recoveries)} recoveries: {last_exc}"
                 ) from last_exc

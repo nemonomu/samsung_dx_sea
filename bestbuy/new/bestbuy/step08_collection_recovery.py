@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from . import step08_detail_diagnostics as diagnostics
+from .step08_detail_transport_recovery import DetailTransportRecovery, RecoverySettings
 
 from .step00_collection_recovery import (
     CollectionIncomplete, Evidence, MAX_ITEM_ATTEMPTS, RecoveryBudget, SUCCESS_STATES, RECOVERY_EVENTS,
@@ -226,6 +227,8 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
     evidence = Evidence(d.DETAIL_ROOT, "detail", dict(category=d.CATEGORY, stage=d.STAGE,
         batch_size=d.DETAIL_SKU_BATCH_SIZE, item_attempts=MAX_ITEM_ATTEMPTS))
     budget = budget_factory(evidence)
+    resilient = d.CATEGORY in {"REF", "LDY"}
+    transport_recovery = None
     status_path = d.OUTPUT_ROOT / "collection_status.json"
     previous = read_json(status_path)
     if previous:
@@ -260,6 +263,8 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         report = make_report(output_targets, states, evidence, reason, status)
         report["target_hash"] = target_hash
         report["request_calls"] = calls
+        if transport_recovery is not None:
+            report["transport_recovery"] = transport_recovery.report()
         if d.TARGET_CSV.exists():
             report["target_csv"] = str(d.TARGET_CSV.resolve())
             report["final_output_csv"] = str(d.FINAL_OUTPUT_CSV.resolve())
@@ -269,99 +274,129 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         atomic_json(status_path, report)
         return report
 
+    def execute(entries, request_mode="batch"):
+        nonlocal calls
+        requests = [entry[3] for entry in entries]
+        start = time.monotonic()
+        request_started_at = utc_now()
+        for _, sku, stage, _ in entries:
+            states[sku][stage]["request_attempt"] += 1
+        error, code, response, response_text = "", "ERR", {}, ""
+        with diagnostics.observe_request(d) as transport_diagnostic:
+            try:
+                code, response_text, response, _, _ = d.browser_graphql_post(
+                    requests, d.target_url(entries[0][0], entries[0][1]), entries[0][1])
+            except (RuntimeError, d.RequestException) as exc:
+                error = str(exc)
+        calls += 1
+        if isinstance(response, dict) and len(requests) == 1 and ("data" in response or (resilient and "errors" in response)):
+            response = [response]
+        transport_ok = str(code) == "200" and isinstance(response, list) and len(response) == len(requests)
+        event = evidence.request(requests, response, status_code=code, error=error,
+            started_at=request_started_at, finished_at=utc_now(),
+            unparsed_response=sanitized(response_text[:8000]) if not response else "",
+            elapsed_seconds=round(time.monotonic() - start, 3),
+            session_generation=d.BROWSER_GRAPHQL_PROCESS_GENERATION,
+            browser_version=d.BROWSER_GRAPHQL_META.get("browser_version", "unknown"),
+            targets=[dict(sku_id=sku, operation=stage) for _, sku, stage, _ in entries],
+            status="response_received" if transport_ok else "transport_failed", request_mode=request_mode)
+        diagnostics.request_result(d, evidence, requests, transport_diagnostic, code, response,
+                                   transport_ok, event["evidence_path"])
+        if not transport_ok:
+            for target, sku, stage, payload in entries:
+                state = states[sku][stage]
+                state.update(status="failed", reason=error or f"http_{code}_or_batch_shape",
+                    status_code=code, evidence_path=event["evidence_path"], collected_at=utc_now())
+                if resilient:
+                    state.update(failure_kind="transport", transport_attempts=state.get("transport_attempts", 0) + 1)
+                # Clear stale caches on a fresh failure; retain data observed in this invocation.
+                if not state.get("response_received"):
+                    store_operation(d, target, stage, payload, {}, state)
+                evidence.emit("operation_result", sku_id=sku, operation=stage,
+                    main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
+                diagnostics.operation_result(d, evidence, sku, stage, {}, state, False)
+            if not resilient and budget.started is None:
+                budget.started = budget.clock()
+            checkpoint()
+            return False
+        for index, (target, sku, stage, payload) in enumerate(entries):
+            state = states[sku][stage]
+            state["attempt"] += 1
+            outcome, why = validate_operation(d, stage, sku, response[index], target)
+            state.update(status=outcome, reason=why, status_code=code,
+                         evidence_path=event["evidence_path"], collected_at=utc_now(), response_received=True)
+            if resilient:
+                state["failure_kind"] = "" if outcome in SUCCESS_STATES else "validation"
+            if stage == "review":
+                state.update(d.review_count_validation(target, sku, response[index]))
+            item = response[index]
+            errors = item.get("errors") if isinstance(item, dict) else []
+            state["error_paths"] = [".".join(map(str, e["path"])) for e in errors or []
+                                    if isinstance(e, dict) and isinstance(e.get("path"), list)] if isinstance(errors, list) else []
+            state["warnings"] = sanitized(item.get("errors") or []) if (
+                outcome in SUCCESS_STATES and isinstance(response[index], dict)) else []
+            if not resilient and outcome not in SUCCESS_STATES and budget.started is None:
+                budget.started = budget.clock()
+            store_operation(d, target, stage, payload, response[index], state)
+            evidence.emit("operation_result", sku_id=sku, operation=stage,
+                main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
+            diagnostics.operation_result(d, evidence, sku, stage, response[index], state, True)
+        checkpoint()
+        return True
+
     checkpoint()
     reason = ""
     old_recoveries = d.BROWSER_GRAPHQL_MAX_RECOVERIES
     d.BROWSER_GRAPHQL_MAX_RECOVERIES = 0  # One shared recovery owner; no nested retry multiplication.
+    old_managed = getattr(d, "BROWSER_GRAPHQL_RECOVERY_MANAGED", False)
+    old_remaining = getattr(d, "BROWSER_GRAPHQL_RECOVERY_REMAINING", None)
+    if resilient:
+        d.BROWSER_GRAPHQL_RECOVERY_MANAGED = True
+        d.BROWSER_GRAPHQL_RECOVERY_REMAINING = None
     fatal = None
     aborted = False
     try:
         if previous.get("collected_date") and previous["collected_date"] != str(date.today()):
             raise CollectionIncomplete("stale_run_requires_new_listing_collection")
-        for round_number in range(MAX_ITEM_ATTEMPTS):
-            pending = [t for t in output_targets if str(t["sku_id"]) in selected and any(
-                s["status"] not in SUCCESS_STATES
-                and s["request_attempt"] < MAX_ITEM_ATTEMPTS for s in states[str(t["sku_id"])].values())]
-            if not pending:
-                break
-            if round_number and not budget.wait(reason="retry_incomplete_operations"):
-                reason = budget.reason
-                break
-            for offset in range(0, len(pending), max(1, d.DETAIL_SKU_BATCH_SIZE)):
-                chunk = pending[offset:offset + max(1, d.DETAIL_SKU_BATCH_SIZE)]
-                requests, entries = [], []
-                for target in chunk:
-                    sku = str(target["sku_id"])
-                    for stage, state in states[sku].items():
-                        if state["status"] in SUCCESS_STATES or state["request_attempt"] >= MAX_ITEM_ATTEMPTS:
-                            continue
-                        entries.append((target, sku, stage, operations[sku][stage]))
-                        requests.append(operations[sku][stage])
-                if not entries:
-                    continue
-                if budget.expired():
-                    raise CollectionIncomplete(budget.reason)
-                start = time.monotonic()
-                request_started_at = utc_now()
-                for _, sku, stage, _ in entries:
-                    states[sku][stage]["request_attempt"] += 1
-                error, code, response, response_text = "", "ERR", {}, ""
-                with diagnostics.observe_request(d) as transport_diagnostic:
-                    try:
-                        code, response_text, response, _, _ = d.browser_graphql_post(
-                            requests, d.target_url(chunk[0], str(chunk[0]["sku_id"])), str(chunk[0]["sku_id"]))
-                    except (RuntimeError, d.RequestException) as exc:
-                        error = str(exc)
-                calls += 1
-                if isinstance(response, dict) and len(requests) == 1 and "data" in response:
-                    response = [response]
-                transport_ok = str(code) == "200" and isinstance(response, list) and len(response) == len(requests)
-                event = evidence.request(requests, response, status_code=code, error=error,
-                    started_at=request_started_at, finished_at=utc_now(),
-                    unparsed_response=sanitized(response_text[:8000]) if not response else "",
-                    elapsed_seconds=round(time.monotonic() - start, 3),
-                    session_generation=d.BROWSER_GRAPHQL_PROCESS_GENERATION,
-                    browser_version=d.BROWSER_GRAPHQL_META.get("browser_version", "unknown"),
-                    targets=[dict(sku_id=sku, operation=stage) for _, sku, stage, _ in entries],
-                    status="response_received" if transport_ok else "transport_failed")
-                diagnostics.request_result(d, evidence, requests, transport_diagnostic, code, response,
-                                           transport_ok, event["evidence_path"])
-                if not transport_ok:
-                    for target, sku, stage, payload in entries:
-                        state = states[sku][stage]
-                        state.update(status="failed", reason=error or f"http_{code}_or_batch_shape",
-                            status_code=code, evidence_path=event["evidence_path"], collected_at=utc_now())
-                        # Clear stale caches on a fresh failure; retain data observed in this invocation.
-                        if not state.get("response_received"):
-                            store_operation(d, target, stage, payload, {}, state)
-                        evidence.emit("operation_result", sku_id=sku, operation=stage,
-                            main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
-                        diagnostics.operation_result(d, evidence, sku, stage, {}, state, False)
-                    if budget.started is None:
-                        budget.started = budget.clock()
-                    checkpoint()
-                    continue
-                for index, (target, sku, stage, payload) in enumerate(entries):
-                    state = states[sku][stage]
-                    state["attempt"] += 1
-                    outcome, why = validate_operation(d, stage, sku, response[index], target)
-                    state.update(status=outcome, reason=why, status_code=code,
-                                 evidence_path=event["evidence_path"], collected_at=utc_now(), response_received=True)
-                    if stage == "review":
-                        state.update(d.review_count_validation(target, sku, response[index]))
-                    item = response[index]
-                    errors = item.get("errors") if isinstance(item, dict) else []
-                    state["error_paths"] = [".".join(map(str, e["path"])) for e in errors or []
-                                            if isinstance(e, dict) and isinstance(e.get("path"), list)] if isinstance(errors, list) else []
-                    state["warnings"] = sanitized(item.get("errors") or []) if (
-                        outcome in SUCCESS_STATES and isinstance(response[index], dict)) else []
-                    if outcome not in SUCCESS_STATES and budget.started is None:
-                        budget.started = budget.clock()
-                    store_operation(d, target, stage, payload, response[index], state)
-                    evidence.emit("operation_result", sku_id=sku, operation=stage,
-                        main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
-                    diagnostics.operation_result(d, evidence, sku, stage, response[index], state, True)
-                checkpoint()
+        if resilient:
+            settings = RecoverySettings.from_env()
+            transport_recovery = DetailTransportRecovery(d, evidence, budget, states, execute, checkpoint, settings)
+            if reusable:
+                transport_recovery.restore_mode(previous.get("transport_recovery") or {})
+            evidence.emit("transport_recovery_settings", **transport_recovery.report())
+            selected_targets = [t for t in output_targets if str(t["sku_id"]) in selected]
+            size = max(1, d.DETAIL_SKU_BATCH_SIZE)
+            chunks = ([
+                (target, str(target["sku_id"]), stage, payload)
+                for target in selected_targets[offset:offset + size]
+                for stage, payload in operations[str(target["sku_id"])].items()
+            ] for offset in range(0, len(selected_targets), size))
+            transport_recovery.collect(chunks)
+        else:
+            for round_number in range(MAX_ITEM_ATTEMPTS):
+                pending = [t for t in output_targets if str(t["sku_id"]) in selected and any(
+                    s["status"] not in SUCCESS_STATES
+                    and s["request_attempt"] < MAX_ITEM_ATTEMPTS for s in states[str(t["sku_id"])].values())]
+                if not pending:
+                    break
+                if round_number and not budget.wait(reason="retry_incomplete_operations"):
+                    reason = budget.reason
+                    break
+                for offset in range(0, len(pending), max(1, d.DETAIL_SKU_BATCH_SIZE)):
+                    chunk = pending[offset:offset + max(1, d.DETAIL_SKU_BATCH_SIZE)]
+                    requests, entries = [], []
+                    for target in chunk:
+                        sku = str(target["sku_id"])
+                        for stage, state in states[sku].items():
+                            if state["status"] in SUCCESS_STATES or state["request_attempt"] >= MAX_ITEM_ATTEMPTS:
+                                continue
+                            entries.append((target, sku, stage, operations[sku][stage]))
+                            requests.append(operations[sku][stage])
+                    if not entries:
+                        continue
+                    if budget.expired():
+                        raise CollectionIncomplete(budget.reason)
+                    execute(entries)
         reason = reason or "item_attempt_limit"
     except CollectionIncomplete as exc:
         reason = str(exc)
@@ -371,6 +406,9 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         fatal = exc
     finally:
         d.BROWSER_GRAPHQL_MAX_RECOVERIES = old_recoveries
+        if resilient:
+            d.BROWSER_GRAPHQL_RECOVERY_MANAGED = old_managed
+            d.BROWSER_GRAPHQL_RECOVERY_REMAINING = old_remaining
         d.close_detail_browser_page()
 
     try:
@@ -378,7 +416,9 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
         complete = not report["failures"] and bool(output_targets) and fatal is None and not aborted
         ready = bool(output_targets) and fatal is None and not aborted and all(
             state["status"] in SUCCESS_STATES or (
-                state["status"] == "failed" and state["request_attempt"] >= MAX_ITEM_ATTEMPTS)
+                state["status"] == "failed" and (
+                    state["attempt"] >= MAX_ITEM_ATTEMPTS and state.get("failure_kind") != "transport"
+                    if resilient else state["request_attempt"] >= MAX_ITEM_ATTEMPTS))
             for stages in states.values() for state in stages.values())
         rows = [safe_output_row(d, target, states[str(target["sku_id"])]) for target in output_targets]
         if ready:

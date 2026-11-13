@@ -87,6 +87,8 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         "BROWSER_GRAPHQL_PROFILE_KIND",
         "BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION",
         "BROWSER_GRAPHQL_WAIT_SECONDS",
+        "BROWSER_GRAPHQL_RECOVERY_MANAGED",
+        "BROWSER_GRAPHQL_RECOVERY_REMAINING",
     )
 
     def setUp(self):
@@ -344,6 +346,62 @@ class DetailBrowserRecoveryTests(unittest.TestCase):
         self.assertEqual(fetch_mock.call_count, 2)
         recover_mock.assert_not_called()
         self.assertEqual(headers["browser_profile_kind"], "primary")
+
+    def test_managed_bootstrap_cannot_restart_outside_coordinator(self):
+        self.install_page(object())
+        with patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_MANAGED", True), patch.object(
+            detail, "bootstrap_detail_browser_session", side_effect=RuntimeError("navigation failed")
+        ) as bootstrap, patch.object(detail, "recreate_detail_browser_page") as restart:
+            with self.assertRaises(detail.DetailBrowserUnavailable):
+                detail.ensure_detail_browser_session(PDP_URL, SKU, require_pdp=False)
+        bootstrap.assert_called_once()
+        restart.assert_not_called()
+
+    def test_managed_fetch_failure_preserves_session_for_single_probe(self):
+        self.install_page(object(), ready=True, current_url=detail.BROWSER_BOOTSTRAP_HOME_URL)
+        with patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_MANAGED", True), patch.object(
+            detail, "BROWSER_GRAPHQL_MAX_RECOVERIES", 0
+        ), patch.object(detail, "browser_fetch_graphql", side_effect=RuntimeError("HTTP2")) as fetch, patch.object(
+            detail, "recover_detail_browser_session"
+        ) as recover:
+            with self.assertRaises(detail.DetailBrowserUnavailable):
+                detail.browser_graphql_post([{"query": "q"}], PDP_URL, SKU)
+        self.assertTrue(detail.BROWSER_GRAPHQL_SESSION_READY)
+        self.assertEqual(detail.BROWSER_GRAPHQL_SESSION_KIND, "home_origin")
+        fetch.assert_called_once()
+        recover.assert_not_called()
+
+    def test_managed_remaining_time_caps_fetch_and_navigation(self):
+        page = Mock()
+        self.install_page(page)
+        with patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_MANAGED", True), patch.object(
+            detail, "BROWSER_GRAPHQL_RECOVERY_REMAINING", return_value=2.5
+        ), patch.object(detail, "browser_fetch_graphql", return_value={"status": 200}) as fetch:
+            detail.fetch_detail_browser_graphql_envelope([{"query": "q"}])
+            self.assertEqual(fetch.call_args.kwargs["timeout"], 2.5)
+            detail.navigate_detail_browser(PDP_URL, "home")
+            self.assertEqual(page.get.call_args.kwargs["timeout"], 2.5)
+        with patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_MANAGED", True), patch.object(
+            detail, "BROWSER_GRAPHQL_RECOVERY_REMAINING", return_value=0
+        ), patch.object(detail, "browser_fetch_graphql") as fetch:
+            with self.assertRaisesRegex(detail.DetailBrowserUnavailable, "recovery_time_limit"):
+                detail.fetch_detail_browser_graphql_envelope([])
+            fetch.assert_not_called()
+
+    def test_managed_settle_wait_cannot_exceed_remaining_budget(self):
+        remaining = [2.5]
+        def sleep(seconds):
+            remaining[0] -= seconds
+        self.install_page(Mock())
+        with patch.object(detail, "BROWSER_GRAPHQL_RECOVERY_MANAGED", True), patch.object(
+            detail, "BROWSER_GRAPHQL_RECOVERY_REMAINING", side_effect=lambda: remaining[0]
+        ), patch.object(detail, "BROWSER_GRAPHQL_WAIT_SECONDS", 8), patch.object(
+            detail.time, "sleep", side_effect=sleep
+        ) as sleeper:
+            with self.assertRaisesRegex(detail.DetailBrowserUnavailable, "recovery_time_limit"):
+                detail.commit_detail_browser_session(browser_state(detail.BROWSER_BOOTSTRAP_HOME_URL), "home_origin")
+        sleeper.assert_called_once_with(2.5)
+        self.assertFalse(detail.BROWSER_GRAPHQL_SESSION_READY)
 
     def test_second_failed_fetch_restarts_home_session_then_succeeds(self):
         self.install_page(object(), ready=True, current_url=PDP_URL)
