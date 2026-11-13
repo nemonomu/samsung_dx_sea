@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 import time
 from datetime import datetime
 from html import unescape as html_unescape
@@ -13,6 +14,9 @@ from lxml import html as lxml_html
 
 WALMART_BASE_URL = "https://www.walmart.com"
 ZENROWS_API_URL = "https://api.zenrows.com/v1/"
+WALMART_ZIP = "11581"
+WALMART_STORE = "5293"
+WALMART_LOCATION_START_URL = "https://www.walmart.com/search?q=TV"
 PRODUCT_SCOPE_QUERY_KEYS = ("conditionGroupCode", "classType")
 HTTP_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -235,24 +239,75 @@ def extract_next_data(html_text):
 
 
 def get_initial_data(next_data):
-    initial_data = (
-        (next_data or {}).get("props", {}).get("pageProps", {}).get("initialData", {})
-    )
+    initial_data = next_data
+    for key in ("props", "pageProps", "initialData"):
+        if not isinstance(initial_data, dict):
+            return {}
+        initial_data = initial_data.get(key)
     if not isinstance(initial_data, dict):
         return {}
     nested_data = initial_data.get("data")
     return nested_data if isinstance(nested_data, dict) and nested_data else initial_data
 
 
+def response_zip(next_data):
+    data = get_initial_data(next_data)
+    initial = next_data
+    for key in ("props", "pageProps", "initialData"):
+        initial = initial.get(key) if isinstance(initial, dict) else None
+    if not isinstance(initial, dict):
+        initial = {}
+    def location(node, *keys):
+        for key in keys:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(key)
+        return node
+    locations = [location(root, *path) for root in (initial, data) for path in (
+        ("pageMetadata", "location"),
+        ("contentLayout", "pageMetadata", "location"),
+        ("product", "location"),
+    )]
+    values = {str(location.get("postalCode")) for location in locations
+              if isinstance(location, dict) and location.get("postalCode")}
+    return values.pop() if len(values) == 1 else None
+
+
+def walmart_location_instructions(url):
+    return [
+        {"wait_for": 'button[data-automation-id="fulfillment-banner"]'},
+        {"click": 'button[data-automation-id="fulfillment-banner"]'},
+        {"wait": 1500},
+        {"evaluate": "(() => {const b=[...document.querySelectorAll('[role=dialog] button')].find(x=>/Supercenter| Store/.test(x.innerText)); if(!b)throw Error('store picker not found'); b.click()})()"},
+        {"wait_for": 'input[name="zipCodeOrCityState"]'},
+        {"fill": ['input[name="zipCodeOrCityState"]', WALMART_ZIP]},
+        {"wait": 4000},
+        {"evaluate": "(() => {const e=[...document.querySelectorAll('label[data-automation-id=pickup-store]')].find(x=>x.innerText.includes('Valley Stream')); if(!e)throw Error('store not found');e.click()})()"},
+        {"wait": 1500},
+        {"evaluate": "(() => {const b=[...document.querySelectorAll('[role=dialog] button')].find(x=>x.innerText.trim()==='Save');if(!b)throw Error('save not found');b.click()})()"},
+        {"wait": 4000},
+        {"evaluate": "location.reload()" if url == WALMART_LOCATION_START_URL else "location.href=" + json.dumps(url)},
+        {"wait": 6000},
+        {"evaluate": "document.documentElement.setAttribute('data-walmart-final-url', location.href)"},
+    ]
+
+
 def read_zenrows_api_key(config_path=None):
     if config_path is None:
         config_path = Path(__file__).resolve().parents[1] / "config.py"
-    text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+    try:
+        text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
     match = re.search(r"^\s*ZENROWS_API_KEY\s*=\s*[\"']?([^\"'\s#]+)", text, re.M)
     return match.group(1) if match else None
 
 
 class WalmartNextDataClient:
+    _location_lock = threading.Lock()
+    _location_failures = 0
+    _location_retry_after = 0
+
     def __init__(
         self,
         timeout=30,
@@ -288,6 +343,13 @@ class WalmartNextDataClient:
         return last_meta, last_html
 
     def fetch_zenrows_html(self, url, js_render=False):
+        location_error = None
+        if js_render and not urlparse(url).path.startswith("/reviews/"):
+            meta, payload = self.fetch_with_location(url)
+            if isinstance(payload, dict):
+                meta["source"] = "zenrows_js"
+                return meta, payload.get("html", "")
+            location_error = meta.get("error") or "location setup failed"
         if not self.zenrows_api_key:
             self.zenrows_api_key = read_zenrows_api_key(self.config_path)
         started = time.time()
@@ -301,13 +363,15 @@ class WalmartNextDataClient:
         try:
             response = requests.get(ZENROWS_API_URL, params=params, timeout=self.zenrows_timeout)
             html_text = response.text or ""
-            meta.update({"status": response.status_code, "final_url": response.url, "elapsed_sec": round(time.time() - started, 2), "html_len": len(html_text), "blocked": is_blocked_html(html_text, response.url)})
+            meta.update({"status": response.status_code, "final_url": url, "elapsed_sec": round(time.time() - started, 2), "html_len": len(html_text), "blocked": is_blocked_html(html_text, response.url)})
+            if location_error:
+                meta["error"] = location_error
             return meta, html_text
         except Exception as exc:
-            meta.update({"elapsed_sec": round(time.time() - started, 2), "error": f"{type(exc).__name__}: {exc}"})
+            meta.update({"elapsed_sec": round(time.time() - started, 2), "error": type(exc).__name__})
             return meta, ""
 
-    def fetch_zenrows_json_response(self, url, wait_ms=6000):
+    def fetch_zenrows_json_response(self, url, wait_ms=6000, set_location=False):
         if not self.zenrows_api_key:
             self.zenrows_api_key = read_zenrows_api_key(self.config_path)
         started = time.time()
@@ -338,6 +402,12 @@ class WalmartNextDataClient:
             "json_response": "true",
             "wait": str(wait_ms),
         }
+        if set_location:
+            if urlparse(url).hostname != "www.walmart.com":
+                meta["error"] = "invalid Walmart URL"
+                return meta, None
+            instructions = walmart_location_instructions(url)
+            params.update({"url": WALMART_LOCATION_START_URL, "js_instructions": json.dumps(instructions)})
         try:
             response = requests.get(ZENROWS_API_URL, params=params, timeout=max(self.zenrows_timeout, 180))
             response_text = response.text or ""
@@ -355,13 +425,97 @@ class WalmartNextDataClient:
                 return meta, None
             if isinstance(payload, dict):
                 meta["xhr_count"] = len(payload.get("xhr") or [])
+            if set_location:
+                if response.status_code != 200 or not isinstance(payload, dict):
+                    meta["error"] = "location request failed"
+                    return meta, None
+                meta["blocked"] = is_blocked_html(payload.get("html") or "", url)
+                if meta["blocked"]:
+                    meta["error"] = "Walmart page blocked"
+                    return meta, None
+                report = payload.get("js_instructions_report") or {}
+                if report.get("instructions_failed") != 0 or report.get("instructions_executed") != len(instructions):
+                    meta["error"] = "location instructions incomplete"
+                    return meta, None
+                pickup_index = None
+                guest_error = False
+                for index, request in enumerate(payload.get("xhr") or []):
+                    if not isinstance(request, dict) or "/graphql/setPickup/" not in (request.get("url") or ""):
+                        continue
+                    try:
+                        body = json.loads(request.get("body") or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(body, dict):
+                        guest_error = guest_error or any(
+                            isinstance(error, dict) and 'guestAccount' in str(error.get('message') or '')
+                            for error in (body.get('errors') or [])
+                        )
+                    body_text = json.dumps(body)
+                    if (isinstance(body, dict) and request.get("status_code") == 200 and not body.get("errors")
+                            and WALMART_ZIP in body_text and WALMART_STORE in body_text):
+                        pickup_index = index
+                if pickup_index is None or response_zip(extract_next_data(payload.get("html") or "")) != WALMART_ZIP:
+                    meta["error"] = "Walmart guest session unavailable" if guest_error else "Walmart location not confirmed"
+                    return meta, None
+                try:
+                    actual_url = lxml_html.fromstring(payload.get("html") or "").xpath("/html/@data-walmart-final-url")[0]
+                    actual, expected = urlparse(actual_url), urlparse(url)
+                    expected_params, actual_params = parse_qs(expected.query), parse_qs(actual.query)
+                    next_data = extract_next_data(payload.get("html") or "") or {}
+                    query = next_data.get("query") or {}
+                    expected_item = item_id_from_url(url) if expected.path.startswith('/ip/') else None
+                    same_path = (item_id_from_url(actual_url) == expected_item and actual.path.startswith('/ip/')) if expected_item else actual.path.rstrip("/") == expected.path.rstrip("/")
+                    if expected_item:
+                        expected_params = {key: [value] for key, value in product_scope_query_params(url).items()}
+                        product = get_initial_data(next_data).get("product") or {}
+                        actual_item = product.get("usItemId") if isinstance(product, dict) else None
+                        actual_item = actual_item or (query.get("id") if isinstance(query, dict) else None)
+                        if str(actual_item or "") != expected_item:
+                            raise ValueError("target item mismatch")
+                    if (actual.hostname != expected.hostname or not same_path
+                            or any(actual_params.get(key) != value for key, value in expected_params.items())):
+                        raise ValueError("target URL mismatch")
+                    if isinstance(query, dict):
+                        for key in ("q", "page"):
+                            if key in expected_params and key in query and str(query[key]) != expected_params[key][0]:
+                                raise ValueError("target page mismatch")
+                except (IndexError, TypeError, ValueError):
+                    meta["error"] = "Walmart target URL not confirmed"
+                    return meta, None
+                payload["xhr"] = payload.get("xhr", [])[pickup_index + 1:]
             return meta, payload
         except Exception as exc:
-            meta.update({"elapsed_sec": round(time.time() - started, 2), "error": f"{type(exc).__name__}: {exc}"})
+            meta.update({"elapsed_sec": round(time.time() - started, 2), "error": type(exc).__name__})
             return meta, None
 
+    def fetch_with_location(self, url, wait_ms=6000):
+        cls = WalmartNextDataClient
+        with cls._location_lock:
+            if time.monotonic() < cls._location_retry_after:
+                return {"source": "zenrows_json", "status": None, "blocked": False,
+                        "error": "location setup temporarily paused"}, None
+        meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms, set_location=True)
+        with cls._location_lock:
+            if time.monotonic() < cls._location_retry_after:
+                pass
+            elif payload is not None:
+                cls._location_failures = 0
+                cls._location_retry_after = 0
+            else:
+                cls._location_failures += 1
+                if cls._location_failures >= 3:
+                    cls._location_failures = 0
+                    cls._location_retry_after = time.monotonic() + 600
+        return meta, payload
+
     def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30):
-        meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
+        meta, payload = self.fetch_with_location(url, wait_ms=wait_ms)
+        if payload is None:
+            print(f"[LOCATION WARNING] Walmart similar products: ZIP {WALMART_ZIP} not confirmed; using existing route; reason={meta.get('error') or 'location unknown'}")
+            meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
+        else:
+            print(f"[LOCATION] Walmart similar products: ZIP {WALMART_ZIP} confirmed")
         names = parse_similar_product_names_from_json_response(
             payload,
             current_item=current_item,
@@ -381,20 +535,49 @@ class WalmartNextDataClient:
         js_render_fallback=True,
     ):
         attempts = []
+        needs_location = not urlparse(url).path.startswith("/reviews/")
+        fallback = None
         if self.direct_enabled:
             meta, html_text = self.fetch_direct_html(url, retries=direct_retries)
             if meta:
                 attempts.append(meta)
             next_data = extract_next_data(html_text)
-            if next_data and meta and not meta.get("blocked"):
-                return {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+            if next_data and meta and meta.get("status") == 200 and not meta.get("blocked"):
+                candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+                if not needs_location or response_zip(next_data) == WALMART_ZIP:
+                    if needs_location:
+                        meta["location_zip"] = WALMART_ZIP
+                        meta["location_verified"] = True
+                        print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}")
+                    return candidate
+                fallback = candidate
         if use_zenrows:
             for js_render in ([False, True] if js_render_fallback else [False]):
                 meta, html_text = self.fetch_zenrows_html(url, js_render=js_render)
                 attempts.append(meta)
                 next_data = extract_next_data(html_text)
-                if next_data and not meta.get("blocked"):
-                    return {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+                if next_data and meta.get("status") == 200 and not meta.get("blocked"):
+                    candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+                    if not needs_location or response_zip(next_data) == WALMART_ZIP:
+                        if needs_location:
+                            meta["location_zip"] = WALMART_ZIP
+                            meta["location_verified"] = True
+                            print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}")
+                        return candidate
+                    if fallback is None:
+                        fallback = candidate
+        if fallback:
+            actual_zip = response_zip(fallback["next_data"]) or "unknown"
+            fallback["meta"]["location_zip"] = actual_zip
+            fallback["meta"]["location_verified"] = False
+            reason = next((attempt.get("error") for attempt in reversed(attempts)
+                           if attempt.get("source") == "zenrows_js" and attempt.get("error")), None)
+            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: expected ZIP {WALMART_ZIP}, observed {actual_zip}; using {fallback['source']}; reason={reason or 'location mismatch'}")
+            return fallback
+        if needs_location:
+            reason = next((attempt.get("error") for attempt in reversed(attempts)
+                           if attempt.get("source") == "zenrows_js" and attempt.get("error")), None)
+            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} not confirmed; no usable response; reason={reason or 'no valid response'}")
         return {"next_data": None, "html": "", "source": None, "meta": None, "attempts": attempts}
 
 

@@ -161,7 +161,7 @@ class ZenRowsRecoveryTests(unittest.TestCase):
                     'status': 200,
                     'blocked': False,
                 },
-                '<script id="__NEXT_DATA__">{"query":{"id":"100"}}</script>',
+                '<script id="__NEXT_DATA__">{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"pageMetadata":{"location":{"postalCode":"11581"}}}}}}</script>',
             )
 
         client.fetch_direct_html = fail_direct
@@ -190,7 +190,7 @@ class ZenRowsRecoveryTests(unittest.TestCase):
             if js_render:
                 html_text = (
                     '<script id="__NEXT_DATA__">'
-                    '{"query":{"id":"100"}}'
+                    '{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"pageMetadata":{"location":{"postalCode":"11581"}}}}}}'
                     '</script>'
                 )
             return (

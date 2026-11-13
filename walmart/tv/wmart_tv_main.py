@@ -46,9 +46,12 @@ setup_environment(__file__)
 from common.walmart_base import WalmartBaseCrawler
 from walmart.tv.wmart_tv_next_data import (
     WalmartNextDataClient,
+    WALMART_ZIP,
     build_listing_url,
+    extract_next_data,
     parse_listing_card_element,
     parse_listing_products,
+    response_zip,
 )
 
 
@@ -289,6 +292,12 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
 
             self.handle_captcha()
             time.sleep(random.uniform(3, 5))
+
+            if response_zip(extract_next_data(self.page.html)) != WALMART_ZIP:
+                actual_zip = response_zip(extract_next_data(self.page.html)) or 'unknown'
+                print(f"[LOCATION WARNING] Walmart browser: expected ZIP {WALMART_ZIP}, observed {actual_zip}; continuing")
+            else:
+                print(f"[LOCATION] Walmart browser: ZIP {WALMART_ZIP} confirmed")
 
             # 40개 검증 (최대 3회 재시도: 파싱 → 부족하면 스크롤 → 재파싱)
             expected_products = 40
