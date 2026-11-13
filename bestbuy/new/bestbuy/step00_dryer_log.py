@@ -1,4 +1,4 @@
-"""Safe DRYER progress logs: never serialize exception messages or network data."""
+"""DRYER progress and bounded transport diagnostics; no payloads or credentials."""
 import io
 import json
 import re
@@ -9,8 +9,90 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from .step00_browser_diagnostics import BrowserDiagnostics
 
 _LOGGER = None
+
+
+def request_diagnostic(payload):
+    """Only known operation names and numeric page positions, never variables."""
+    result = {}
+    try:
+        operations = payload if isinstance(payload, list) else [payload]
+        names, pages = set(), set()
+        for operation in operations:
+            name = operation.get("operationName")
+            names.add(name if name in {"PlpView_ProductList_Init", "DryerDetail"} else "other")
+            variables = operation.get("variables") or {}
+            for key in ("pagination", "paginationForDetailedProductSearch"):
+                page = (variables.get(key) or {}).get("pageNumber")
+                if type(page) is int and page > 0:
+                    pages.add(page)
+        result = {"operation_names": sorted(names), "page_numbers": sorted(pages)}
+    except Exception:
+        pass
+    return result
+
+
+def browser_context(helpers):
+    result = {}
+    try:
+        page = getattr(helpers, "BROWSER_GRAPHQL_PAGE", None)
+        parts = urlsplit(str(getattr(page, "url", "") or ""))
+        if parts.scheme in {"https", "http"} and parts.hostname == "www.bestbuy.com":
+            result["context_url"] = f"{parts.scheme}://{parts.hostname}{parts.path}"
+        for name, key in (("BROWSER_GRAPHQL_PROCESS_GENERATION", "process_generation"),
+                          ("BROWSER_GRAPHQL_RECOVERY_PROFILE_GENERATION", "profile_generation")):
+            value = getattr(helpers, name, None)
+            if type(value) is int:
+                result[key] = value
+        kind = getattr(helpers, "BROWSER_GRAPHQL_SESSION_KIND", "")
+        if kind in {"home_origin", "pdp"}:
+            result["session_kind"] = kind
+    except Exception:
+        pass
+    return result
+
+
+def diagnostic_event(name, **fields):
+    # Observability must not replace a successful return or the original exception.
+    try:
+        event(name, **fields)
+    except Exception:
+        pass
+
+
+def finish_transport_diagnostic(diagnostic, capture_failed, helpers, **fields):
+    try:
+        info = diagnostic.finish(capture_failed) if diagnostic is not None else {}
+        safe = {"listener_status": info.get("listener_status", "unavailable"), "network_events": []}
+        for packet in info.get("network_events", [])[:20]:
+            item = {}
+            code = re.search(r"\bnet::ERR_[A-Z0-9_]+\b", str(packet.get("errorText", "")))
+            if code:
+                item["error_code"] = code.group()
+            for key in ("is_failed", "canceled"):
+                if type(packet.get(key)) is bool:
+                    item[key] = packet[key]
+            status = packet.get("status_code")
+            if type(status) is int and 100 <= status <= 599:
+                item["http_status"] = status
+            cors = packet.get("corsErrorStatus") or {}
+            cors = cors.get("corsError", "") if isinstance(cors, dict) else cors
+            for key, value in (("blocked_reason", packet.get("blockedReason", "")), ("cors_error", cors)):
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", value):
+                    item[key] = value
+            if item:
+                safe["network_events"].append(item)
+        if info.get("ready_state") in {"loading", "interactive", "complete"}:
+            safe["ready_state"] = info["ready_state"]
+        if type(info.get("online")) is bool:
+            safe["online"] = info["online"]
+        diagnostic_event("graphql_transport", **fields, **browser_context(helpers), **safe)
+    except Exception:
+        diagnostic_event("graphql_transport", **fields, diagnostic_status="unavailable")
 
 
 def exception_chain(exc):
@@ -265,6 +347,7 @@ def trace_browser_calls(helpers):
              "bootstrap_detail_browser_session": "session_bootstrap", "recreate_detail_browser_page": "chrome_restart",
              "recover_detail_browser_session": "session_recovery"}
     counts = {}
+    last_fetch_error = ""
     try:
         for name, stage in names.items():
             original = getattr(helpers, name, None)
@@ -272,12 +355,41 @@ def trace_browser_calls(helpers):
                 continue
             originals[name] = original
             def traced(*args, _original=original, _stage=stage, **kwargs):
+                nonlocal last_fetch_error
                 counts[_stage] = counts.get(_stage, 0) + 1
                 fields = {"attempt": counts[_stage]}
                 if _stage in {"chrome_restart", "session_recovery"}:
                     fields["fresh_profile"] = bool(kwargs.get("fresh_profile", False))
+                if _stage == "graphql_fetch":
+                    fields.update(request_diagnostic(args[0] if args else kwargs.get("payload")))
+                    if last_fetch_error:
+                        diagnostic_event("graphql_retry", reason=last_fetch_error,
+                                         **fields, **browser_context(helpers))
                 with phase(_stage, **fields):
-                    return _original(*args, **kwargs)
+                    if _stage != "graphql_fetch":
+                        return _original(*args, **kwargs)
+                    diagnostic = None
+                    try:
+                        diagnostic = BrowserDiagnostics(getattr(helpers, "BROWSER_GRAPHQL_PAGE", None))
+                    except Exception:
+                        pass
+                    started = time.monotonic()
+                    failed, http_status = True, None
+                    diagnostic_event("graphql_request_context", **fields, **browser_context(helpers))
+                    try:
+                        result = _original(*args, **kwargs)
+                        failed = False
+                        last_fetch_error = ""
+                        if isinstance(result, dict) and type(result.get("status")) is int:
+                            http_status = result["status"]
+                        return result
+                    except Exception as exc:
+                        last_fetch_error = error_diagnostic(exc)["error_category"]
+                        raise
+                    finally:
+                        finish_transport_diagnostic(diagnostic, failed, helpers, **fields,
+                            http_status=http_status, failed=failed,
+                            duration_s=round(time.monotonic() - started, 3))
             setattr(helpers, name, wraps(original)(traced))
         yield
     finally:

@@ -13,7 +13,7 @@ from pathlib import Path
 from .step00_collection_recovery import MAX_ITEM_ATTEMPTS
 from .step00_dryer import (FIELDS, TABLE, make_listing_row, make_row, merge_targets,
                           ordered_listing_rows, primary_url, product_selection, public_product)
-from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls
+from .step00_dryer_log import error_diagnostic, event, graphql_diagnostic, graphql_response_diagnostic, phase, run_logging, safe_legacy_output, trace_browser_calls, request_diagnostic
 
 COLLECTOR_VERSION = 6
 FILTER_POLICY = "laundry_exclusions_v1"
@@ -71,13 +71,15 @@ def api_post(helpers, payload):
     # Share LDY's connection, session bootstrap and transport recovery directly.
     # Discard legacy raw diagnostics; emit safe status codes from this runner only.
     count = len(payload) if isinstance(payload, list) else 1
-    event("api_request", operations=count, status="start")
+    event("api_request", operations=count, status="start", **request_diagnostic(payload))
     started = time.perf_counter()
     try:
         with phase("browser_api", operations=count), safe_legacy_output(), trace_browser_calls(helpers):
             status, _, body, _, _ = helpers.browser_graphql_post(payload, "https://www.bestbuy.com/?intl=nosplash")
     except Exception as exc:
-        event("api_failed", operations=count, duration_s=round(time.perf_counter() - started, 2), **error_diagnostic(exc))
+        event("api_failed", operations=count, duration_s=round(time.perf_counter() - started, 2),
+              action="raise_browser_api_unavailable", reason="shared_transport_failed",
+              **request_diagnostic(payload), **error_diagnostic(exc))
         raise DryerError("browser_api_unavailable") from exc
     http_status = int(status or 0)
     event("api_response", http_status=http_status, operations=count, duration_s=round(time.perf_counter() - started, 2))
