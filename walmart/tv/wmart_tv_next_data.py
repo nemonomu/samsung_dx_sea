@@ -17,6 +17,8 @@ ZENROWS_API_URL = "https://api.zenrows.com/v1/"
 WALMART_ZIP = "11581"
 WALMART_STORE = "5293"
 WALMART_LOCATION_START_URL = "https://www.walmart.com/search?q=TV"
+# shortcut: enable after the complete 11581 product-detail flow is verified.
+_WALMART_LOCATION_FLOW_VERIFIED = False
 PRODUCT_SCOPE_QUERY_KEYS = ("conditionGroupCode", "classType")
 HTTP_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -350,6 +352,7 @@ class WalmartNextDataClient:
                 meta["source"] = "zenrows_js"
                 return meta, payload.get("html", "")
             location_error = meta.get("error") or "location setup failed"
+            print(f"[LOCATION WARNING] Walmart: {location_error}; using existing JS route")
         if not self.zenrows_api_key:
             self.zenrows_api_key = read_zenrows_api_key(self.config_path)
         started = time.time()
@@ -442,6 +445,8 @@ class WalmartNextDataClient:
                 for index, request in enumerate(payload.get("xhr") or []):
                     if not isinstance(request, dict) or "/graphql/setPickup/" not in (request.get("url") or ""):
                         continue
+                    pickup_index = None
+                    guest_error = False
                     try:
                         body = json.loads(request.get("body") or "{}")
                     except (TypeError, ValueError):
@@ -451,9 +456,13 @@ class WalmartNextDataClient:
                             isinstance(error, dict) and 'guestAccount' in str(error.get('message') or '')
                             for error in (body.get('errors') or [])
                         )
-                    body_text = json.dumps(body)
-                    if (isinstance(body, dict) and request.get("status_code") == 200 and not body.get("errors")
-                            and WALMART_ZIP in body_text and WALMART_STORE in body_text):
+                    pickup = body
+                    for key in ("data", "fulfillmentMutations", "setPickup", "fulfillment", "pickupStore"):
+                        pickup = pickup.get(key) if isinstance(pickup, dict) else None
+                    if (isinstance(body, dict) and isinstance(pickup, dict)
+                            and request.get("status_code") == 200 and not body.get("errors")
+                            and str(pickup.get("postalCode") or "") == WALMART_ZIP
+                            and str(pickup.get("storeId") or "") == WALMART_STORE):
                         pickup_index = index
                 if pickup_index is None or response_zip(extract_next_data(payload.get("html") or "")) != WALMART_ZIP:
                     meta["error"] = "Walmart guest session unavailable" if guest_error else "Walmart location not confirmed"
@@ -490,6 +499,9 @@ class WalmartNextDataClient:
             return meta, None
 
     def fetch_with_location(self, url, wait_ms=6000):
+        if not _WALMART_LOCATION_FLOW_VERIFIED:
+            return {"source": "zenrows_json", "status": None, "blocked": False,
+                    "error": "Walmart 11581 location flow unverified"}, None
         cls = WalmartNextDataClient
         with cls._location_lock:
             if time.monotonic() < cls._location_retry_after:
@@ -536,6 +548,7 @@ class WalmartNextDataClient:
     ):
         attempts = []
         needs_location = not urlparse(url).path.startswith("/reviews/")
+        disabled_note = "; automatic 11581 setup disabled (flow unverified)" if not _WALMART_LOCATION_FLOW_VERIFIED else ""
         fallback = None
         if self.direct_enabled:
             meta, html_text = self.fetch_direct_html(url, retries=direct_retries)
@@ -548,10 +561,10 @@ class WalmartNextDataClient:
                     if needs_location:
                         meta["location_zip"] = WALMART_ZIP
                         meta["location_verified"] = True
-                        print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}")
+                        print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}{disabled_note}")
                     return candidate
                 fallback = candidate
-        if use_zenrows:
+        if use_zenrows and (fallback is None or _WALMART_LOCATION_FLOW_VERIFIED):
             for js_render in ([False, True] if js_render_fallback else [False]):
                 meta, html_text = self.fetch_zenrows_html(url, js_render=js_render)
                 attempts.append(meta)
@@ -562,22 +575,24 @@ class WalmartNextDataClient:
                         if needs_location:
                             meta["location_zip"] = WALMART_ZIP
                             meta["location_verified"] = True
-                            print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}")
+                            print(f"[LOCATION] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} confirmed via {meta.get('source')}{disabled_note}")
                         return candidate
                     if fallback is None:
                         fallback = candidate
+                    if not _WALMART_LOCATION_FLOW_VERIFIED:
+                        break
         if fallback:
             actual_zip = response_zip(fallback["next_data"]) or "unknown"
             fallback["meta"]["location_zip"] = actual_zip
             fallback["meta"]["location_verified"] = False
             reason = next((attempt.get("error") for attempt in reversed(attempts)
                            if attempt.get("source") == "zenrows_js" and attempt.get("error")), None)
-            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: expected ZIP {WALMART_ZIP}, observed {actual_zip}; using {fallback['source']}; reason={reason or 'location mismatch'}")
+            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: expected ZIP {WALMART_ZIP}, observed {actual_zip}; using {fallback['source']}; reason={reason or 'location mismatch'}{disabled_note}")
             return fallback
         if needs_location:
             reason = next((attempt.get("error") for attempt in reversed(attempts)
                            if attempt.get("source") == "zenrows_js" and attempt.get("error")), None)
-            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} not confirmed; no usable response; reason={reason or 'no valid response'}")
+            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: ZIP {WALMART_ZIP} not confirmed; no usable response; reason={reason or 'no valid response'}{disabled_note}")
         return {"next_data": None, "html": "", "source": None, "meta": None, "attempts": attempts}
 
 

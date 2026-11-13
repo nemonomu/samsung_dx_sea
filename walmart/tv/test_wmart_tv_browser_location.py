@@ -1,6 +1,8 @@
 """Offline checks for the Walmart browser location picker."""
 
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 from common.walmart_base import WalmartBaseCrawler
@@ -11,13 +13,13 @@ class BrowserLocationTests(unittest.TestCase):
     @patch('common.walmart_base.ChromiumOptions')
     @patch('common.walmart_base.ChromiumPage')
     @patch('subprocess.run')
-    def test_setup_retry_closes_only_failed_browser(self, run, page_class, _options, _sleep):
+    def test_setup_retry_does_not_quit_unowned_browser(self, run, page_class, _options, _sleep):
         crawler = WalmartBaseCrawler.__new__(WalmartBaseCrawler)
         first, second = Mock(), Mock()
         first.run_cdp.side_effect = RuntimeError('startup failed')
         page_class.side_effect = [first, second]
         self.assertTrue(crawler.setup_browser())
-        first.quit.assert_called_once()
+        first.quit.assert_not_called()
         second.quit.assert_not_called()
         run.assert_not_called()
 
@@ -56,7 +58,11 @@ class BrowserLocationTests(unittest.TestCase):
 
         crawler.page.ele.side_effect = element
         crawler.handle_captcha = Mock()
-        self.assertTrue(crawler.set_walmart_zip_code('11581'))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(crawler.set_walmart_zip_code('11581'))
+        self.assertIn('banner displays ZIP 11581', output.getvalue())
+        self.assertIn('product data not checked', output.getvalue())
         zip_input.input.assert_called_with('11581', clear=True)
         store.click.assert_called_once()
         save.click.assert_called_once()
@@ -65,9 +71,14 @@ class BrowserLocationTests(unittest.TestCase):
     def test_correct_banner_skips_store_selection(self, _sleep):
         crawler = WalmartBaseCrawler.__new__(WalmartBaseCrawler)
         crawler.page = Mock()
+        crawler.page.html = '<script>product location 95829</script>'
         banner = Mock(text='Valley Stream 11581')
         crawler.page.ele.return_value = banner
-        self.assertTrue(crawler.set_walmart_zip_code('11581'))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(crawler.set_walmart_zip_code('11581'))
+        self.assertIn('banner displays ZIP 11581', output.getvalue())
+        self.assertIn('product data not checked', output.getvalue())
         banner.click.assert_not_called()
 
 

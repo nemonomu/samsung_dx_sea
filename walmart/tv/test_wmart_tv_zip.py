@@ -35,6 +35,13 @@ def response(source, payload, *, blocked=False, status=200):
     return ({'source': source, 'status': status, 'blocked': blocked}, page_html(payload))
 
 
+def pickup_body(store='5293', postal='11581'):
+    return {'data': {'fulfillmentMutations': {'setPickup': {'fulfillment': {
+        'pickupStore': {'storeId': store, 'postalCode': postal},
+        'deliveryAddress': {'postalCode': '11581'},
+    }}}}}
+
+
 class ResponseZipTests(unittest.TestCase):
     def test_reads_listing_and_detail_location_shapes(self):
         examples = [
@@ -77,6 +84,53 @@ class FetchLocationTests(unittest.TestCase):
         self.assertEqual(result['source'], 'direct')
         client.fetch_zenrows_html.assert_not_called()
 
+    def test_disabled_location_flow_returns_first_valid_direct_without_zenrows(self):
+        for zipcode in ('11581', '95829', None):
+            with self.subTest(zipcode=zipcode):
+                payload = search_data(zipcode)
+                client = self.client(response('direct', payload), [])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = client.fetch_next_data(self.url)
+                self.assertEqual(result['next_data'], payload)
+                client.fetch_zenrows_html.assert_not_called()
+                self.assertIn('automatic 11581 setup disabled', output.getvalue())
+                if zipcode != '11581':
+                    self.assertFalse(result['meta']['location_verified'])
+                    self.assertIn('[LOCATION WARNING]', output.getvalue())
+
+    def test_disabled_location_flow_returns_first_valid_static_without_js(self):
+        for zipcode in ('11581', '95829', None):
+            with self.subTest(zipcode=zipcode):
+                payload = search_data(zipcode)
+                client = self.client(response('direct', payload, blocked=True), [
+                    response('zenrows_static', payload),
+                ])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = client.fetch_next_data(self.url)
+                self.assertEqual(result['next_data'], payload)
+                self.assertEqual(client.fetch_zenrows_html.call_count, 1)
+                self.assertFalse(client.fetch_zenrows_html.call_args.kwargs['js_render'])
+                self.assertIn('automatic 11581 setup disabled', output.getvalue())
+                if zipcode != '11581':
+                    self.assertFalse(result['meta']['location_verified'])
+                    self.assertIn('[LOCATION WARNING]', output.getvalue())
+
+    def test_disabled_location_flow_still_tries_js_after_blocked_or_failed_routes(self):
+        payload = search_data('95829')
+        client = self.client(response('direct', payload, blocked=True), [
+            response('zenrows_static', payload, status=503),
+            response('zenrows_js', payload),
+        ])
+        with redirect_stdout(io.StringIO()):
+            result = client.fetch_next_data(self.url)
+        self.assertEqual(result['next_data'], payload)
+        self.assertEqual(result['source'], 'zenrows_js')
+        self.assertFalse(result['meta']['location_verified'])
+        self.assertEqual([call.kwargs.get('js_render') for call in client.fetch_zenrows_html.call_args_list], [False, True])
+
+    @patch.object(client_module, '_WALMART_LOCATION_FLOW_VERIFIED', True)
     def test_wrong_then_missing_location_advance_to_matching_response(self):
         good = search_data('11581')
         client = self.client(response('direct', search_data('95829')), [
@@ -131,9 +185,100 @@ class FetchLocationTests(unittest.TestCase):
 class ZenRowsLocationTests(unittest.TestCase):
     url = 'https://www.walmart.com/ip/100'
 
+    def test_unverified_location_setup_does_not_make_automatic_request(self):
+        client = client_module.WalmartNextDataClient()
+        client.fetch_zenrows_json_response = Mock(return_value=({'error': 'failed'}, None))
+        meta, payload = client.fetch_with_location(self.url)
+        self.assertIsNone(payload)
+        self.assertEqual(meta['error'], 'Walmart 11581 location flow unverified')
+        client.fetch_zenrows_json_response.assert_not_called()
+
+    def test_disabled_location_attempt_runs_only_existing_js_route(self):
+        client = client_module.WalmartNextDataClient()
+        client.zenrows_api_key = 'fake-test-key'
+        fallback = Mock(status_code=200, text=page_html(detail_data('95829')),
+                        url='https://api.zenrows.com/v1/')
+        output = io.StringIO()
+        with patch.object(client_module.requests, 'get', return_value=fallback) as get:
+            with redirect_stdout(output):
+                meta, html = client.fetch_zenrows_html(self.url, js_render=True)
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(get.call_args.kwargs['params']['url'], self.url)
+        self.assertEqual(get.call_args.kwargs['params']['js_render'], 'true')
+        self.assertEqual(html, fallback.text)
+        self.assertEqual(meta['error'], 'Walmart 11581 location flow unverified')
+        self.assertIn('Walmart 11581 location flow unverified', output.getvalue())
+
     def test_initial_search_is_reloaded_after_store_selection(self):
         instructions = client_module.walmart_location_instructions(client_module.WALMART_LOCATION_START_URL)
         self.assertIn({'evaluate': 'location.reload()'}, instructions)
+
+    def test_unrelated_target_store_in_response_does_not_confirm_pickup(self):
+        payload = self.valid_payload()
+        body = pickup_body(3081, '95829')
+        body['data']['otherAvailableStores'] = [{'storeId': 5293, 'postalCode': '11581'}]
+        payload['xhr'][0]['body'] = json.dumps(body)
+        fake_response = Mock(status_code=200, text='{}', url='https://api.zenrows.com/v1/')
+        fake_response.json.return_value = payload
+        client = client_module.WalmartNextDataClient()
+        client.zenrows_api_key = 'fake-test-key'
+        with patch.object(client_module.requests, 'get', return_value=fake_response):
+            meta, actual = client.fetch_zenrows_json_response(self.url, set_location=True)
+        self.assertIsNone(actual)
+        self.assertEqual(meta['error'], 'Walmart location not confirmed')
+
+    def test_pickup_requires_both_expected_values_at_observed_path(self):
+        bodies = [pickup_body('5293', '95829'), pickup_body('3081', '11581'),
+                  {'data': {'fulfillmentMutations': {'setPickup': {'fulfillment': {'pickupStore': None}}}}}]
+        for body in bodies:
+            with self.subTest(body=body):
+                payload = self.valid_payload()
+                payload['xhr'][0]['body'] = json.dumps(body)
+                fake_response = Mock(status_code=200, text='{}', url='https://api.zenrows.com/v1/')
+                fake_response.json.return_value = payload
+                client = client_module.WalmartNextDataClient()
+                client.zenrows_api_key = 'fake-test-key'
+                with patch.object(client_module.requests, 'get', return_value=fake_response):
+                    meta, actual = client.fetch_zenrows_json_response(self.url, set_location=True)
+                self.assertIsNone(actual)
+                self.assertEqual(meta['error'], 'Walmart location not confirmed')
+
+    def test_later_failed_pickup_does_not_reuse_prior_success(self):
+        payload = self.valid_payload()
+        payload['xhr'].append({
+            'url': 'https://www.walmart.com/orchestra/cartxo/graphql/setPickup/hash',
+            'status_code': 200,
+            'body': json.dumps(pickup_body('3081', '95829')),
+        })
+        fake_response = Mock(status_code=200, text='{}', url='https://api.zenrows.com/v1/')
+        fake_response.json.return_value = payload
+        client = client_module.WalmartNextDataClient()
+        client.zenrows_api_key = 'fake-test-key'
+        with patch.object(client_module.requests, 'get', return_value=fake_response):
+            meta, actual = client.fetch_zenrows_json_response(self.url, set_location=True)
+        self.assertIsNone(actual)
+        self.assertEqual(meta['error'], 'Walmart location not confirmed')
+
+    @patch.object(client_module, '_WALMART_LOCATION_FLOW_VERIFIED', True)
+    def test_unverified_pickup_uses_legacy_js_and_logs_reason(self):
+        payload = self.valid_payload()
+        body = pickup_body(3081, '95829')
+        body['data']['otherAvailableStores'] = [{'storeId': 5293, 'postalCode': '11581'}]
+        payload['xhr'][0]['body'] = json.dumps(body)
+        location_response = Mock(status_code=200, text='{}', url='https://api.zenrows.com/v1/')
+        location_response.json.return_value = payload
+        fallback_response = Mock(status_code=200, text=page_html(detail_data('95829')),
+                                 url='https://api.zenrows.com/v1/')
+        client = client_module.WalmartNextDataClient()
+        client.zenrows_api_key = 'fake-test-key'
+        output = io.StringIO()
+        with patch.object(client_module.requests, 'get', side_effect=[location_response, fallback_response]) as get:
+            with redirect_stdout(output):
+                meta, html = client.fetch_zenrows_html(self.url, js_render=True)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(html, fallback_response.text)
+        self.assertEqual(meta['error'], 'Walmart location not confirmed')
+        self.assertIn('Walmart location not confirmed', output.getvalue())
 
     def setUp(self):
         client_module.WalmartNextDataClient._location_failures = 0
@@ -152,7 +297,7 @@ class ZenRowsLocationTests(unittest.TestCase):
             'xhr': [{
                 'url': 'https://www.walmart.com/orchestra/cartxo/graphql/setPickup/hash',
                 'status_code': 200,
-                'body': json.dumps({'data': {'postalCode': '11581', 'nodeId': '5293'}}),
+                'body': json.dumps(pickup_body()),
             }],
             'js_instructions_report': {
                 'instructions_failed': 0,
@@ -160,12 +305,12 @@ class ZenRowsLocationTests(unittest.TestCase):
             },
         }
 
-    def test_location_setup_keeps_only_requests_after_pickup_and_reloads_url(self):
+    def test_verified_location_setup_reloads_url_and_keeps_only_new_xhrs(self):
         old = {'url': 'https://www.walmart.com/orchestra/pdp/graphql/ItemByIdBtf', 'body': '{}'}
         pickup = {
             'url': 'https://www.walmart.com/orchestra/cartxo/graphql/setPickup/hash',
             'status_code': 200,
-            'body': json.dumps({'data': {'postalCode': '11581', 'nodeId': '5293'}}),
+            'body': json.dumps(pickup_body()),
         }
         fresh = {'url': 'https://www.walmart.com/orchestra/pdp/graphql/ItemByIdBtf?fresh=1', 'body': '{}'}
         count = len(client_module.walmart_location_instructions(self.url))
@@ -238,6 +383,7 @@ class ZenRowsLocationTests(unittest.TestCase):
         self.assertIsNone(actual)
         self.assertEqual(meta['error'], 'Walmart guest session unavailable')
 
+    @patch.object(client_module, '_WALMART_LOCATION_FLOW_VERIFIED', True)
     def test_repeated_location_failures_pause_requests_across_clients(self):
         first = client_module.WalmartNextDataClient()
         second = client_module.WalmartNextDataClient()
@@ -263,6 +409,7 @@ class ZenRowsLocationTests(unittest.TestCase):
         self.assertEqual(meta['error'], 'failed')
         self.assertEqual(get.call_args.kwargs['params']['js_render'], 'true')
 
+    @patch.object(client_module, '_WALMART_LOCATION_FLOW_VERIFIED', True)
     def test_inflight_success_does_not_close_open_circuit(self):
         client = client_module.WalmartNextDataClient()
         started, release = threading.Event(), threading.Event()

@@ -62,11 +62,6 @@ class WalmartBaseCrawler(BaseCrawler):
 
             except Exception as e:
                 last_error = e
-                if getattr(self, 'page', None):
-                    try:
-                        self.page.quit()
-                    except Exception:
-                        pass
                 self.page = None
                 print(f"[ERROR] Failed to setup browser (attempt {attempt}/3): {e}")
                 traceback.print_exc()
@@ -301,7 +296,7 @@ class WalmartBaseCrawler(BaseCrawler):
                 print("[WARNING] Walmart fulfillment banner not found")
                 return False
             if zip_code in (banner.text or ''):
-                print(f"[OK] Walmart zipcode 이미 설정됨, 스킵: {zip_code}")
+                print(f"[INFO] Walmart banner displays ZIP {zip_code}; product data not checked")
                 return True
 
             banner.click()
@@ -372,7 +367,7 @@ class WalmartBaseCrawler(BaseCrawler):
 
             banner = self._find_first_element(['css:button[data-automation-id="fulfillment-banner"]'], timeout=5)
             if banner and zip_code in (banner.text or ''):
-                print(f"[OK] Walmart zipcode set: {zip_code}")
+                print(f"[INFO] Walmart banner displays ZIP {zip_code}; product data not checked")
                 return True
 
             print(f"[WARNING] Walmart zipcode set result not confirmed: {zip_code}")
