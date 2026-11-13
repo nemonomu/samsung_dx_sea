@@ -275,8 +275,49 @@ def response_zip(next_data):
     return values.pop() if len(values) == 1 else None
 
 
+def _location_path_matches(next_data, path, expected=WALMART_ZIP, required=True):
+    initial = next_data
+    for key in ("props", "pageProps", "initialData"):
+        initial = initial.get(key) if isinstance(initial, dict) else None
+    values = set()
+    for root in (initial, get_initial_data(next_data)):
+        value = root
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if value not in (None, ""):
+            values.add(str(value))
+    return values == {str(expected)} or (not required and not values)
+
+
+def _detail_location_confirmed(next_data):
+    return (response_zip(next_data) == WALMART_ZIP
+            and _location_path_matches(next_data, ("product", "location", "postalCode"))
+            and _location_path_matches(next_data, ("contentLayout", "pageMetadata", "location", "postalCode"))
+            and _location_path_matches(next_data, ("product", "location", "intent"), "SHIPPING")
+            and _location_path_matches(next_data, ("contentLayout", "pageMetadata", "location", "intent"), "SHIPPING")
+            and _location_path_matches(next_data, ("contentLayout", "pageMetadata", "location", "storeId"), WALMART_STORE))
+
+
+def _search_location_confirmed(next_data):
+    fields = (("postalCode", WALMART_ZIP), ("intent", "SHIPPING"), ("storeId", WALMART_STORE))
+    return (response_zip(next_data) == WALMART_ZIP
+            and all(_location_path_matches(next_data, ("pageMetadata", "location", key), value)
+                    and _location_path_matches(next_data, ("contentLayout", "pageMetadata", "location", key), value, required=False)
+                    for key, value in fields))
+
+
+def _response_location_confirmed(url, next_data):
+    path = urlparse(url).path
+    if path.startswith('/ip/'):
+        return _detail_location_confirmed(next_data)
+    if path.rstrip('/') == '/search':
+        return _search_location_confirmed(next_data)
+    return response_zip(next_data) == WALMART_ZIP
+
+
 def walmart_location_instructions(url):
-    return [
+    instructions = [
+        {"evaluate": "sessionStorage.removeItem('__walmart_verified_search_zip')"},
         {"wait_for": 'button[data-automation-id="fulfillment-banner"]'},
         {"click": 'button[data-automation-id="fulfillment-banner"]'},
         {"wait": 1500},
@@ -288,10 +329,19 @@ def walmart_location_instructions(url):
         {"wait": 1500},
         {"evaluate": "(() => {const b=[...document.querySelectorAll('[role=dialog] button')].find(x=>x.innerText.trim()==='Save');if(!b)throw Error('save not found');b.click()})()"},
         {"wait": 4000},
-        {"evaluate": "location.reload()" if url == WALMART_LOCATION_START_URL else "location.href=" + json.dumps(url)},
-        {"wait": 6000},
-        {"evaluate": "document.documentElement.setAttribute('data-walmart-final-url', location.href)"},
+        {"evaluate": "(() => {const buttons=[...document.querySelectorAll('[role=dialog] button[aria-label=Shipping]')];if(!buttons.some(x=>x.getClientRects().length)){const banner=document.querySelector('button[data-automation-id=fulfillment-banner]');if(!banner)throw Error('banner not found');banner.click()}})()"},
+        {"wait_for": '[role="dialog"] button[aria-label="Shipping"]'},
+        {"wait": 1000},
+        {"evaluate": "(() => {const b=[...document.querySelectorAll('[role=dialog] button[aria-label=Shipping]')].find(x=>x.getClientRects().length);if(!b)throw Error('visible Shipping button not found');b.click()})()"},
+        {"wait": 3000},
+        {"evaluate": "location.reload()"},
+        {"wait": 5000},
+        {"evaluate": "(() => {if(location.pathname!=='/search'||new URLSearchParams(location.search).get('q')!=='TV')throw Error('search URL not confirmed');const e=document.getElementById('__NEXT_DATA__');if(!e)throw Error('search data missing');const n=JSON.parse(e.textContent);const d=n?.props?.pageProps?.initialData;const s=d?.data?.searchResult??d?.searchResult;if(n?.query?.q!=='TV'||!Array.isArray(s?.itemStacks))throw Error('search data not confirmed');const a=[d?.pageMetadata?.location,d?.data?.pageMetadata?.location],b=[d?.contentLayout?.pageMetadata?.location,d?.data?.contentLayout?.pageMetadata?.location];for(const [k,v] of [['postalCode','11581'],['intent','SHIPPING'],['storeId','5293']]){const x=a.map(o=>o?.[k]).filter(x=>x!=null&&x!=='');const y=b.map(o=>o?.[k]).filter(x=>x!=null&&x!=='');if(!x.length||[...x,...y].some(x=>String(x)!==v))throw Error('search ZIP not confirmed')}sessionStorage.setItem('__walmart_verified_search_zip','11581')})()"},
     ]
+    if url != WALMART_LOCATION_START_URL:
+        instructions.extend([{"evaluate": "location.href=" + json.dumps(url)}, {"wait": 6000}])
+    instructions.append({"evaluate": "(() => {const z=sessionStorage.getItem('__walmart_verified_search_zip');if(z!=='11581')throw Error('search ZIP marker missing');document.documentElement.setAttribute('data-walmart-search-zip',z);document.documentElement.setAttribute('data-walmart-final-url',location.href)})()"})
+    return instructions
 
 
 def read_zenrows_api_key(config_path=None):
@@ -441,41 +491,105 @@ class WalmartNextDataClient:
                     meta["error"] = "location instructions incomplete"
                     return meta, None
                 pickup_index = None
+                shipping_index = None
                 guest_error = False
                 for index, request in enumerate(payload.get("xhr") or []):
-                    if not isinstance(request, dict) or "/graphql/setPickup/" not in (request.get("url") or ""):
+                    if not isinstance(request, dict):
                         continue
-                    pickup_index = None
-                    guest_error = False
+                    request_url = request.get("url") or ""
+                    is_pickup = "/graphql/setPickup/" in request_url
+                    is_shipping = "/graphql/setFulfillmentIntent/" in request_url
+                    if not is_pickup and not is_shipping:
+                        continue
+                    if is_pickup:
+                        pickup_index = None
+                        guest_error = False
+                    else:
+                        shipping_index = None
                     try:
                         body = json.loads(request.get("body") or "{}")
                     except (TypeError, ValueError):
                         continue
-                    if isinstance(body, dict):
+                    if not isinstance(body, dict):
+                        continue
+                    if is_pickup:
                         guest_error = guest_error or any(
                             isinstance(error, dict) and 'guestAccount' in str(error.get('message') or '')
                             for error in (body.get('errors') or [])
                         )
-                    pickup = body
-                    for key in ("data", "fulfillmentMutations", "setPickup", "fulfillment", "pickupStore"):
-                        pickup = pickup.get(key) if isinstance(pickup, dict) else None
-                    if (isinstance(body, dict) and isinstance(pickup, dict)
-                            and request.get("status_code") == 200 and not body.get("errors")
-                            and str(pickup.get("postalCode") or "") == WALMART_ZIP
-                            and str(pickup.get("storeId") or "") == WALMART_STORE):
-                        pickup_index = index
+                        pickup = body
+                        for key in ("data", "fulfillmentMutations", "setPickup", "fulfillment", "pickupStore"):
+                            pickup = pickup.get(key) if isinstance(pickup, dict) else None
+                        if (isinstance(pickup, dict) and request.get("status_code") == 200
+                                and not body.get("errors")
+                                and str(pickup.get("postalCode") or "") == WALMART_ZIP
+                                and str(pickup.get("storeId") or "") == WALMART_STORE):
+                            pickup_index = index
+                    else:
+                        data = body.get("data")
+                        shipping = data.get("setFulfillmentIntent") if isinstance(data, dict) else None
+                        if (isinstance(shipping, dict) and request.get("status_code") == 200
+                                and not body.get("errors") and not shipping.get("errors")
+                                and shipping.get("status") is True
+                                and shipping.get("fulfillmentOption") == "SHIPPING"):
+                            shipping_index = index
                 if pickup_index is None or response_zip(extract_next_data(payload.get("html") or "")) != WALMART_ZIP:
                     meta["error"] = "Walmart guest session unavailable" if guest_error else "Walmart location not confirmed"
                     return meta, None
+                if shipping_index is None or shipping_index <= pickup_index:
+                    meta["error"] = "Walmart shipping intent not confirmed"
+                    return meta, None
+                cart_unverified = False
+                for request in payload.get("xhr", [])[shipping_index + 1:]:
+                    if not isinstance(request, dict) or "/graphql/MergeAndGetCart/" not in (request.get("url") or ""):
+                        continue
+                    try:
+                        body = json.loads(request.get("body") or "{}")
+                    except (TypeError, ValueError):
+                        body = None
+                    if request.get("status_code") != 200 or not isinstance(body, dict) or body.get("errors"):
+                        cart_unverified = True
+                        continue
+                    data = body.get("data")
+                    cart_data = data.get("mergeAndGetCart") if isinstance(data, dict) else None
+                    fulfillment = cart_data.get("fulfillment") if isinstance(cart_data, dict) else None
+                    if not isinstance(fulfillment, dict):
+                        cart_unverified = True
+                        continue
+                    address, store = fulfillment.get("deliveryAddress"), fulfillment.get("pickupStore")
+                    values = (
+                        (address.get("postalCode") if isinstance(address, dict) else None, WALMART_ZIP),
+                        (store.get("storeId") if isinstance(store, dict) else None, WALMART_STORE),
+                        (store.get("postalCode") if isinstance(store, dict) else None, WALMART_ZIP),
+                        (fulfillment.get("intent"), "SHIPPING"),
+                    )
+                    if not any(value not in (None, "") for value, _ in values):
+                        cart_unverified = True
+                    if any(value not in (None, "") and str(value) != expected for value, expected in values):
+                        meta["error"] = "Walmart cart location mismatch"
+                        return meta, None
+                if cart_unverified:
+                    meta["error"] = "Walmart cart state unverified"
+                    return meta, None
                 try:
-                    actual_url = lxml_html.fromstring(payload.get("html") or "").xpath("/html/@data-walmart-final-url")[0]
+                    html_tree = lxml_html.fromstring(payload.get("html") or "")
+                    if html_tree.xpath("/html/@data-walmart-search-zip") != [WALMART_ZIP]:
+                        meta["error"] = "Walmart search reload location not confirmed"
+                        return meta, None
+                    actual_url = html_tree.xpath("/html/@data-walmart-final-url")[0]
                     actual, expected = urlparse(actual_url), urlparse(url)
                     expected_params, actual_params = parse_qs(expected.query), parse_qs(actual.query)
                     next_data = extract_next_data(payload.get("html") or "") or {}
                     query = next_data.get("query") or {}
                     expected_item = item_id_from_url(url) if expected.path.startswith('/ip/') else None
                     same_path = (item_id_from_url(actual_url) == expected_item and actual.path.startswith('/ip/')) if expected_item else actual.path.rstrip("/") == expected.path.rstrip("/")
+                    if expected.path.rstrip('/') == '/search' and not _search_location_confirmed(next_data):
+                        meta["error"] = "Walmart search location not confirmed"
+                        return meta, None
                     if expected_item:
+                        if not _detail_location_confirmed(next_data):
+                            meta["error"] = "Walmart detail location not confirmed"
+                            return meta, None
                         expected_params = {key: [value] for key, value in product_scope_query_params(url).items()}
                         product = get_initial_data(next_data).get("product") or {}
                         actual_item = product.get("usItemId") if isinstance(product, dict) else None
@@ -485,6 +599,9 @@ class WalmartNextDataClient:
                     if (actual.hostname != expected.hostname or not same_path
                             or any(actual_params.get(key) != value for key, value in expected_params.items())):
                         raise ValueError("target URL mismatch")
+                    expected_page = expected_params.get("page", ["1"])[0]
+                    if expected_page != "1" and (not isinstance(query, dict) or str(query.get("page") or "") != expected_page):
+                        raise ValueError("target page missing or mismatched")
                     if isinstance(query, dict):
                         for key in ("q", "page"):
                             if key in expected_params and key in query and str(query[key]) != expected_params[key][0]:
@@ -492,7 +609,6 @@ class WalmartNextDataClient:
                 except (IndexError, TypeError, ValueError):
                     meta["error"] = "Walmart target URL not confirmed"
                     return meta, None
-                payload["xhr"] = payload.get("xhr", [])[pickup_index + 1:]
             return meta, payload
         except Exception as exc:
             meta.update({"elapsed_sec": round(time.time() - started, 2), "error": type(exc).__name__})
@@ -522,12 +638,8 @@ class WalmartNextDataClient:
         return meta, payload
 
     def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30):
-        meta, payload = self.fetch_with_location(url, wait_ms=wait_ms)
-        if payload is None:
-            print(f"[LOCATION WARNING] Walmart similar products: ZIP {WALMART_ZIP} not confirmed; using existing route; reason={meta.get('error') or 'location unknown'}")
-            meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
-        else:
-            print(f"[LOCATION] Walmart similar products: ZIP {WALMART_ZIP} confirmed")
+        print("[LOCATION WARNING] Walmart similar products: location not verified; using existing route")
+        meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
         names = parse_similar_product_names_from_json_response(
             payload,
             current_item=current_item,
@@ -557,7 +669,7 @@ class WalmartNextDataClient:
             next_data = extract_next_data(html_text)
             if next_data and meta and meta.get("status") == 200 and not meta.get("blocked"):
                 candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
-                if not needs_location or response_zip(next_data) == WALMART_ZIP:
+                if not needs_location or _response_location_confirmed(url, next_data):
                     if needs_location:
                         meta["location_zip"] = WALMART_ZIP
                         meta["location_verified"] = True
@@ -571,7 +683,7 @@ class WalmartNextDataClient:
                 next_data = extract_next_data(html_text)
                 if next_data and meta.get("status") == 200 and not meta.get("blocked"):
                     candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
-                    if not needs_location or response_zip(next_data) == WALMART_ZIP:
+                    if not needs_location or _response_location_confirmed(url, next_data):
                         if needs_location:
                             meta["location_zip"] = WALMART_ZIP
                             meta["location_verified"] = True
@@ -587,7 +699,10 @@ class WalmartNextDataClient:
             fallback["meta"]["location_verified"] = False
             reason = next((attempt.get("error") for attempt in reversed(attempts)
                            if attempt.get("source") == "zenrows_js" and attempt.get("error")), None)
-            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: expected ZIP {WALMART_ZIP}, observed {actual_zip}; using {fallback['source']}; reason={reason or 'location mismatch'}{disabled_note}")
+            if not reason:
+                reason = ('shipping or store context unverified' if urlparse(url).path.startswith('/ip/')
+                          else 'page location context unverified') if actual_zip == WALMART_ZIP else 'location mismatch'
+            print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: expected ZIP {WALMART_ZIP}, observed {actual_zip}; using {fallback['source']}; reason={reason}{disabled_note}")
             return fallback
         if needs_location:
             reason = next((attempt.get("error") for attempt in reversed(attempts)
