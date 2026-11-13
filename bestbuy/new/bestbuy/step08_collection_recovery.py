@@ -6,6 +6,8 @@ from collections import Counter
 from datetime import date
 from pathlib import Path
 
+from . import step08_detail_diagnostics as diagnostics
+
 from .step00_collection_recovery import (
     CollectionIncomplete, Evidence, MAX_ITEM_ATTEMPTS, RecoveryBudget, SUCCESS_STATES, RECOVERY_EVENTS,
     assert_ready, atomic_csv, atomic_json, fingerprint, permanent_errors, read_json, sanitized, utc_now,
@@ -304,11 +306,12 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                 for _, sku, stage, _ in entries:
                     states[sku][stage]["request_attempt"] += 1
                 error, code, response, response_text = "", "ERR", {}, ""
-                try:
-                    code, response_text, response, _, _ = d.browser_graphql_post(
-                        requests, d.target_url(chunk[0], str(chunk[0]["sku_id"])), str(chunk[0]["sku_id"]))
-                except (RuntimeError, d.RequestException) as exc:
-                    error = str(exc)
+                with diagnostics.observe_request(d) as transport_diagnostic:
+                    try:
+                        code, response_text, response, _, _ = d.browser_graphql_post(
+                            requests, d.target_url(chunk[0], str(chunk[0]["sku_id"])), str(chunk[0]["sku_id"]))
+                    except (RuntimeError, d.RequestException) as exc:
+                        error = str(exc)
                 calls += 1
                 if isinstance(response, dict) and len(requests) == 1 and "data" in response:
                     response = [response]
@@ -321,6 +324,8 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                     browser_version=d.BROWSER_GRAPHQL_META.get("browser_version", "unknown"),
                     targets=[dict(sku_id=sku, operation=stage) for _, sku, stage, _ in entries],
                     status="response_received" if transport_ok else "transport_failed")
+                diagnostics.request_result(d, evidence, requests, transport_diagnostic, code, response,
+                                           transport_ok, event["evidence_path"])
                 if not transport_ok:
                     for target, sku, stage, payload in entries:
                         state = states[sku][stage]
@@ -331,6 +336,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                             store_operation(d, target, stage, payload, {}, state)
                         evidence.emit("operation_result", sku_id=sku, operation=stage,
                             main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
+                        diagnostics.operation_result(d, evidence, sku, stage, {}, state, False)
                     if budget.started is None:
                         budget.started = budget.clock()
                     checkpoint()
@@ -354,6 +360,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
                     store_operation(d, target, stage, payload, response[index], state)
                     evidence.emit("operation_result", sku_id=sku, operation=stage,
                         main_rank=target.get("main_rank"), bsr_rank=target.get("bsr_rank"), **state)
+                    diagnostics.operation_result(d, evidence, sku, stage, response[index], state, True)
                 checkpoint()
         reason = reason or "item_attempt_limit"
     except CollectionIncomplete as exc:
@@ -401,6 +408,7 @@ def run(d, targets, output_targets, *, budget_factory=RecoveryBudget):
             atomic_csv(d.write_csv, d.OUTPUT_ROOT / "partial_output.csv", rows)
             atomic_json(d.OUTPUT_ROOT / "partial_output.json", rows)
         final_status = "complete" if complete else "complete_with_warnings" if ready else "partial"
+        diagnostics.output_fields(d, evidence, output_targets, rows, states)
         evidence.emit(final_status, reason="verified" if complete else reason,
                       completed_skus=report["completed_skus"], target_count=len(output_targets))
         report = checkpoint("verified" if complete else reason, final_status)
