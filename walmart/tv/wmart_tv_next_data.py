@@ -366,6 +366,7 @@ class WalmartNextDataClient:
         zenrows_timeout=120,
         config_path=None,
         direct_enabled=True,
+        renderer=None,
     ):
         self.timeout = timeout
         self.zenrows_timeout = zenrows_timeout
@@ -373,6 +374,8 @@ class WalmartNextDataClient:
         self.direct_enabled = bool(direct_enabled)
         self.session = requests.Session()
         self.zenrows_api_key = None
+        self.renderer = renderer
+        self._rendered_pages = {}
 
     def fetch_direct_html(self, url, retries=1):
         last_meta = None
@@ -638,8 +641,40 @@ class WalmartNextDataClient:
         return meta, payload
 
     def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30):
+        attempts = []
+        if self.renderer is not None:
+            cached = self._rendered_pages.get(url)
+            for use_cache in ([True, False] if cached else [False]):
+                try:
+                    meta, html_text = cached if use_cache else self.renderer.fetch_html(url, wait_for_similar=True)
+                except Exception as exc:
+                    meta, html_text = {"source": "browser_render", "error": type(exc).__name__}, ""
+                if not isinstance(meta, dict):
+                    meta = {"source": "browser_render", "error": "invalid browser metadata"}
+                attempts.append(meta)
+                next_data = extract_next_data(html_text)
+                product = get_initial_data(next_data).get("product") or {}
+                if not isinstance(product, dict):
+                    product = {}
+                actual_item = product.get("usItemId") or item_id_from_url(product.get("canonicalUrl"))
+                names = None
+                if (meta.get("content_valid") and not meta.get("blocked") and current_item
+                        and str(actual_item or "") == str(current_item)):
+                    self._rendered_pages[url] = (meta, html_text)
+                    names = (parse_similar_product_names_from_html(html_text, limit=limit)
+                             or parse_similar_product_names(next_data, current_item=current_item, limit=limit))
+                if names:
+                    meta["similar_count"] = names.count(" ||| ") + 1
+                    if not self._verified_render_location(meta):
+                        meta["location_verified"] = False
+                        print("[LOCATION WARNING] Walmart similar products: browser ZIP 11581 not verified")
+                    return {"names": names, "source": "browser_render", "meta": meta, "attempts": attempts}
         print("[LOCATION WARNING] Walmart similar products: location not verified; using existing route")
-        meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
+        try:
+            meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
+        except Exception as exc:
+            meta, payload = {"source": "zenrows_json", "error": type(exc).__name__}, None
+        attempts.append(meta)
         names = parse_similar_product_names_from_json_response(
             payload,
             current_item=current_item,
@@ -649,7 +684,90 @@ class WalmartNextDataClient:
             meta["similar_count"] = names.count(" ||| ") + 1
         else:
             meta["similar_count"] = 0
-        return {"names": names, "source": meta.get("source"), "meta": meta}
+        return {"names": names, "source": meta.get("source"), "meta": meta, "attempts": attempts}
+
+    @staticmethod
+    def _verified_render_location(meta):
+        return (isinstance(meta, dict) and meta.get("location_verified") is True
+                and meta.get("location_zip") == WALMART_ZIP)
+
+    @staticmethod
+    def _usable_detail_or_review(url, next_data):
+        if not isinstance(next_data, dict):
+            return False
+        path = urlparse(url).path
+        if path.startswith("/ip/"):
+            product = get_initial_data(next_data).get("product")
+            if not isinstance(product, dict):
+                return False
+            item = product.get("usItemId") or product.get("id") or item_id_from_url(product.get("canonicalUrl"))
+            try:
+                price = _price_string(product.get("priceInfo") or {})
+            except (AttributeError, TypeError, ValueError):
+                price = None
+            has_price = bool(price and re.search(r"\$\s*\d[\d,]*(?:\.\d{1,2})?", price))
+            name = product.get("name")
+            has_name = isinstance(name, str) and bool(name.strip())
+            if item and has_name and not has_price:
+                print(f"[DETAIL WARNING] item={item}: current price missing or invalid")
+            return bool(item and (has_name or has_price))
+        if path.startswith("/reviews/"):
+            expected_page = parse_qs(urlparse(url).query).get("page", ["1"])[0]
+            actual_page = (next_data.get("query") or {}).get("page") or "1"
+            return (review_response_scope_error(next_data, item_id_from_url(url), url) is None
+                    and str(actual_page) == str(expected_page)
+                    and find_reviews_node(next_data) is not None)
+        return True
+
+    def _fetch_next_data_with_render(self, url, direct_retries, use_zenrows, js_render_fallback, accept_response):
+        attempts = []
+        routes = []
+        if self.direct_enabled:
+            routes.append(("direct", lambda: self.fetch_direct_html(url, retries=direct_retries)))
+        routes.append(("browser_render", lambda: self.renderer.fetch_html(url)))
+        if use_zenrows:
+            routes.append(("zenrows_static", lambda: self.fetch_zenrows_html(url, js_render=False)))
+            if js_render_fallback:
+                routes.append(("zenrows_js", lambda: self.fetch_zenrows_html(url, js_render=True)))
+        for source, fetch in routes:
+            try:
+                meta, html_text = fetch()
+                meta = dict(meta) if isinstance(meta, dict) else {"error": "invalid response metadata"}
+            except Exception as exc:
+                meta, html_text = {"error": type(exc).__name__}, ""
+            meta.setdefault("source", source)
+            attempts.append(meta)
+            next_data = extract_next_data(html_text)
+            usable = meta.get("content_valid") if source == "browser_render" else meta.get("status") == 200
+            if not usable or meta.get("blocked") or not next_data:
+                continue
+            try:
+                valid = (self._usable_detail_or_review(url, next_data)
+                         and (accept_response is None or accept_response(next_data)))
+            except (AttributeError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                meta["error"] = "detail or review response incomplete or mismatched"
+                continue
+            if source == "browser_render":
+                meta.setdefault("location_zip", None)
+                if not self._verified_render_location(meta):
+                    meta["location_verified"] = False
+                    if urlparse(url).path.startswith("/reviews/"):
+                        print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: browser ZIP {WALMART_ZIP} not verified; "
+                              f"observed {meta.get('location_zip') or 'unknown'}")
+                self._rendered_pages[url] = (meta, html_text)
+            if not urlparse(url).path.startswith("/reviews/"):
+                if source != "browser_render":
+                    meta["location_zip"] = response_zip(next_data)
+                    meta["location_verified"] = _response_location_confirmed(url, next_data)
+                label = "LOCATION" if meta["location_verified"] else "LOCATION WARNING"
+                print(f"[{label}] Walmart {urlparse(url).path}: source={source}, "
+                      f"expected ZIP {WALMART_ZIP}, observed {meta['location_zip'] or 'unknown'}, "
+                      f"verified={meta['location_verified']}")
+            return {"next_data": next_data, "html": html_text, "source": source,
+                    "meta": meta, "attempts": attempts}
+        return {"next_data": None, "html": "", "source": None, "meta": None, "attempts": attempts}
 
     def fetch_next_data(
         self,
@@ -657,7 +775,10 @@ class WalmartNextDataClient:
         direct_retries=1,
         use_zenrows=True,
         js_render_fallback=True,
+        accept_response=None,
     ):
+        if self.renderer is not None:
+            return self._fetch_next_data_with_render(url, direct_retries, use_zenrows, js_render_fallback, accept_response)
         attempts = []
         needs_location = not urlparse(url).path.startswith("/reviews/")
         disabled_note = "; automatic 11581 setup disabled (flow unverified)" if not _WALMART_LOCATION_FLOW_VERIFIED else ""
@@ -667,6 +788,13 @@ class WalmartNextDataClient:
             if meta:
                 attempts.append(meta)
             next_data = extract_next_data(html_text)
+            try:
+                valid = self._usable_detail_or_review(url, next_data) and (accept_response is None or accept_response(next_data))
+            except (AttributeError, TypeError, ValueError):
+                valid = False
+            if next_data and meta and not valid:
+                meta["error"] = "detail or review response incomplete or mismatched"
+                next_data = None
             if next_data and meta and meta.get("status") == 200 and not meta.get("blocked"):
                 candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
                 if not needs_location or _response_location_confirmed(url, next_data):
@@ -681,6 +809,13 @@ class WalmartNextDataClient:
                 meta, html_text = self.fetch_zenrows_html(url, js_render=js_render)
                 attempts.append(meta)
                 next_data = extract_next_data(html_text)
+                try:
+                    valid = self._usable_detail_or_review(url, next_data) and (accept_response is None or accept_response(next_data))
+                except (AttributeError, TypeError, ValueError):
+                    valid = False
+                if next_data and not valid:
+                    meta["error"] = "detail or review response incomplete or mismatched"
+                    next_data = None
                 if next_data and meta.get("status") == 200 and not meta.get("blocked"):
                     candidate = {"next_data": next_data, "html": html_text, "source": meta.get("source"), "meta": meta, "attempts": attempts}
                     if not needs_location or _response_location_confirmed(url, next_data):
@@ -1249,7 +1384,8 @@ def _price_string(price_info):
         formatted = format_money(price_info.get(key))
         if formatted:
             return formatted
-    estimated_total = ((price_info.get("additionalFees") or {}).get("estimatedTotalPrice") or {})
+    additional_fees = price_info.get("additionalFees")
+    estimated_total = additional_fees.get("estimatedTotalPrice") if isinstance(additional_fees, dict) else None
     if isinstance(estimated_total, dict):
         for nested_key in ("priceString", "price"):
             formatted = format_money(estimated_total.get(nested_key))

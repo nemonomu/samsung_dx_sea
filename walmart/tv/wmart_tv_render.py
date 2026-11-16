@@ -1,0 +1,217 @@
+"""Owned, shared Walmart browser fallback for detail and review pages."""
+import random
+import threading
+import time
+from urllib.parse import parse_qs, urlparse
+
+from walmart.tv.wmart_tv_next_data import (
+    _response_location_confirmed, extract_next_data, find_reviews_node,
+    get_initial_data, is_blocked_html, item_id_from_url, product_scope_query_params,
+    response_zip, review_response_scope_error, parse_similar_product_names_from_html,
+    parse_similar_product_names,
+)
+
+
+class WalmartTVBrowserRenderer:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._browser = None
+        self._page = None
+        self._initial_attempted = False
+        self._zip_attempted = False
+        self._location_verified = False
+        self._last_navigation = None
+
+    def _open_browser(self):
+        from DrissionPage import Chromium, ChromiumOptions
+        options = ChromiumOptions(read_file=False)
+        options.auto_port()
+        # Keep hydration/challenge requests loading while our readiness loop waits.
+        options.set_load_mode('none')
+        options.set_timeouts(page_load=30)
+        return Chromium(options)
+
+    def _set_zip(self):
+        # The banner hydrates after the embedded product data becomes available.
+        banner = self._page.ele('css:button[data-automation-id="fulfillment-banner"]', timeout=60)
+        if not banner or not banner.wait.clickable(timeout=15):
+            return False
+        if banner.attr('aria-expanded') != 'true':
+            banner.click()
+        store = self._page.ele(
+            'xpath:(//*[@role="dialog"]//button[contains(., "Supercenter") or contains(., " Store")])[1]', timeout=15)
+        if not store or not store.wait.clickable(timeout=15):
+            return False
+        store.click()
+        field = self._page.ele('css:input[name="zipCodeOrCityState"]', timeout=15)
+        if not field:
+            return False
+        field.input('11581', clear=True)
+        store = self._page.ele(
+            'xpath://label[@data-automation-id="pickup-store" and starts-with(@for,"5293-") and contains(.,"11581")]', timeout=20)
+        if not store or not store.wait.clickable(timeout=15):
+            return False
+        store.click()
+        time.sleep(random.uniform(1, 2))
+        self._page.ele('css:button[data-automation-id="save-label"]', timeout=10).click()
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            banner = self._page.ele('css:button[data-automation-id="fulfillment-banner"]', timeout=1)
+            if banner and '11581' in (banner.text or ''):
+                if banner.attr('aria-expanded') != 'true':
+                    banner.click()
+                shipping = self._page.ele('css:button[aria-label="Shipping"]', timeout=10)
+                if shipping and shipping.wait.clickable(timeout=10):
+                    shipping.click()
+                    time.sleep(3)
+                    return True
+                return False
+            time.sleep(1)
+        return False
+
+    def _navigate(self, url):
+        if self._last_navigation is not None:
+            remaining = random.uniform(10, 15) - (time.monotonic() - self._last_navigation)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_navigation = time.monotonic()
+        self._page.get(url, retry=0, timeout=30)
+
+    @staticmethod
+    def _valid(url, data):
+        if not isinstance(data, dict):
+            return False
+        item = item_id_from_url(url)
+        query = data.get('query') or {}
+        if not isinstance(query, dict):
+            return False
+        if any(str(query.get(k) or '') != v
+               for k, v in product_scope_query_params(url).items()):
+            return False
+        if urlparse(url).path.startswith('/reviews/'):
+            requested_page = parse_qs(urlparse(url).query).get('page', ['1'])[0]
+            response_page = str(query.get('page') or '1')
+            return bool(item and requested_page == response_page
+                        and not review_response_scope_error(data, item, url)
+                        and find_reviews_node(data) is not None)
+        product = get_initial_data(data).get('product') or {}
+        if not isinstance(product, dict):
+            return False
+        actual = product.get('usItemId') or item_id_from_url(product.get('canonicalUrl'))
+        return bool(item and actual and str(actual) == item)
+
+    def _wait_ready(self, url, timeout, require_location=False):
+        from DrissionPage.errors import ContextLostError
+        print(f'[BROWSER] Waiting on current Walmart page: budget={timeout}s')
+        deadline = time.monotonic() + timeout
+        blocked = False
+        while True:
+            try:
+                body = self._page.html or ''
+                blocked = is_blocked_html(body, self._page.url)
+            except ContextLostError:
+                body = ''
+            data = extract_next_data(body) if not blocked else None
+            if (data and self._valid(url, data)
+                    and (not require_location or _response_location_confirmed(url, data))):
+                return body, data, False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return '', None, blocked
+            time.sleep(min(1, remaining))
+
+    def fetch_html(self, url, wait_for_similar=False):
+        with self._lock:
+            meta = {'source': 'browser_render', 'status': None, 'content_valid': False,
+                    'blocked': False, 'error': None, 'location_verified': False,
+                    'location_zip': None}
+            try:
+                if self._browser is None:
+                    self._browser = self._open_browser()
+                    self._page = self._browser.latest_tab
+                is_review = urlparse(url).path.startswith('/reviews/')
+                reuse = False
+                if wait_for_similar and self._page.url == url:
+                    current = self._page.html or ''
+                    reuse = (not is_blocked_html(current, self._page.url)
+                             and self._valid(url, extract_next_data(current)))
+                if not reuse:
+                    self._navigate(url)
+                first = not self._initial_attempted
+                self._initial_attempted = True
+                body, data, blocked = self._wait_ready(url, 300 if first else 90)
+                meta['blocked'] = blocked
+                if not data:
+                    meta['error'] = 'challenge timeout' if blocked else 'page readiness timeout'
+                    return meta, ''
+
+                meta['location_zip'] = response_zip(data)
+                if (not is_review and not self._zip_attempted
+                        and not _response_location_confirmed(url, data)):
+                    self._zip_attempted = True
+                    self._location_verified = False
+                    try:
+                        zip_set = self._set_zip()
+                    except Exception as exc:
+                        print(f'[LOCATION WARNING] Browser ZIP setup failed: {type(exc).__name__}')
+                        zip_set = False
+                    if zip_set:
+                        try:
+                            self._navigate(url)
+                            updated_body, updated_data, blocked = self._wait_ready(url, 90)
+                        except Exception as exc:
+                            print(f'[LOCATION WARNING] ZIP revisit failed: {type(exc).__name__}')
+                            self._close_browser()
+                            updated_data = None
+                        if updated_data:
+                            body, data = updated_body, updated_data
+                        else:
+                            print('[LOCATION WARNING] ZIP revisit failed; keeping previously collected product data')
+
+                if not is_review:
+                    self._location_verified = bool(_response_location_confirmed(url, data))
+                elif response_zip(data) and response_zip(data) != '11581':
+                    self._location_verified = False
+                if not self._location_verified:
+                    meta['location_warning'] = 'browser ZIP 11581 not verified; keeping collected data'
+                    print('[LOCATION WARNING] Browser ZIP 11581 not verified; keeping collected data')
+
+                if wait_for_similar:
+                    deadline = time.monotonic() + 5
+                    while (not (parse_similar_product_names_from_html(body)
+                                or parse_similar_product_names(data, current_item=item_id_from_url(url)))
+                           and time.monotonic() < deadline):
+                        time.sleep(min(1, deadline - time.monotonic()))
+                        candidate = self._page.html or ''
+                        candidate_data = extract_next_data(candidate)
+                        if is_blocked_html(candidate, self._page.url) or not self._valid(url, candidate_data):
+                            self._location_verified = False
+                            meta['blocked'] = is_blocked_html(candidate, self._page.url)
+                            meta['error'] = 'page changed while waiting for similar items'
+                            return meta, ''
+                        body, data = candidate, candidate_data
+                        self._location_verified = bool(_response_location_confirmed(url, data))
+                meta['content_valid'] = True
+                meta['location_zip'] = response_zip(data) or ('11581' if self._location_verified else None)
+                meta['location_verified'] = self._location_verified
+                if not self._location_verified:
+                    meta['location_warning'] = 'browser ZIP 11581 not verified; keeping collected data'
+                return meta, body
+            except Exception as exc:
+                meta['error'] = type(exc).__name__
+                self._close_browser()
+                return meta, ''
+
+    def _close_browser(self):
+        browser, self._browser, self._page = self._browser, None, None
+        self._zip_attempted = False
+        self._location_verified = False
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+
+    def close(self):
+        with self._lock:
+            self._close_browser()

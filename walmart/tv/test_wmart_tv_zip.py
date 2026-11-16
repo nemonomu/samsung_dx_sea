@@ -26,7 +26,8 @@ def search_data(zip_code):
 
 def detail_data(zip_code, item='100'):
     return next_data({'data': {
-        'product': {'usItemId': item, 'location': {'postalCode': zip_code, 'intent': 'SHIPPING'}},
+        'product': {'usItemId': item, 'priceInfo': {'currentPrice': {'price': 199}},
+                    'location': {'postalCode': zip_code, 'intent': 'SHIPPING'}},
         'contentLayout': {'pageMetadata': {'location': {
             'postalCode': zip_code, 'intent': 'SHIPPING', 'storeId': '5293',
         }}},

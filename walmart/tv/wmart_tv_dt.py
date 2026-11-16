@@ -26,6 +26,7 @@ import time
 import random
 import traceback
 import re
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -49,6 +50,7 @@ from walmart.tv.wmart_tv_next_data import (
     build_item_url,
     build_review_url,
     format_reviews,
+    get_initial_data,
     item_id_from_url,
     normalize_availability_value,
     normalize_int,
@@ -59,6 +61,8 @@ from walmart.tv.wmart_tv_next_data import (
     repair_similar_text_encoding,
     review_response_scope_error,
 )
+
+_renderer_init_lock = threading.Lock()
 
 
 # ================================================================================
@@ -324,6 +328,27 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             'decision': 'detail_not_saved',
         })
 
+    def _get_browser_renderer(self):
+        with _renderer_init_lock:
+            renderer = getattr(self, '_browser_renderer', None)
+            if renderer is None:
+                try:
+                    from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
+                    renderer = WalmartTVBrowserRenderer()
+                    self._browser_renderer = renderer
+                except Exception as exc:
+                    print(f'[WARNING] Browser initialization failed: {type(exc).__name__}')
+            return renderer
+
+    def _close_browser_renderer(self):
+        renderer = getattr(self, '_browser_renderer', None)
+        if renderer is not None:
+            self._browser_renderer = None
+            try:
+                renderer.close()
+            except Exception as exc:
+                print(f'[WARNING] Browser cleanup failed: {type(exc).__name__}')
+
     def run(self):
         """실행: initialize() → load_product_list() → 제품별 detail 수집/저장 → 리소스 정리"""
         try:
@@ -539,6 +564,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return False
 
         finally:
+            self._close_browser_renderer()
             if self.db_conn:
                 self.db_conn.close()
 
@@ -552,7 +578,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if not self.connect_db():
             return False
 
-        # 3. NextData HTTP client ready. Detail collection does not use XPath or Chrome.
+        # 3. NextData HTTP client ready.
         self.next_data_client = WalmartNextDataClient()
 
         # 4. Log cleanup
@@ -949,7 +975,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
     ):
         diagnostics = []
         try:
-            client = WalmartNextDataClient(direct_enabled=not zenrows_only)
+            client = WalmartNextDataClient(
+                direct_enabled=not zenrows_only,
+                renderer=None if zenrows_only else self._get_browser_renderer(),
+            )
             combined_data = self.crawl_detail_next_data(
                 product,
                 next_data_client=client,
@@ -1383,6 +1412,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
         review_mismatch = combined_data.get('_review_mismatch')
         self._apply_fast_artifacts(combined_data)
+        raw_price = combined_data.get('final_sku_price')
+        if raw_price is not None and str(raw_price).strip() and not self._has_required_price(raw_price):
+            print(f"  [SAVE SKIP] invalid final_sku_price: item={combined_data.get('item') or '-'}")
+            return False
         raw_star_rating = ' '.join(str(combined_data.get('star_rating') or '').split())
         raw_star_match = re.search(r'\d+(?:\.(\d+))?', raw_star_rating)
         if raw_star_match and len(raw_star_match.group(1) or '') > 1:
@@ -1404,12 +1437,12 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         item = item_text
 
         if not self._has_required_price(combined_data.get('final_sku_price')):
-            print(f"  [SAVE SKIP] final_sku_price missing: item={item}")
-            return False
+            combined_data['final_sku_price'] = None
+            print(f"  [SAVE WARNING] final_sku_price missing: item={item}")
 
         final_price_amount = self._money_amount(combined_data.get('final_sku_price'))
         original_price_amount = self._money_amount(combined_data.get('original_sku_price'))
-        if original_price_amount is not None and final_price_amount > original_price_amount:
+        if final_price_amount is not None and original_price_amount is not None and final_price_amount > original_price_amount:
             print(
                 f"  [SAVE SKIP] final price exceeds original price: item={item}, "
                 f"final={combined_data.get('final_sku_price')}, "
@@ -1420,15 +1453,23 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         review_total = normalize_int(combined_data.get('count_of_reviews'))
         rating_total = normalize_int(combined_data.get('count_of_star_ratings'))
         star_rating = str(combined_data.get('star_rating') or '').strip()
+        for field, value in (('count_of_reviews', review_total), ('count_of_star_ratings', rating_total)):
+            raw = combined_data.get(field)
+            if raw is not None and str(raw).strip() and value is None:
+                print(f"  [SAVE SKIP] invalid {field}: item={item}, value={raw}")
+                return False
+            if value is None:
+                combined_data[field] = None
+        if not star_rating:
+            combined_data['star_rating'] = None
         if review_total is None or rating_total is None or not star_rating:
             print(
-                f"  [SAVE SKIP] rating summary incomplete: item={item}, "
+                f"  [SAVE WARNING] rating summary incomplete: item={item}, "
                 f"reviews={combined_data.get('count_of_reviews')}, "
                 f"rating={combined_data.get('star_rating')}, ratings={combined_data.get('count_of_star_ratings')}"
             )
-            return False
 
-        if review_total > rating_total:
+        if review_total is not None and rating_total is not None and review_total > rating_total:
             print(
                 f"  [SAVE SKIP] review count exceeds rating count: item={item}, "
                 f"reviews={review_total}, ratings={rating_total}"
@@ -1436,18 +1477,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             return False
 
         if star_rating.lower() == 'no ratings yet':
-            if review_total != 0 or rating_total != 0:
+            if (review_total is not None and review_total != 0) or (rating_total is not None and rating_total != 0):
                 print(
                     f"  [SAVE SKIP] no-ratings label conflicts with counts: item={item}, "
                     f"reviews={review_total}, ratings={rating_total}"
                 )
                 return False
-        else:
+        elif star_rating:
             if not re.fullmatch(r'\d+(?:\.\d+)?', star_rating):
                 print(f"  [SAVE SKIP] invalid star_rating: item={item}, rating={star_rating}")
                 return False
             star_value = float(star_rating)
-            if not (0.0 <= star_value <= 5.0) or rating_total <= 0:
+            if not (0.0 <= star_value <= 5.0) or (rating_total is not None and rating_total <= 0):
                 print(
                     f"  [SAVE SKIP] star rating conflicts with rating count: item={item}, "
                     f"rating={star_rating}, ratings={rating_total}"
@@ -1726,6 +1767,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         diagnostics=None,
     ):
         client = next_data_client or self.next_data_client
+        if isinstance(client, WalmartNextDataClient) and client.direct_enabled and client.renderer is None:
+            client.renderer = self._get_browser_renderer()
         fast_errors = []
         review_notes = []
         diagnostics_list = diagnostics if diagnostics is not None else []
@@ -1759,12 +1802,23 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             add_diagnostic('detail_next_data_no_candidate_url', 'no candidate URL')
             return None
 
+        def accept_detail(next_data):
+            detail = get_initial_data(next_data).get('product') or {}
+            if not isinstance(detail, dict):
+                return False
+            item = detail.get('usItemId') or detail.get('id') or item_id_from_url(detail.get('canonicalUrl') or '')
+            if not item:
+                return False
+            return (not requested_item or str(item) == str(requested_item)
+                    or self.redirect_product_names_match(product.get('retailer_sku_name'), detail.get('name')))
+
         for url in candidate_urls:
             result = client.fetch_next_data(
                 url,
                 direct_retries=1,
                 use_zenrows=True,
                 js_render_fallback=True,
+                accept_response=accept_detail,
             )
             if log:
                 self._log_next_data_attempts('detail', requested_item, None, result)
@@ -1799,10 +1853,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 continue
 
             if not self._has_required_price(parsed.get('final_sku_price')):
-                add_diagnostic('detail_next_data_price_missing', f'item={item}')
                 if log:
-                    print(f"  [NEXT_DATA detail] price missing for item={item}; trying next candidate")
-                continue
+                    print(f"  [NEXT_DATA detail WARNING] price missing for item={item}")
 
             spec_product = product.copy()
             if parsed.get('retailer_sku_name'):
@@ -1873,6 +1925,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 'retailer_sku_name_similar': parsed.get('retailer_sku_name_similar'),
                 'detailed_review_content': detailed_review_content,
                 '_detail_source': source,
+                '_detail_location_zip': (result.get('meta') or {}).get('location_zip'),
+                '_detail_location_verified': (result.get('meta') or {}).get('location_verified'),
             })
 
             pdp_review_total = normalize_int(parsed.get('count_of_reviews'))
@@ -1925,7 +1979,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         return None
 
     def crawl_detail(self, product, skip_fast=False):
-        """Collect a validated detail row without opening a local browser."""
+        """Collect a validated detail row through the available routes."""
         product_url = product.get('product_url') if product else None
         if not product_url:
             print("  [SKIP] product_url missing; detail collection skipped")

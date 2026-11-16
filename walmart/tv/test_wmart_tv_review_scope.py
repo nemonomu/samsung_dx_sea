@@ -161,7 +161,7 @@ class ZenRowsRecoveryTests(unittest.TestCase):
                     'status': 200,
                     'blocked': False,
                 },
-                '<script id="__NEXT_DATA__">{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"pageMetadata":{"location":{"postalCode":"11581"}}}}}}</script>',
+                '<script id="__NEXT_DATA__">{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"product":{"usItemId":"100","priceInfo":{"currentPrice":{"price":199}}},"pageMetadata":{"location":{"postalCode":"11581"}}}}}}</script>',
             )
 
         client.fetch_direct_html = fail_direct
@@ -190,7 +190,7 @@ class ZenRowsRecoveryTests(unittest.TestCase):
             if js_render:
                 html_text = (
                     '<script id="__NEXT_DATA__">'
-                    '{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"pageMetadata":{"location":{"postalCode":"11581"}}}}}}'
+                    '{"query":{"id":"100"},"props":{"pageProps":{"initialData":{"product":{"usItemId":"100","priceInfo":{"currentPrice":{"price":199}}},"pageMetadata":{"location":{"postalCode":"11581"}}}}}}'
                     '</script>'
                 )
             return (
@@ -1337,10 +1337,19 @@ class DetailSaveGuardTests(unittest.TestCase):
         self.assertEqual(saved_rows[0]['fastest_delivery'], 'tomorrow')
         self.assertIsNone(saved_rows[0]['count_of_reviews'])
 
+    def test_missing_price_keeps_partial_detail_for_db_write(self):
+        crawler = self.save_crawler()
+        rows = []
+        crawler.save_to_retail_com = lambda product: rows.append(product.copy()) or True
+        row = valid_detail_row()
+        row['final_sku_price'] = None
+        self.assertTrue(crawler.save_detail_result(row))
+        self.assertIsNone(rows[0]['final_sku_price'])
+        self.assertEqual(rows[0]['count_of_reviews'], '1')
+
     def test_invalid_rows_are_rejected_before_db_writes(self):
         cases = {
             'item_missing': {'item': None},
-            'price_missing': {'final_sku_price': None},
             'final_above_original': {
                 'final_sku_price': '$225.00',
                 'original_sku_price': '$200.00',
