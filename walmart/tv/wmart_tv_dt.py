@@ -49,6 +49,7 @@ from walmart.tv.wmart_tv_next_data import (
     WalmartNextDataClient,
     build_item_url,
     build_review_url,
+    PRODUCT_SCOPE_QUERY_KEYS,
     format_reviews,
     get_initial_data,
     item_id_from_url,
@@ -282,7 +283,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             10,
             self._env_int(
                 'WALMART_TV_ZENROWS_RECOVERY_ATTEMPTS',
-                10,
+                2,
             ),
         )
         self.similar_json_fallback_enabled = self._env_bool('WALMART_TV_SIMILAR_JSON_FALLBACK', True)
@@ -391,7 +392,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     combined_data = None
                     try:
                         retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
-                        product_url = product.get('product_url', 'N/A')
+                        product_url = (product.get('product_url') or 'N/A').split('?', 1)[0]
                         url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
                         print(f"\n[{i}/{total_products}] {retailer_sku_name}")
                         print(f"  URL: {url_display}")
@@ -408,8 +409,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                             miss_entry = chunk_misses.get(i) or {}
                             miss_reason = miss_entry.get('reason') or 'unknown'
                             print(
-                                f"  [NEXT_DATA DEFERRED] reason={miss_reason}; "
-                                "immediate retry exhausted, queued for final ZenRows recovery"
+                                f"  [NEXT_DATA DEFERRED] item={item_id_from_url(product_url) or '-'} "
+                                f"reason={miss_reason} next=final_zenrows_recovery"
                             )
                             continue
 
@@ -454,60 +455,67 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 for i, initial_entry in sorted(deferred_misses.items()):
                     product = initial_entry.get('product') or {}
                     retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
-                    product_url = product.get('product_url', 'N/A')
+                    product_url = (product.get('product_url') or 'N/A').split('?', 1)[0]
                     url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
                     print(f"\n[{i}/{total_products}] {retailer_sku_name}")
                     print(f"  URL: {url_display}")
 
-                    combined_data = recovered.get(i)
-                    if combined_data:
-                        review_count = self._formatted_review_count(
-                            combined_data.get('detailed_review_content')
+                    try:
+                        combined_data = recovered.get(i)
+                        if combined_data:
+                            review_count = self._formatted_review_count(
+                                combined_data.get('detailed_review_content')
+                            )
+                            print(
+                                f"  [ZENROWS FINAL HIT] source={combined_data.get('_detail_source')}, "
+                                f"item={combined_data.get('item') or '-'}, "
+                                f"price={combined_data.get('final_sku_price') or '-'}, "
+                                f"reviews={review_count}"
+                            )
+                            if self.save_detail_result(combined_data):
+                                total_saved += 1
+                                self._record_saved(detail=True)
+                            else:
+                                self._record_run_error(
+                                    'detail_save_rejected',
+                                    product,
+                                    'validated recovery row was not saved',
+                                )
+                            time.sleep(random.uniform(0.05, 0.15))
+                            continue
+
+                        unresolved_entry = unresolved.get(i) or initial_entry
+                        miss_reason = unresolved_entry.get('reason') or 'unknown'
+                        message = self._parallel_miss_message(
+                            unresolved_entry.get('diagnostics')
+                        )
+                        detail = f"reason={miss_reason}"
+                        if message:
+                            detail = f"{detail}; {message}"
+                        self._record_run_error(
+                            'detail_zenrows_recovery_exhausted',
+                            product,
+                            detail,
                         )
                         print(
-                            f"  [ZENROWS FINAL HIT] source={combined_data.get('_detail_source')}, "
-                            f"item={combined_data.get('item') or '-'}, "
-                            f"price={combined_data.get('final_sku_price') or '-'}, "
-                            f"reviews={review_count}"
+                            f"  [NEXT_DATA MISS] reason={miss_reason}; "
+                            "final ZenRows recovery exhausted"
                         )
-                        if self.save_detail_result(combined_data):
+                        if self.save_listing_fallback(product, miss_reason):
                             total_saved += 1
-                            self._record_saved(detail=True)
+                            self._record_saved(detail=False)
+                            print("  [LISTING-ONLY SAVED] original listing row preserved")
                         else:
                             self._record_run_error(
-                                'detail_save_rejected',
+                                'listing_fallback_save_failed',
                                 product,
-                                'validated recovery row was not saved',
+                                f'reason={miss_reason}',
                             )
-                        time.sleep(random.uniform(0.05, 0.15))
-                        continue
-
-                    unresolved_entry = unresolved.get(i) or initial_entry
-                    miss_reason = unresolved_entry.get('reason') or 'unknown'
-                    message = self._parallel_miss_message(
-                        unresolved_entry.get('diagnostics')
-                    )
-                    detail = f"reason={miss_reason}"
-                    if message:
-                        detail = f"{detail}; {message}"
-                    self._record_run_error(
-                        'detail_zenrows_recovery_exhausted',
-                        product,
-                        detail,
-                    )
-                    print(
-                        f"  [NEXT_DATA MISS] reason={miss_reason}; "
-                        "final ZenRows recovery exhausted"
-                    )
-                    if self.save_listing_fallback(product, miss_reason):
-                        total_saved += 1
-                        self._record_saved(detail=False)
-                        print("  [LISTING-ONLY SAVED] original listing row preserved")
-                    else:
-                        self._record_run_error(
-                            'listing_fallback_save_failed',
-                            product,
-                            f'reason={miss_reason}',
+                    except Exception as exc:
+                        self._record_run_error('detail', product, type(exc).__name__)
+                        print(
+                            f"[DETAIL ITEM SKIP] item={item_id_from_url(product_url) or '-'} "
+                            f"stage=recovery_save error={type(exc).__name__}"
                         )
             else:
                 self.parallel_miss_reasons = {}
@@ -554,6 +562,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             unsaved = len(product_list) - total_saved
             self.detail_report['unsaved_records'] = unsaved
+            self.detail_report['all_targets_processed'] = True
             if unsaved:
                 print(f"[INCOMPLETE] Unsaved: {unsaved}; remaining products were all processed")
             return unsaved == 0
@@ -1077,6 +1086,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             f"[INFO] NextData detail parallel fetch: "
             f"{len(indexed_products)} products, workers={workers}"
         )
+        started = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
                 executor.submit(self._crawl_detail_next_data_worker, index, product, mst_specs): (index, product)
@@ -1103,80 +1113,11 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     'error': error,
                 }
 
-        print(f"[INFO] NextData detail parallel result: {len(results)}/{len(indexed_products)} loaded")
+        print(
+            f"[DETAIL CHUNK END] loaded={len(results)} targets={len(indexed_products)} "
+            f"deferred={len(initial_misses)} elapsed_s={time.monotonic() - started:.1f}"
+        )
         self._print_parallel_miss_summary('NextData parallel MISS', initial_misses)
-
-        if initial_misses:
-            retry_workers = min(self.detail_next_data_workers, len(initial_misses))
-            retry_misses = {}
-            print(
-                f"[INFO] Immediate detail retry: {len(initial_misses)} products, "
-                f"workers={retry_workers}, attempts=1"
-            )
-            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
-                future_map = {
-                    executor.submit(
-                        self._crawl_detail_next_data_worker,
-                        index,
-                        entry.get('product') or {},
-                        mst_specs,
-                    ): (index, entry)
-                    for index, entry in initial_misses.items()
-                }
-                for future in as_completed(future_map):
-                    index, initial_entry = future_map[future]
-                    product = initial_entry.get('product') or {}
-                    try:
-                        (
-                            result_index,
-                            combined_data,
-                            error,
-                            reason,
-                            retry_diagnostics,
-                        ) = future.result()
-                    except Exception as e:
-                        result_index = index
-                        combined_data = None
-                        error = e
-                        reason = 'worker_exception'
-                        retry_diagnostics = [{
-                            'stage': 'worker_exception',
-                            'product': product,
-                            'message': str(e),
-                        }]
-
-                    if combined_data:
-                        results[result_index] = combined_data
-                        continue
-
-                    diagnostics = list(initial_entry.get('diagnostics') or [])
-                    for diagnostic in retry_diagnostics or []:
-                        enriched = dict(diagnostic)
-                        enriched['immediate_retry'] = 1
-                        diagnostics.append(enriched)
-                    final_reason = (
-                        reason
-                        or self._parallel_miss_reason(retry_diagnostics)
-                        or initial_entry.get('reason')
-                        or 'unknown'
-                    )
-                    retry_misses[result_index] = {
-                        'product': product,
-                        'reason': final_reason,
-                        'diagnostics': diagnostics,
-                        'error': error,
-                    }
-
-            recovered_count = len(initial_misses) - len(retry_misses)
-            initial_misses = retry_misses
-            print(
-                f"[INFO] Immediate detail retry result: "
-                f"{recovered_count} recovered, remaining={len(initial_misses)}"
-            )
-            self._print_parallel_miss_summary(
-                'Immediate detail retry MISS',
-                initial_misses,
-            )
 
         return results, initial_misses, mst_specs
 
@@ -1245,6 +1186,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if not pending:
                 break
 
+            round_started = time.monotonic()
             round_size = len(pending)
             workers = min(self.zenrows_recovery_workers, round_size)
             round_unresolved = {}
@@ -1331,7 +1273,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             pending = round_unresolved
             print(
                 f"[INFO] ZenRows recovery round {attempt} result: "
-                f"recovered={round_recovered}, remaining={len(pending)}"
+                f"recovered={round_recovered}, remaining={len(pending)}, "
+                f"elapsed_s={time.monotonic() - round_started:.1f}"
             )
             if pending and attempt < self.zenrows_recovery_attempts:
                 time.sleep(random.uniform(0.5, 1.5))
@@ -1526,6 +1469,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         error_collector=None,
         note_collector=None,
         log=True,
+        verified_inline=False,
     ):
         client = next_data_client or self.next_data_client
 
@@ -1584,6 +1528,21 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         expected_review_count, page_limit, max_page = review_limits(review_total_hint)
 
         page_number = 1
+        # A single review has no ordering or pagination ambiguity.
+        if (
+            verified_inline
+            and review_total == 1
+            and rating_total is not None
+            and rating_total >= review_total
+            and re.fullmatch(r'[0-5](?:\.\d+)?', star_text)
+            and float(star_text) <= 5
+            and len(inline_reviews) == 1
+            and isinstance(inline_reviews[0], str)
+            and inline_reviews[0].strip()
+        ):
+            add_note('review_inline_reused', f'item={item} page=1 reviews=1')
+            return format_reviews(inline_reviews, limit=20), review_summary, True
+
         while page_number <= max_page:
             page_added = False
             last_reason = 'no __NEXT_DATA__'
@@ -1880,6 +1839,24 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 log=log,
                 page_screen_size_raw=parsed.get('screen_size'),
             )
+            # Read recommendations while the product tab may still be open.
+            self._fill_similar_from_json_response(parsed, url, item, client, log=log)
+            detail_query = next_data.get('query')
+            detail_data = get_initial_data(next_data)
+            detail_product = detail_data.get('product') or {}
+            detail_reviews = detail_data.get('reviews')
+            requested_scope = product_scope_query_params(product_url)
+            verified_inline = (
+                bool(requested_item)
+                and str(item) == str(requested_item)
+                and isinstance(detail_query, dict)
+                and {key: str(detail_query[key]) for key in PRODUCT_SCOPE_QUERY_KEYS
+                     if detail_query.get(key)} == requested_scope
+                and product_scope_query_params(url) == requested_scope
+                and isinstance(detail_reviews, dict)
+                and bool(detail_product.get('id'))
+                and str(detail_reviews.get('lookupId') or '') == str(detail_product['id'])
+            )
             detailed_review_content, review_summary, review_complete = self.collect_reviews_next_data(
                 item,
                 parsed.get('count_of_reviews'),
@@ -1892,6 +1869,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 error_collector=fast_errors,
                 note_collector=review_notes,
                 log=log,
+                verified_inline=verified_inline,
             )
             if not review_complete:
                 if log:
@@ -1902,7 +1880,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     )
 
             parsed.update(review_summary)
-            self._fill_similar_from_json_response(parsed, url, item, client, log=log)
 
             source = result.get('source') or 'next_data'
             combined_data = product.copy()

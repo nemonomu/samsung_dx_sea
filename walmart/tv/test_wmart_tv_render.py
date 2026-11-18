@@ -85,10 +85,11 @@ class RenderTests(unittest.TestCase):
         banner.attr.return_value = 'true'
         renderer._page = Mock()
         renderer._page.ele.return_value = banner
-        with patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic), patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep):
+        with (patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+              patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+              patch('walmart.tv.wmart_tv_render.random.uniform', return_value=2)):
             self.assertFalse(renderer._set_zip())
-        self.assertGreaterEqual(clock.now, 21)
-        self.assertLessEqual(clock.now, 22)
+        self.assertEqual(clock.now, 22)
 
     def make(self, page, clock):
         renderer = WalmartTVBrowserRenderer()
@@ -96,6 +97,18 @@ class RenderTests(unittest.TestCase):
         renderer._open_browser = lambda: browser
         renderer._set_zip = lambda: False
         return renderer, browser
+
+    def test_explicit_block_skips_the_wait_without_reopening_the_page(self):
+        clock = Clock()
+        page = Page(['<html><head><title>Robot or human?</title></head></html>'])
+        renderer, _ = self.make(page, clock)
+        with (patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+              patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep)):
+            meta, body = renderer.fetch_html(URL)
+        self.assertTrue(meta['blocked'])
+        self.assertFalse(body)
+        self.assertEqual(clock.now, 0)
+        self.assertEqual(page.urls, [URL])
 
     def test_first_challenge_waits_same_page_for_300_seconds(self):
         clock = Clock(); page = Page(['Robot or human']); renderer, _ = self.make(page, clock)

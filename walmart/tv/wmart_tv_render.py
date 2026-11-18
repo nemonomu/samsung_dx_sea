@@ -1,5 +1,6 @@
 """Owned, shared Walmart browser fallback for detail and review pages."""
 import random
+import re
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -8,7 +9,7 @@ from walmart.tv.wmart_tv_next_data import (
     _response_location_confirmed, extract_next_data, find_reviews_node,
     get_initial_data, is_blocked_html, item_id_from_url, product_scope_query_params,
     response_zip, review_response_scope_error, parse_similar_product_names_from_html,
-    parse_similar_product_names,
+    parse_similar_product_names, _transport_log,
 )
 
 
@@ -102,21 +103,43 @@ class WalmartTVBrowserRenderer:
 
     def _wait_ready(self, url, timeout, require_location=False):
         from DrissionPage.errors import ContextLostError
-        print(f'[BROWSER] Waiting on current Walmart page: budget={timeout}s')
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        _transport_log(url, 'browser_readiness', 0, None, 'waiting',
+                       'browser_result', event='readiness_start', budget_s=timeout)
         blocked = False
+        reason = 'next_data_missing'
         while True:
             try:
                 body = self._page.html or ''
-                blocked = is_blocked_html(body, self._page.url)
+                current_url = self._page.url
+                blocked = is_blocked_html(body, current_url)
+                if blocked and (
+                    urlparse(current_url or '').path.rstrip('/') == '/blocked'
+                    or re.search(r'<title\b[^>]*>\s*robot or human\s*\??\s*</title\s*>', body, re.I)
+                ):
+                    _transport_log(url, 'browser_readiness', time.monotonic() - started, None,
+                                   'explicit_block', 'browser_result', event='readiness')
+                    return '', None, True
             except ContextLostError:
                 body = ''
             data = extract_next_data(body) if not blocked else None
-            if (data and self._valid(url, data)
-                    and (not require_location or _response_location_confirmed(url, data))):
-                return body, data, False
+            if blocked:
+                reason = 'blocked'
+            elif data:
+                reason = 'response_incomplete_or_mismatched'
+            else:
+                reason = 'next_data_missing'
+            if data and self._valid(url, data):
+                if not require_location or _response_location_confirmed(url, data):
+                    _transport_log(url, 'browser_readiness', time.monotonic() - started, None,
+                                   'ready', 'browser_processing', event='readiness')
+                    return body, data, False
+                reason = 'location_unverified'
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                _transport_log(url, 'browser_readiness', time.monotonic() - started, None, reason,
+                               'browser_result', event='readiness')
                 return '', None, blocked
             time.sleep(min(1, remaining))
 
@@ -199,6 +222,7 @@ class WalmartTVBrowserRenderer:
                 return meta, body
             except Exception as exc:
                 meta['error'] = type(exc).__name__
+                meta['error_class'] = type(exc).__name__
                 self._close_browser()
                 return meta, ''
 

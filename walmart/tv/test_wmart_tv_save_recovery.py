@@ -362,6 +362,23 @@ class SaveRecoveryTests(unittest.TestCase):
         self.assertTrue(crawler.run())
         self.assertEqual([row['item'] for row in self.db.rows], ['3', '1', '2'])
 
+    def test_unexpected_deferred_save_error_still_saves_the_next_product(self):
+        crawler = self.crawler()
+        pending = {i: {'product': product(i), 'reason': 'no_next_data'} for i in (1, 2)}
+        crawler._collect_detail_initial_parallel = lambda chunk: ({3: product(3)}, pending, {})
+        crawler.collect_detail_zenrows_recovery_parallel = lambda *args: ({i: product(i) for i in (1, 2)}, {})
+        original_save = crawler.save_detail_result
+
+        def save(row):
+            if str(row['item']) == '1':
+                raise RuntimeError('injected exception before write')
+            return original_save(row)
+
+        crawler.save_detail_result = save
+        self.assertFalse(crawler.run())
+        self.assertEqual([row['item'] for row in self.db.rows], ['3', '2'])
+        self.assertEqual(crawler.detail_report['unsaved_records'], 1)
+
     def test_review_mismatch_warning_survives_final_db_recovery(self):
         crawler = self.crawler(1)
         row = product(1)

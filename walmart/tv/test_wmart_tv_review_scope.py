@@ -1,8 +1,11 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from walmart.tv.wmart_tv_dt import WalmartTVDetailCrawler
 from walmart.tv.wmart_tv_dt_update import WalmartTVDetailUpdateCrawler
+from walmart.tv import wmart_tv_crawl
 from walmart.tv.wmart_tv_crawl import build_walmart_tv_email_report
 from walmart.tv.wmart_tv_next_data import (
     WalmartNextDataClient,
@@ -352,40 +355,26 @@ class ZenRowsRecoveryTests(unittest.TestCase):
         self.assertEqual(set(recovered), {1, 2})
         self.assertEqual(unresolved, {})
 
-    def test_initial_pass_retries_each_miss_once_before_defer(self):
+    def test_initial_pass_defers_a_miss_and_processes_the_next_product(self):
         crawler = bare_crawler()
         crawler.load_mst_specs_cache = lambda products: {}
         calls = []
 
         def fake_worker(index, product, mst_specs, zenrows_only=False):
-            calls.append(zenrows_only)
-            if len(calls) == 1:
-                return (
-                    index,
-                    None,
-                    None,
-                    'no_next_data',
-                    [{'stage': 'detail_next_data_no_next_data'}],
-                )
-            return (
-                index,
-                {
-                    'item': '100',
-                    '_detail_source': 'direct',
-                },
-                None,
-                None,
-                [],
-            )
+            calls.append((index, zenrows_only))
+            if index == 1:
+                return index, None, None, 'no_next_data', []
+            return index, {'item': '200', '_detail_source': 'direct'}, None, None, []
 
         crawler._crawl_detail_next_data_worker = fake_worker
         results, misses, _ = crawler._collect_detail_initial_parallel([
             (1, {'product_url': 'https://www.walmart.com/ip/100'}),
+            (2, {'product_url': 'https://www.walmart.com/ip/200'}),
         ])
 
-        self.assertEqual(calls, [False, False])
-        self.assertEqual(results[1]['item'], '100')
-        self.assertEqual(misses, {})
+        self.assertEqual(calls, [(1, False), (2, False)])
+        self.assertEqual(results[2]['item'], '200')
+        self.assertEqual(misses[1]['reason'], 'no_next_data')
 
     def test_parallel_miss_is_recovered_without_run_error(self):
         crawler = bare_crawler()
@@ -920,6 +909,23 @@ class ReviewCollectionTests(unittest.TestCase):
         self.assertEqual(detailed, 'review1 - scoped review')
         self.assertEqual(errors, [])
 
+    def test_only_verified_single_review_skips_a_request(self):
+        first_url = build_review_url(ITEM, 1, SCOPED_PRODUCT_URL)
+        responses = {first_url: review_next_data(
+            ITEM, ['Same review'], 1, 1, 4.5, conditionGroupCode='2', classType='REGULAR',
+        )}
+        outputs = []
+        for verified, expected_urls in [(True, []), (False, [first_url])]:
+            client = FakeNextDataClient(responses)
+            outputs.append(bare_crawler().collect_reviews_next_data(
+                ITEM, '1', ['Same review'], {'product_url': SCOPED_PRODUCT_URL},
+                star_rating='4.5', count_of_star_ratings='1',
+                next_data_client=client, verified_inline=verified, log=False,
+            ))
+            self.assertEqual(client.urls, expected_urls)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertTrue(outputs[0][2])
+
     def test_twenty_reviews_keep_scope_on_page_two(self):
         source_url = (
             'https://www.walmart.com/ip/example/100?classType=REGULAR'
@@ -1370,6 +1376,45 @@ class DetailSaveGuardTests(unittest.TestCase):
                 row.update(changes)
                 self.assertFalse(crawler.save_detail_result(row))
                 self.assertEqual(db_calls, [])
+
+
+class IntegratedRunTests(unittest.TestCase):
+    def test_lock_refuses_second_active_run_and_allows_run_after_release(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'walmart.lock'
+            with wmart_tv_crawl.batch_lock(path) as first:
+                self.assertTrue(first)
+                with wmart_tv_crawl.batch_lock(path) as second:
+                    self.assertFalse(second)
+            with wmart_tv_crawl.batch_lock(path) as later:
+                self.assertTrue(later)
+
+    def test_only_completed_detail_pass_with_saved_rows_avoids_whole_job_failure(self):
+        for completed, saved, expected, label in [
+            (True, 2, True, 'PARTIAL'),
+            (True, 0, False, 'FAIL'),
+            (False, 2, False, 'FAIL'),
+        ]:
+            with self.subTest(completed=completed, saved=saved):
+                with (patch.object(wmart_tv_crawl, 'BaseCrawler'),
+                      patch.object(wmart_tv_crawl, 'WalmartTVDetailCrawler') as detail,
+                      patch.object(wmart_tv_crawl, 'send_walmart_tv_email_report') as send,
+                      patch('builtins.print') as printed):
+                    detail.return_value.run.return_value = False
+                    detail.return_value.detail_report = {
+                        'all_targets_processed': completed,
+                        'target_records': 3,
+                        'saved_records': saved,
+                        'detail_records': saved,
+                    }
+                    crawler = wmart_tv_crawl.WalmartTVIntegratedCrawler(
+                        resume_from='detail', batch_id='w_test',
+                    )
+                    self.assertEqual(crawler.run(), expected)
+                    self.assertIn(unittest.mock.call(f'  detail: {label}'), printed.call_args_list)
+                    subject, body = send.call_args.args
+                    self.assertTrue(subject.startswith('WARNING' if expected else 'SOS'))
+                    self.assertIn('detail missing', body)
 
 
 class DetailReportTests(unittest.TestCase):
