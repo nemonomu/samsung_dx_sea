@@ -17,7 +17,6 @@ TV Walmart 크롤러부터 이 베이스를 사용한다.
 import os
 import random
 import re
-import subprocess
 import time
 import traceback
 import gc
@@ -68,7 +67,6 @@ class WalmartBaseCrawler(BaseCrawler):
                 traceback.print_exc()
 
                 if attempt < 3:
-                    subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
                     wait_seconds = 5 * attempt
                     print(f"[INFO] Waiting {wait_seconds}s before browser setup retry...")
                     time.sleep(wait_seconds)
@@ -290,10 +288,6 @@ class WalmartBaseCrawler(BaseCrawler):
         try:
             print(f"[INFO] Step 3/4: Walmart zipcode setting: {zip_code}")
 
-            if zip_code in (self.page.html or ''):
-                print(f"[OK] Walmart zipcode 이미 설정됨, 스킵: {zip_code}")
-                return True
-
             banner = self._find_first_element([
                 'css:button[data-automation-id="fulfillment-banner"]',
                 'xpath://button[contains(., "Pickup or delivery")]',
@@ -301,6 +295,9 @@ class WalmartBaseCrawler(BaseCrawler):
             if not banner:
                 print("[WARNING] Walmart fulfillment banner not found")
                 return False
+            if zip_code in (banner.text or ''):
+                print(f"[INFO] Walmart banner displays ZIP {zip_code}; product data not checked")
+                return True
 
             banner.click()
             time.sleep(random.uniform(2, 3))
@@ -310,6 +307,7 @@ class WalmartBaseCrawler(BaseCrawler):
                 'xpath://button[contains(., "8915 GERBER ROAD")]',
                 'xpath://button[contains(., "Supercenter") and contains(., "95829")]',
                 'xpath:(//div[@data-automation-id="fulfillment-address"][contains(., "Supercenter") or contains(., "GERBER ROAD")]//button)[1]',
+                'xpath:(//*[@role="dialog"]//button[contains(., "Supercenter") or contains(., " Store")])[1]',
             ], timeout=5)
             if store_button:
                 store_button.click()
@@ -367,8 +365,9 @@ class WalmartBaseCrawler(BaseCrawler):
             time.sleep(random.uniform(4, 6))
             self.handle_captcha()
 
-            if zip_code in (self.page.html or ''):
-                print(f"[OK] Walmart zipcode set: {zip_code}")
+            banner = self._find_first_element(['css:button[data-automation-id="fulfillment-banner"]'], timeout=5)
+            if banner and zip_code in (banner.text or ''):
+                print(f"[INFO] Walmart banner displays ZIP {zip_code}; product data not checked")
                 return True
 
             print(f"[WARNING] Walmart zipcode set result not confirmed: {zip_code}")
@@ -390,6 +389,7 @@ class WalmartBaseCrawler(BaseCrawler):
 
     def _find_zip_input(self, timeout=3):
         return self._find_first_element([
+            'css:input[name="zipCodeOrCityState"]',
             'css:input[data-automation-id="store-zip-code"]',
             'css:input[data-automation-id="zip-code-input"]',
             'xpath://input[contains(@aria-label, "Zip") or contains(@aria-label, "zip") or contains(@placeholder, "Zip") or contains(@placeholder, "zip") or contains(@name, "zip") or contains(@name, "postal")]',
@@ -490,7 +490,6 @@ class WalmartBaseCrawler(BaseCrawler):
                     pass
                 self.page = None
 
-            subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
             print("[INFO] 브라우저 종료 완료, 잠시 대기...")
             time.sleep(random.uniform(6, 10))
 

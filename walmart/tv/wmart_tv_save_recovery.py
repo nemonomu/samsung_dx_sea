@@ -161,11 +161,22 @@ def snapshot_conflict(crawler, product):
     crawler._record_run_error('save_snapshot_conflict', product, 'first snapshot retained; no overwrite')
 
 
+def write_pending_snapshot(crawler, row, kind):
+    payload = {
+        'version': 1, 'account_name': crawler.account_name,
+        'batch_id': crawler.batch_id, 'test_mode': bool(crawler.test_mode),
+        'kind': kind, 'product': row,
+    }
+    key = recovery_key(crawler, row, kind)
+    atomic_json(recovery_directory(crawler) / f'{key}.pending.json', payload)
+
+
 def prepare_save(crawler, product, kind):
     """Protect an older pending collection BEFORE any master/detail DB write."""
     crawler._last_file_cleanup_ok = True
     crawler._last_save_conflict = False
     crawler._last_save_retryable = False
+    product.pop('_fresh_recovery_snapshot', None)
     row = snapshot_product(crawler, product)
     key = recovery_key(crawler, row, kind)
     path = recovery_directory(crawler) / f'{key}.pending.json'
@@ -183,6 +194,16 @@ def prepare_save(crawler, product, kind):
         # DB enrichment may fill a missing model year; archive only the exact
         # input snapshot verified here, never a later collection with this key.
         product['_recovery_source_snapshot'] = row
+        if not path.exists():
+            try:
+                write_pending_snapshot(crawler, row, kind)
+                product['_fresh_recovery_snapshot'] = True
+            except FileExistsError:
+                if not same_snapshot(read_snapshot(crawler, path, kind), row):
+                    snapshot_conflict(crawler, product)
+                    return False
+            except OSError as error:
+                record_snapshot_error(crawler, product, error)
         return True
     except Exception as error:
         record_snapshot_error(crawler, product, error)
@@ -192,36 +213,34 @@ def prepare_save(crawler, product, kind):
 def queue_failed_save(crawler, product, kind):
     """Keep the row in memory and on disk; disk failure must not stop the run."""
     key = recovery_key(crawler, product, kind)
-    row = snapshot_product(crawler, product)
+    row = product.get('_recovery_source_snapshot') or snapshot_product(crawler, product)
     pending = getattr(crawler, '_pending_db_saves', None)
     if pending is None:
         pending = crawler._pending_db_saves = {}
     entry = pending.setdefault(key, (row, kind, bool(getattr(crawler, '_last_save_retryable', False))))
     row = entry[0]
-    payload = {
-        'version': 1, 'account_name': crawler.account_name,
-        'batch_id': crawler.batch_id, 'test_mode': bool(crawler.test_mode),
-        'kind': kind, 'product': row,
-    }
     try:
-        atomic_json(recovery_directory(crawler) / f'{key}.pending.json', payload)
-        print(f"[SAVE QUEUED] item={row.get('item') or '-'}; original values preserved")
+        write_pending_snapshot(crawler, row, kind)
     except FileExistsError:
         try:
             original = read_snapshot(crawler, recovery_directory(crawler) / f'{key}.pending.json', kind)
             pending[key] = (original, kind, entry[2])
-            if not same_snapshot(original, snapshot_product(crawler, product)):
+            if not same_snapshot(original, row):
                 snapshot_conflict(crawler, product)
+                return
         except Exception as error:
             record_snapshot_error(crawler, product, error)
+            return
     except Exception as error:
         record_snapshot_error(crawler, product, error)
+        return
+    print(f"[SAVE QUEUED] item={row.get('item') or '-'}; original values preserved")
 
 
 def complete_save(crawler, product, kind):
     """Return file-cleanup status independently of confirmed DB success."""
     key = recovery_key(crawler, product, kind)
-    getattr(crawler, '_pending_db_saves', {}).pop(key, None)
+    failed_save = getattr(crawler, '_pending_db_saves', {}).pop(key, None)
     path = recovery_directory(crawler) / f'{key}.pending.json'
     pending = getattr(crawler, '_file_cleanup_pending', None)
     if pending is None:
@@ -232,10 +251,13 @@ def complete_save(crawler, product, kind):
             source = product.get('_recovery_source_snapshot', snapshot_product(crawler, product))
             if not same_snapshot(original, source):
                 raise SaveConflictError('Pending snapshot changed; not archived')
-            destination = path.with_name(f'{key}.saved.json')
-            if destination.exists():
-                destination = path.with_name(f'{key}.{uuid.uuid4().hex}.saved.json')
-            os.replace(path, destination)
+            if product.get('_fresh_recovery_snapshot') and not failed_save and kind != 'insert_listing':
+                path.unlink()
+            else:
+                destination = path.with_name(f'{key}.saved.json')
+                if destination.exists():
+                    destination = path.with_name(f'{key}.{uuid.uuid4().hex}.saved.json')
+                os.replace(path, destination)
         pending.pop(key, None)
         report = getattr(crawler, 'detail_report', {})
         report['run_errors'] = [

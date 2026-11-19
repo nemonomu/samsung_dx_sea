@@ -213,11 +213,52 @@ class SaveRecoveryTests(unittest.TestCase):
         obj.connect_db = connect
         obj.initialize = lambda: True
         obj.load_product_list = lambda: [product(i) for i in range(1, count + 1)]
-        def collect(chunk):
+        def collect(chunk, *, on_result):
             self.db.events.append(('chunk', [i for i, _ in chunk]))
-            return {i: copy.deepcopy(row) for i, row in chunk}, {}, {}
+            results = {i: copy.deepcopy(row) for i, row in chunk}
+            for i, row in chunk:
+                on_result(i, row, results[i])
+            return results, {}, {}
         obj._collect_detail_initial_parallel = collect
         return obj
+
+    def test_saves_completed_future_before_waiting_for_the_next_product(self):
+        from threading import Event
+
+        crawler = self.crawler(2)
+        crawler.detail_next_data_workers = 2
+        crawler.load_mst_specs_cache = lambda products: {}
+        first_saved = Event()
+        original_save = crawler.save_detail_result
+
+        def save(row):
+            saved = original_save(row)
+            if saved and row['item'] == '1':
+                first_saved.set()
+            return saved
+
+        def fetch(index, row, specs):
+            if index == 2 and not first_saved.wait(2):
+                raise RuntimeError('first row remained buffered')
+            return index, row.copy(), None, None, []
+
+        crawler.save_detail_result = save
+        crawler._crawl_detail_next_data_worker = fetch
+        del crawler._collect_detail_initial_parallel
+        self.assertTrue(crawler.run())
+        self.assertEqual([row['item'] for row in self.db.rows], ['1', '2'])
+
+    def test_snapshot_survives_interruption_before_first_database_write(self):
+        crawler = self.crawler(1)
+        row = product(1)
+        with patch.object(crawler, 'upsert_item_mst', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                crawler.save_detail_result(row)
+        self.assertFalse(self.db.rows)
+        self.assertEqual(len(list(Path(self.folder.name).glob('*.pending.json'))), 1)
+        self.assertTrue(replay_batch(crawler.batch_id, directory=Path(self.folder.name),
+                                     factory=lambda kind: self.crawler(0)))
+        self.assertEqual([row['item'] for row in self.db.rows], ['1'])
 
     def test_reconnect_at_each_observed_chunk_boundary_processes_all_later_products(self):
         for failed_item in (1, 41, 81):
@@ -320,14 +361,16 @@ class SaveRecoveryTests(unittest.TestCase):
 
     def test_listing_fallback_failure_continues_and_does_not_write_master(self):
         crawler = self.crawler()
-        def collect(chunk):
-            return {i: copy.deepcopy(row) for i, row in chunk if i != 1}, {
-                1: {'product': product(1), 'reason': 'no_next_data'},
-            }, {}
+        def collect(chunk, *, on_result):
+            rows = {i: copy.deepcopy(row) for i, row in chunk if i != 1}
+            for i, row in chunk:
+                if i in rows:
+                    on_result(i, row, rows[i])
+            return rows, {1: {'product': product(1), 'reason': 'no_next_data'}}, {}
         crawler._collect_detail_initial_parallel = collect
-        crawler.collect_detail_zenrows_recovery_parallel = lambda pending, specs: ({}, pending)
+        crawler.collect_detail_zenrows_recovery_parallel = lambda pending, specs, **kwargs: ({}, pending)
         self.db.fail('retail', 1)
-        self.assertTrue(crawler.run())
+        self.assertFalse(crawler.run())
         self.assertEqual([row['item'] for row in self.db.rows], ['2', '3', '1'])
         self.assertNotIn('1', self.db.masters)
         self.assertEqual(crawler.detail_report['detail_records'], 2)
@@ -356,17 +399,59 @@ class SaveRecoveryTests(unittest.TestCase):
     def test_deferred_detail_save_retry_does_not_skip_other_recovered_products(self):
         crawler = self.crawler()
         pending = {i: {'product': product(i), 'reason': 'no_next_data'} for i in (1, 2)}
-        crawler._collect_detail_initial_parallel = lambda chunk: ({3: product(3)}, pending, {})
-        crawler.collect_detail_zenrows_recovery_parallel = lambda *args: ({i: product(i) for i in (1, 2)}, {})
+        def initial(chunk, *, on_result):
+            row = product(3)
+            on_result(3, row, row)
+            return {3: row}, pending, {}
+
+        def recover(misses, specs, *, on_result):
+            rows = {i: product(i) for i in (1, 2)}
+            for i, row in rows.items():
+                on_result(i, row, row)
+            return rows, {}
+
+        crawler._collect_detail_initial_parallel = initial
+        crawler.collect_detail_zenrows_recovery_parallel = recover
         self.db.fail('master', 1)
         self.assertTrue(crawler.run())
         self.assertEqual([row['item'] for row in self.db.rows], ['3', '1', '2'])
+
+    def test_unexpected_deferred_save_error_still_saves_the_next_product(self):
+        crawler = self.crawler()
+        pending = {i: {'product': product(i), 'reason': 'no_next_data'} for i in (1, 2)}
+        def initial(chunk, *, on_result):
+            row = product(3)
+            on_result(3, row, row)
+            return {3: row}, pending, {}
+
+        def recover(misses, specs, *, on_result):
+            rows = {i: product(i) for i in (1, 2)}
+            for i, row in rows.items():
+                on_result(i, row, row)
+            return rows, {}
+
+        crawler._collect_detail_initial_parallel = initial
+        crawler.collect_detail_zenrows_recovery_parallel = recover
+        original_save = crawler.save_detail_result
+
+        def save(row):
+            if str(row['item']) == '1':
+                raise RuntimeError('injected exception before write')
+            return original_save(row)
+
+        crawler.save_detail_result = save
+        self.assertFalse(crawler.run())
+        self.assertEqual([row['item'] for row in self.db.rows], ['3', '2'])
+        self.assertEqual(crawler.detail_report['unsaved_records'], 1)
 
     def test_review_mismatch_warning_survives_final_db_recovery(self):
         crawler = self.crawler(1)
         row = product(1)
         row['_review_mismatch'] = {'item': '1', 'expected_review_bodies': 2, 'collected_review_bodies': 1}
-        crawler._collect_detail_initial_parallel = lambda chunk: ({1: row}, {}, {})
+        def collect(chunk, *, on_result):
+            on_result(1, row, row)
+            return {1: row}, {}, {}
+        crawler._collect_detail_initial_parallel = collect
         self.db.fail('master', 1, 3)
         self.assertTrue(crawler.run())
         self.assertEqual(crawler.detail_report['review_mismatches'], [row['_review_mismatch']])

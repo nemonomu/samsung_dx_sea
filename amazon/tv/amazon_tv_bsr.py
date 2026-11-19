@@ -41,9 +41,10 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.amazon_base import AmazonBaseCrawler
+from amazon.tv.amazon_tv_listing import AmazonTVListingMixin
 
 
-class AmazonTVBSRCrawler(AmazonBaseCrawler):
+class AmazonTVBSRCrawler(AmazonTVListingMixin, AmazonBaseCrawler):
     """
     Amazon TV BSR 페이지 크롤러 (DrissionPage 기반)
     """
@@ -97,33 +98,15 @@ class AmazonTVBSRCrawler(AmazonBaseCrawler):
             target_products = self.test_count if self.test_mode else self.max_products
             self.current_rank = 0
             page_num = 1
+            empty_pages = []
 
             while (total_insert + total_update) < target_products and page_num <= self.max_pages:
                 products = self.crawl_page(page_num)
 
                 if not products:
-                    if page_num == 1:
-                        page_url = (
-                            self.url_template
-                            .replace('&pg={page}', '')
-                            .replace('&page={page}', '')
-                            .replace('{page}', str(page_num))
-                        )
-                    else:
-                        page_url = self.url_template.replace('{page}', str(page_num))
-
-                    for restart_count in range(1, 2):
-                        print(f"[WARNING] Page {page_num}: 0 products found, restarting browser with page URL ({restart_count}/1)")
-                        if not self.restart_browser(page_url):  # 재시작 실패 시 아래의 0개 실패 처리로 이동
-                            break
-
-                        products = self.crawl_page(page_num)
-                        if products:
-                            break
-
-                if not products:
-                    print(f"[ERROR] No products found at page {page_num}")
-                    return False
+                    # crawl_page already exhausted both budgets and its one refresh.
+                    empty_pages.append(page_num)
+                    print(f"[WARNING] No products after bounded loading at page {page_num}; continuing next page")
                 else:
                     result = self.save_products(products)
                     total_insert += result['insert']
@@ -136,7 +119,9 @@ class AmazonTVBSRCrawler(AmazonBaseCrawler):
                 page_num += 1
 
             print(f"[DONE] Page: {page_num}, Update: {total_update}, Insert: {total_insert}, batch_id: {self.batch_id}")
-            return True
+            if empty_pages:
+                print(f'[WARNING] BSR empty pages: {empty_pages}')
+            return not empty_pages
 
         except Exception as e:
             print(f"[ERROR] Crawler failed: {e}")
@@ -228,9 +213,9 @@ class AmazonTVBSRCrawler(AmazonBaseCrawler):
                 print(f"[SKIP] Skipping page {page_number} due to Amazon recovery failure")
                 raise RuntimeError(f"Amazon recovery failed at page {page_number}")
 
-            # 50개 검증 (최대 3회 재시도: 파싱 → 부족하면 스크롤 → 재파싱)
+            # 최대 2분 스크롤/확인 → 새로고침 1회 → 최대 2분 추가 확인.
             expected_products = 50
-            base_containers = self.find_product_containers(base_container_xpath, page_number, expected_products, scroll_ratio=0.8)
+            base_containers = self.find_bsr_product_containers(base_container_xpath, page_number, expected_products)
 
             print(f"[INFO] Page {page_number}: {len(base_containers)} products found")
 
@@ -248,7 +233,7 @@ class AmazonTVBSRCrawler(AmazonBaseCrawler):
                         'retailer_sku_name': self.safe_extract_chain(item, 'retailer_sku_name'),
                         'bsr_rank': 0,
                         'page_number': page_number,
-                        'product_url': self.extract_product_url(item, 'https://www.amazon.com'),
+                        'product_url': self.extract_listing_product_url(item, page_number, idx),
                         'calendar_week': self.calendar_week,
                         'crawl_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'batch_id': self.batch_id

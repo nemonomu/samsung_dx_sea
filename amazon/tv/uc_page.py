@@ -1,6 +1,6 @@
 """
 UCPage — undetected-chromedriver(selenium) 위에 DrissionPage ChromiumPage와
-동일한 API 표면을 제공하는 얇은 어댑터 (Amazon TV UC 전환 전용).
+동일한 API 표면을 제공하는 얇은 어댑터.
 
 목적:
   기존 크롤러/추출 로직(amazon_base·base_crawler의 검증된 메서드 18개)이
@@ -8,10 +8,6 @@ UCPage — undetected-chromedriver(selenium) 위에 DrissionPage ChromiumPage와
   self.page 를 이 UCPage 로 바꾸면 코드 재작성 없이 UC 위에서 동작한다.
   게이트 소진이 없는 UC(2026-07-08 실측 145/145 게이트0)로 파이프라인을 옮기되,
   검증된 크롤/복구/추출 로직은 손대지 않는 것이 설계 의도.
-
-격리:
-  이 파일은 amazon/tv/ 전용 신규 파일 — common/ 공유 base 는 건드리지 않는다.
-  Walmart/HHP/기존 DrissionPage TV 경로에 영향 없음.
 
 DrissionPage → selenium 대응 (Explore 전수조사 기반, 실제 사용 표면만):
   page.get(url)              → driver.get(url)
@@ -84,13 +80,14 @@ def detect_chrome_major():
     return max(versions) if versions else None
 
 
-def make_uc_driver(user_data_dir=None, headless=False, lang='en-US'):
+def make_uc_driver(user_data_dir=None, headless=False, lang='en-US', page_load_strategy='normal'):
     """UC 드라이버 생성 — SIEL make_driver 설정 + 신뢰 프로필 옵션.
 
     스로틀링 방지 플래그 + focus emulation 은 리뷰 lazy-load 안정화용(백그라운드
     창에서도 위젯 로딩 유지). version_main 은 실제 Chrome 메이저에 맞춘다.
     """
     opts = uc.ChromeOptions()
+    opts.page_load_strategy = page_load_strategy
     if headless:
         opts.add_argument('--headless=new')
     opts.add_argument('--no-sandbox')
@@ -154,11 +151,24 @@ class UCElement:
         except StaleElementReferenceException:
             return None
 
-    def input(self, value):
+    def input(self, value, clear=False):
+        if clear:
+            self._el.clear()
         self._el.send_keys(value)
 
     def clear(self):
         self._el.clear()
+
+    @property
+    def wait(self):
+        return self
+
+    def clickable(self, timeout):
+        try:
+            return bool(WebDriverWait(self._driver, timeout).until(
+                EC.element_to_be_clickable(self._el)))
+        except (TimeoutException, StaleElementReferenceException):
+            return False
 
     @property
     def scroll(self):

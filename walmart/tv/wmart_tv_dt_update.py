@@ -95,7 +95,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
         return super().initialize()
 
     def crawl_detail(self, product):
-        """Run the same validated HTTP/ZenRows detail flow for UPDATE mode."""
+        """Run the same validated HTML/browser/ZenRows detail flow for UPDATE mode."""
         result = super().crawl_detail(product)
         if result is product:
             print("[INFO] Unvalidated listing row rejected without UPDATE")
@@ -195,9 +195,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
 
             self.apply_master_model_year(cursor, product)
 
-            # 크롤링으로 추출한 필드는 이번 결과로 덮어쓴다.
-            # 단, 리뷰 본문을 이번 실행에서 얻지 못한 경우(None)에는
-            # 기존 detailed_review_content를 유지해 정상 데이터를 지우지 않는다.
+            # 이번에 얻지 못한 추출값은 기존 데이터를 유지한다.
             # 필드 리스트는 부모의 EXTRACTED_FIELDS 사용 → 부모에 새 필드 추가 시 자동 반영
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             update_meta = {
@@ -205,14 +203,15 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
                 for field, source in self.UPDATE_META_FIELDS.items()
             }
             update_data = {
-                **{key: product.get(key) for key in self.EXTRACTED_FIELDS},
+                **{key: (None if isinstance(product.get(key), str) and not product[key].strip()
+                          else product.get(key)) for key in self.EXTRACTED_FIELDS},
                 **update_meta,
             }
 
             updates = [
                 (
                     f"{key} = COALESCE(%s, {key})"
-                    if key in {'detailed_review_content', 'model_year'}
+                    if key in self.EXTRACTED_FIELDS
                     else f"{key} = %s"
                 )
                 for key in update_data
@@ -293,6 +292,7 @@ class WalmartTVDetailUpdateCrawler(WalmartTVDetailCrawler):
             return False
 
         finally:
+            self._close_browser_renderer()
             if self.db_conn:
                 self.db_conn.close()
             self.stop_logging()

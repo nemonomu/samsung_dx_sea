@@ -30,6 +30,7 @@ import traceback
 import re
 from datetime import datetime
 from lxml import html
+from DrissionPage.errors import BrowserConnectError, ContextLostError, PageDisconnectedError
 
 # 공통 환경 설정 (작업 디렉토리, 한글 출력, 경로 설정)
 _project_root = os.path.abspath(os.path.dirname(__file__))
@@ -57,8 +58,44 @@ from amazon.tv.amazon_tv_cart_price import (
     extract_pdp_offer_identity,
     hidden_pdp_price_trigger,
     is_hidden_pdp_price_state,
+    normalize_money,
     parse_html,
 )
+
+
+def extract_pdp_body_price(page, asin):
+    """Read the rendered main selling price on the exact product page."""
+    try:
+        prices = page.run_js(r'''
+        const asin = arguments[0];
+        const readAsin = path => path.match(/\/(?:dp|gp\/product)\/([a-z0-9]{10})(?:\/|$)/i)?.[1].toUpperCase();
+        const productIds = [...document.querySelectorAll('input#ASIN[name="ASIN"]')].map(node => node.value);
+        const canonical = (document.querySelector('link[rel="canonical"]')?.href || '').split(/[?#]/)[0];
+        if (!['www.amazon.com', 'amazon.com'].includes(location.hostname)
+            || readAsin(location.pathname) !== asin
+            || (productIds.length ? productIds.some(id => id !== asin) : readAsin(canonical) !== asin)) return [];
+
+        return [...document.querySelectorAll(
+            '#apex_desktop .apex-core-price-identifier .priceToPay > span[aria-hidden="true"]'
+        )].filter(node =>
+            !node.closest('#apex_desktop_usedAccordionRow')
+            && node.getClientRects().length && getComputedStyle(node).visibility === 'visible'
+        ).map(node => node.textContent.trim()).filter(Boolean);
+        ''', asin)
+    except (BrowserConnectError, ContextLostError, PageDisconnectedError, TimeoutError):
+        # A lost browser/context needs the existing product retry/restart path.
+        raise
+    except Exception as exc:
+        if 'timeout' in str(exc).lower() or 'time out' in str(exc).lower():
+            raise
+        print(f'  [WARNING] PDP body price failed: item={asin}, error={exc}; continuing price fallback')
+        return None
+    try:
+        unique = {normalize_money(price) for price in prices or []}
+    except CartPriceParseError:
+        return None
+    return unique.pop() if len(unique) == 1 else None
+
 
 # Dedicated trusted profile for Amazon detail collection.
 # Seed it once from regular Chrome, then preserve the authenticated
@@ -1111,32 +1148,38 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             final_sku_price_source = (
                 'xpath' if final_sku_price and '$' in final_sku_price else None
             )
-            try:
-                (
-                    final_sku_price,
-                    used_cart_price,
-                    cart_price_source,
-                    tree,
-                    cart_price_resolution,
-                ) = self.resolve_hidden_price_from_cart(
-                    tree,
-                    item,
-                    product_url,
-                    final_sku_price,
-                )
-                if used_cart_price:
-                    final_sku_price_source = cart_price_source
-                    self._record_cart_price_resolution(cart_price_resolution)
-                    print(
-                        f"  [CART PRICE] Hidden PDP resolved: "
-                        f"item={item}, price={final_sku_price}, "
-                        f"source={cart_price_source}"
+            if not final_sku_price:
+                final_sku_price = extract_pdp_body_price(self.page, item)
+                if final_sku_price:
+                    final_sku_price_source = 'pdp_body_price'
+
+            if not final_sku_price_source:
+                try:
+                    (
+                        final_sku_price,
+                        used_cart_price,
+                        cart_price_source,
+                        tree,
+                        cart_price_resolution,
+                    ) = self.resolve_hidden_price_from_cart(
+                        tree,
+                        item,
+                        product_url,
+                        final_sku_price,
                     )
-            except CartPriceParseError as exc:
-                print(
-                    f"  [WARNING] Exact cart price rejected: "
-                    f"item={item}, reason={exc}"
-                )
+                    if used_cart_price:
+                        final_sku_price_source = cart_price_source
+                        self._record_cart_price_resolution(cart_price_resolution)
+                        print(
+                            f"  [CART PRICE] Hidden PDP resolved: "
+                            f"item={item}, price={final_sku_price}, "
+                            f"source={cart_price_source}"
+                        )
+                except CartPriceParseError as exc:
+                    print(
+                        f"  [WARNING] Exact cart price rejected: "
+                        f"item={item}, reason={exc}"
+                    )
 
             # 장바구니 확인 후 복원된 PDP DOM을 기준으로 리뷰 섹션을 판단한다.
             review_link_xpath = self.xpaths.get('review_link', {}).get('xpath')
@@ -1331,7 +1374,8 @@ class AmazonTVDetailCrawler(AmazonBaseCrawler):
             
             # 타임아웃/리다이렉트/복구 실패는 run()의 전용 분기에서 처리한다.
             if (
-                "timeout" in error_msg
+                isinstance(e, (BrowserConnectError, ContextLostError, PageDisconnectedError, TimeoutError))
+                or "timeout" in error_msg
                 or "time out" in error_msg
                 or "redirect detected" in error_msg
                 or "amazon recovery unresolved" in error_msg

@@ -44,11 +44,17 @@ from common.setup import setup_environment
 setup_environment(__file__)
 
 from common.walmart_base import WalmartBaseCrawler
+from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
 from walmart.tv.wmart_tv_next_data import (
     WalmartNextDataClient,
+    WALMART_ZIP,
     build_listing_url,
+    extract_next_data,
+    has_listing_products,
+    listing_page_matches,
     parse_listing_card_element,
     parse_listing_products,
+    response_zip,
 )
 
 
@@ -57,7 +63,7 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
     Walmart TV Main 페이지 크롤러 (DrissionPage 기반)
     """
 
-    def __init__(self, test_mode=True, batch_id=None):
+    def __init__(self, test_mode=True, batch_id=None, listing_browser_first=False):
         """초기화. test_mode: 테스트(True)/운영 모드(False), batch_id: 통합 크롤러에서 전달"""
         super().__init__()
         self.test_mode = test_mode
@@ -70,6 +76,8 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
         self.url_template = None
         self.next_data_client = WalmartNextDataClient()
         self._last_listing_source = None
+        self.listing_browser_first = listing_browser_first
+        self._owned_listing_renderer = None
         
         # DrissionPage 객체 (setup_browser() 호출 후 채워짐)
         self.page = None
@@ -113,7 +121,7 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             while total_products < target_products and page_num <= self.max_pages:
                 products = self.crawl_page(page_num)
 
-                if not products:
+                if not products and self.next_data_client.renderer is None:
                     page_url = self.url_template.replace('{page}', str(page_num))
 
                     for restart_count in range(1, 2):
@@ -127,7 +135,9 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
 
                 if not products:
                     print(f"[ERROR] No products found at page {page_num}")
-                    return False
+                    if not total_products:
+                        return False
+                    break
                 else:
                     saved_count = self.save_products(products)
                     self.stats['saved'] += saved_count
@@ -137,18 +147,24 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                         break
 
                 # Restart browser only when browser fallback was actually opened.
-                if self.page and page_num % self.browser_restart_interval == 0 and page_num < self.max_pages:
+                if (self.page and self.next_data_client.renderer is None
+                        and page_num % self.browser_restart_interval == 0 and page_num < self.max_pages):
                     print(f"[INFO] Page {page_num} completed, restarting browser...")
                     if not self.restart_browser():
-                        print("[ERROR] Browser restart failed; aborting listing to avoid partial pipeline execution")
-                        return False
+                        print("[ERROR] Browser restart failed")
+                        if not total_products:
+                            return False
+                        break
                     time.sleep(random.uniform(5, 8))
 
                 wait_range = (8, 12) if self._last_listing_source == 'browser' else (0.5, 1.5)
                 time.sleep(random.uniform(*wait_range))
                 page_num += 1
 
-            print(f"[DONE] Page: {page_num}, Saved: {total_products}, batch_id: {self.batch_id}")
+            print(f"[LISTING SAVE RESULT] Page: {page_num}, Saved: {total_products}, batch_id: {self.batch_id}")
+            if total_products < target_products:
+                print(f"[INCOMPLETE] Listing quota: saved={total_products} target={target_products}")
+                self.stats['quota_met'] = False
             return True
 
         except Exception as e:
@@ -176,6 +192,9 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                     self.page.quit()
                 except:
                     pass
+            if self._owned_listing_renderer is not None:
+                self._owned_listing_renderer.close()
+                self._owned_listing_renderer = None
             if self.db_conn:
                 self.db_conn.close()
 
@@ -201,8 +220,10 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             print(f"[ERROR] Initialize failed: URL template load failed (account={self.account_name}, page_type={self.page_type})")
             return False
 
-        # 5. NextData HTTP client ready. Browser opens only as lazy fallback.
-        self.next_data_client = WalmartNextDataClient()
+        renderer = getattr(self, '_integrated_renderer', None)
+        if renderer is None and not self.listing_browser_first:
+            renderer = self._owned_listing_renderer = WalmartTVBrowserRenderer(setup_zip=False, retry_once=True)
+        self.next_data_client = WalmartNextDataClient(direct_enabled=renderer is None, renderer=renderer)
         self.skip_walmart_search = True
 
         # 6. calendar_week/log cleanup
@@ -222,18 +243,22 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
         self.initialize_session()
         return True
 
-    def crawl_page_direct(self, page_number):
+    def crawl_page_direct(self, page_number, client=None, use_zenrows=True):
         url = build_listing_url(self.url_template, page_number, self.page_type)
-        result = self.next_data_client.fetch_next_data(
+        result = (client or self.next_data_client).fetch_next_data(
             url,
             direct_retries=1,
-            use_zenrows=True,
+            use_zenrows=use_zenrows,
             js_render_fallback=True,
+            accept_response=lambda data: has_listing_products(data, page_number),
         )
         attempts = result.get('attempts') or []
+        self._listing_browser_blocked = any(
+            item.get('source') == 'browser_render' and item.get('blocked') for item in attempts
+        )
         if attempts:
             summary = ' -> '.join(
-                f"{item.get('source')}:{item.get('status')}/blocked={item.get('blocked')}"
+                f"{item.get('source')}:{item.get('status')}/blocked={item.get('blocked')}/elapsed={item.get('elapsed_sec')}/error={item.get('error_class') or ('reported' if item.get('error') else None)}"
                 for item in attempts
             )
             print(f"[NEXT_DATA] Page {page_number}: {summary}")
@@ -260,13 +285,40 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
         return products
 
     def crawl_page(self, page_number):
-        """페이지 크롤링: 페이지 로드 → CAPTCHA 처리 → 스크롤 → HTML 파싱(40개 검증) → 제품 데이터 추출"""
-        try:
-            direct_products = self.crawl_page_direct(page_number)
-            if direct_products is not None:
-                return direct_products
+        if getattr(getattr(self, 'next_data_client', None), 'renderer', None) is not None:
+            products = self.crawl_page_direct(page_number)
+            if products or self._listing_browser_blocked:
+                return products
+            try:
+                return self.crawl_page_browser(page_number)
+            except Exception:
+                return None  # crawl_page_browser already logs the page failure.
+        if not self.listing_browser_first:
+            products = self.crawl_page_direct(page_number)
+            return products if products is not None else self.crawl_page_browser(page_number)
 
-            self._last_listing_source = 'browser'
+        routes = (
+            ('http', lambda: self.crawl_page_direct(page_number, use_zenrows=False)),
+            ('browser', lambda: self.crawl_page_browser(page_number)),
+            ('zenrows', lambda: self.crawl_page_direct(
+                page_number, client=WalmartNextDataClient(direct_enabled=False))),
+        )
+        for route, fetch in routes:
+            started = time.monotonic()
+            try:
+                products = fetch()
+                outcome = 'success' if products else 'empty or invalid'
+            except Exception as exc:
+                products = None
+                outcome = type(exc).__name__
+            print(f"[LISTING] Page {page_number}: route={route} elapsed={time.monotonic() - started:.2f}s result={outcome}")
+            if products:
+                return products
+        raise RuntimeError(f"Page {page_number}: all listing routes failed")
+
+    def crawl_page_browser(self, page_number):
+        """Collect a page using the existing browser flow."""
+        try:
             if self.page is None and not self.ensure_browser_ready():
                 raise RuntimeError("Browser page is not initialized")
 
@@ -290,6 +342,15 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             self.handle_captcha()
             time.sleep(random.uniform(3, 5))
 
+            next_data = extract_next_data(self.page.html)
+            if not listing_page_matches(next_data, page_number, self.page.url):
+                raise RuntimeError(f"Page {page_number}: browser returned a different listing page")
+            actual_zip = response_zip(next_data)
+            if actual_zip != WALMART_ZIP:
+                print(f"[LOCATION WARNING] Walmart browser: expected ZIP {WALMART_ZIP}, observed {actual_zip or 'unknown'}; continuing")
+            else:
+                print(f"[LOCATION] Walmart browser: ZIP {WALMART_ZIP} confirmed")
+
             # 40개 검증 (최대 3회 재시도: 파싱 → 부족하면 스크롤 → 재파싱)
             expected_products = 40
             base_containers = self.find_product_containers(base_container_xpath, page_number, expected_products)
@@ -308,6 +369,7 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
             print(f"[INFO] Page {page_number}: {len(base_containers)} products found")
 
             products = []
+            failed_cards = []
             for idx, item in enumerate(base_containers, 1):
                 try:
                     card_data = parse_listing_card_element(item)
@@ -325,16 +387,18 @@ class WalmartTVMainCrawler(WalmartBaseCrawler):
                     products.append(product_data)
 
                 except Exception as e:
-                    print(f"[ERROR] Product {idx} extract failed: {e}")
-                    traceback.print_exc()
-                    raise
+                    print(f"[ERROR] Page {page_number} product {idx} extract failed: {type(e).__name__}")
+                    failed_cards.append(idx)
 
+            if failed_cards:
+                raise RuntimeError(f"Page {page_number}: card extraction failed at positions {failed_cards}")
             print(f"[INFO] Page {page_number}: {len(products)} products")
+            if products:
+                self._last_listing_source = 'browser'
             return products
 
         except Exception as e:
-            print(f"[ERROR] Page {page_number} failed: {e}")
-            traceback.print_exc()
+            print(f"[ERROR] Page {page_number} browser failed: {type(e).__name__}")
             raise
 
     def save_products(self, products):

@@ -35,11 +35,15 @@ python wmart_tv_crawl.py --resume-from bsr --batch-id w_20250123_143045
 import sys
 import os
 import argparse
+import errno
 import traceback
 import time
 import re
 import smtplib
+from contextlib import contextmanager
 from email.message import EmailMessage
+from pathlib import Path
+from tempfile import gettempdir
 from datetime import datetime
 import pytz
 
@@ -58,6 +62,7 @@ setup_environment(__file__)
 from walmart.tv.wmart_tv_main import WalmartTVMainCrawler
 from walmart.tv.wmart_tv_bsr import WalmartTVBSRCrawler
 from walmart.tv.wmart_tv_dt import WalmartTVDetailCrawler
+from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
 from common.base_crawler import BaseCrawler
 from common.alert_hhp_monitor import format_elapsed_time
 from config import EMAIL_CONFIG
@@ -175,8 +180,12 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
     unsaved_records = max(target_records - saved_records, 0)
     missing_detail_records = max(target_records - detail_records, 0)
     detail_blocked = missing_detail_records > 0
+    listing_shortfall = [
+        name.upper() for name, result in (('main', main_result), ('bsr', bsr_result))
+        if isinstance(result, dict) and result.get('partial')
+    ]
     has_warning = bool(
-        redirects or run_errors or review_mismatches or detail_blocked or file_pending
+        redirects or run_errors or review_mismatches or detail_blocked or file_pending or listing_shortfall
     )
     severity = 'sos' if has_sos else ('warning' if has_warning else 'ok')
 
@@ -200,6 +209,8 @@ def build_walmart_tv_email_report(crawl_results, detail_report, log_file, elapse
         lines.append(f'- 치명적 실행 오류 / fatal error: {error_message}')
     if failed_stages:
         lines.append(f"- 실패 단계 / failed stages: {', '.join(failed_stages)}")
+    if listing_shortfall:
+        lines.append(f"- 목록 목표 수량 미달 / listing quota not reached: {', '.join(listing_shortfall)}")
     if file_pending:
         lines.append(f'- DB 적재 성공·복구 파일 정리 필요: {file_pending}건 (상품 미적재 건수와 별도)')
     if detail_blocked:
@@ -324,6 +335,7 @@ class WalmartTVIntegratedCrawler:
         print("Walmart TV Integrated Crawler (Production)")
         print("="*60)
         print(f"batch_id: {self.batch_id}")
+        print(f"[BATCH START] batch={self.batch_id} pid={os.getpid()} at={self.start_time_kst.isoformat(timespec='seconds')}")
         if log_file:
             print(f"log_file: {log_file}")
         if self.resume_from:
@@ -331,26 +343,40 @@ class WalmartTVIntegratedCrawler:
 
         crawl_results = {'main': None, 'bsr': None, 'detail': None}
         detail_report = None
+        detail_crawler = None
+        renderer = WalmartTVBrowserRenderer(
+            setup_zip=False, retry_once=True, summarize_location=True, capture_similar=True,
+        )
+        batch_status = 'failed'
 
         try:
             # 결과: {'stage': {'success': bool, 'duration': float}} 형태로 저장
             # STEP 1: Main
             if not self.resume_from or self.resume_from == 'main':
                 print(f"\n[STEP 1/3] Main Crawler...")
-                stage_start = time.time()
+                print(f"[STAGE START] stage=main at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}")
+                stage_start = time.monotonic()
                 try:
                     main_crawler = WalmartTVMainCrawler(test_mode=False, batch_id=self.batch_id)
+                    main_crawler._integrated_renderer = renderer
                     success = main_crawler.run()
                     crawl_results['main'] = {
                         'success': success,
-                        'duration': time.time() - stage_start,
+                        'partial': success and main_crawler.stats.get('quota_met') is False,
+                        'duration': time.monotonic() - stage_start,
                         'records': main_crawler.stats.get('saved', 0),
                         'stats': dict(main_crawler.stats),
                     }
                 except Exception as e:
                     print(f"[ERROR] Main: {e}")
                     traceback.print_exc()
-                    crawl_results['main'] = {'success': False, 'duration': time.time() - stage_start}
+                    crawl_results['main'] = {'success': False, 'duration': time.monotonic() - stage_start}
+                result = crawl_results['main']
+                print(
+                    f"[STAGE END] stage=main ok={result['success']} partial={result.get('partial', False)} "
+                    f"rows={result.get('records', 0)} elapsed_s={result['duration']:.1f} "
+                    f"at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}"
+                )
             else:
                 crawl_results['main'] = 'skipped'
 
@@ -362,20 +388,29 @@ class WalmartTVIntegratedCrawler:
             # STEP 2: BSR
             if (not self.resume_from or self.resume_from in ['main', 'bsr']) and main_ok:
                 print(f"\n[STEP 2/3] BSR Crawler...")
-                stage_start = time.time()
+                print(f"[STAGE START] stage=bsr at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}")
+                stage_start = time.monotonic()
                 try:
                     bsr_crawler = WalmartTVBSRCrawler(test_mode=False, batch_id=self.batch_id)
+                    bsr_crawler._integrated_renderer = renderer
                     success = bsr_crawler.run()
                     crawl_results['bsr'] = {
                         'success': success,
-                        'duration': time.time() - stage_start,
+                        'partial': success and bsr_crawler.stats.get('quota_met') is False,
+                        'duration': time.monotonic() - stage_start,
                         'records': bsr_crawler.stats.get('updated', 0) + bsr_crawler.stats.get('inserted', 0),
                         'stats': dict(bsr_crawler.stats),
                     }
                 except Exception as e:
                     print(f"[ERROR] BSR: {e}")
                     traceback.print_exc()
-                    crawl_results['bsr'] = {'success': False, 'duration': time.time() - stage_start}
+                    crawl_results['bsr'] = {'success': False, 'duration': time.monotonic() - stage_start}
+                result = crawl_results['bsr']
+                print(
+                    f"[STAGE END] stage=bsr ok={result['success']} partial={result.get('partial', False)} "
+                    f"rows={result.get('records', 0)} elapsed_s={result['duration']:.1f} "
+                    f"at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}"
+                )
             else:
                 if not main_ok:
                     print(f"\n[STEP 2/3] BSR Crawler - Main 실패로 SKIP")
@@ -389,21 +424,35 @@ class WalmartTVIntegratedCrawler:
             # STEP 3: Detail
             if main_ok and bsr_ok:
                 print(f"\n[STEP 3/3] Detail Crawler...")
-                stage_start = time.time()
+                print(f"[STAGE START] stage=detail at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}")
+                stage_start = time.monotonic()
                 try:
                     detail_crawler = WalmartTVDetailCrawler(batch_id=self.batch_id, test_mode=False)
+                    detail_crawler._browser_renderer = renderer
                     success = detail_crawler.run()
                     detail_report = dict(detail_crawler.detail_report)
+                    partial = (
+                        not success
+                        and detail_report.get('all_targets_processed')
+                        and detail_report.get('saved_records', 0) > 0
+                    )
                     crawl_results['detail'] = {
-                        'success': success,
-                        'duration': time.time() - stage_start,
+                        'success': bool(success or partial),
+                        'partial': bool(partial),
+                        'duration': time.monotonic() - stage_start,
                         'records': detail_report.get('saved_records', 0),
                         'stats': detail_report,
                     }
                 except Exception as e:
                     print(f"[ERROR] Detail: {e}")
                     traceback.print_exc()
-                    crawl_results['detail'] = {'success': False, 'duration': time.time() - stage_start}
+                    crawl_results['detail'] = {'success': False, 'duration': time.monotonic() - stage_start}
+                result = crawl_results['detail']
+                print(
+                    f"[STAGE END] stage=detail ok={result['success']} partial={result.get('partial', False)} "
+                    f"rows={result.get('records', 0)} elapsed_s={result['duration']:.1f} "
+                    f"at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}"
+                )
             else:
                 if not main_ok:
                     print(f"\n[STEP 3/3] Detail Crawler - Main 실패로 SKIP")
@@ -416,12 +465,12 @@ class WalmartTVIntegratedCrawler:
             elapsed = (self.end_time - self.start_time_server).total_seconds()
 
             print("\n" + "="*60)
-            print(f"완료 ({elapsed/60:.1f}분)")
+            print(f"수집·적재 단계 결과 ({elapsed/60:.1f}분)")
             for step, result in crawl_results.items():
                 if result == 'skipped':
                     status = "SKIP"
                 elif isinstance(result, dict):
-                    status = "OK" if result.get('success') else "FAIL"
+                    status = "PARTIAL" if result.get('partial') else "OK" if result.get('success') else "FAIL"
                 else:
                     status = "FAIL"
                 print(f"  {step}: {status}")
@@ -446,10 +495,19 @@ class WalmartTVIntegratedCrawler:
                 subject = 'WARNING ' + subject
             send_walmart_tv_email_report(subject, body)
 
-            # 로깅 종료
-            self.base_crawler.stop_logging()
+            if failed_stages:
+                return False
+            batch_status = 'partial' if any(
+                isinstance(result, dict) and result.get('partial')
+                for result in crawl_results.values()
+            ) else 'ok'
+            return True
 
-            return len(failed_stages) == 0
+        except KeyboardInterrupt:
+            batch_status = 'interrupted'
+            if detail_crawler is not None:
+                detail_report = detail_crawler.detail_report
+            raise
 
         except Exception as e:
             print(f"\n[ERROR] Integrated crawler failed: {e}")
@@ -473,9 +531,40 @@ class WalmartTVIntegratedCrawler:
                 subject = 'WARNING ' + subject
             send_walmart_tv_email_report(subject, body)
 
-            # 예외 발생 시에도 로깅 종료
-            self.base_crawler.stop_logging()
             return False
+        finally:
+            renderer.close()
+            renderer.print_location_summary()
+            detail = detail_report or {}
+            print(
+                f"[BATCH END] batch={self.batch_id} pid={os.getpid()} status={batch_status} "
+                f"detail_target={detail.get('target_records', 0)} "
+                f"detail_saved={detail.get('saved_records', 0)} "
+                f"detail_verified={detail.get('detail_records', 0)} "
+                f"at={datetime.now(self.korea_tz).isoformat(timespec='seconds')}",
+                flush=True,
+            )
+            self.base_crawler.stop_logging()
+
+
+@contextmanager
+def batch_lock(path):
+    """Keep one integrated Walmart TV process active per scheduler account."""
+    with path.open('a+b') as lock_file:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            yield False
+            return
+        yield True
 
 
 def main():
@@ -489,8 +578,15 @@ def main():
         print("[ERROR] --batch-id is required when using --resume-from")
         exit(1)
 
-    crawler = WalmartTVIntegratedCrawler(resume_from=args.resume_from, batch_id=args.batch_id)
-    success = crawler.run()
+    with batch_lock(Path(gettempdir()) / 'samsung-dx-sea-walmart-tv.lock') as acquired:
+        if not acquired:
+            print(f"[BATCH SKIP] reason=already_running pid={os.getpid()}", flush=True)
+            raise SystemExit(75)
+        crawler = WalmartTVIntegratedCrawler(resume_from=args.resume_from, batch_id=args.batch_id)
+        try:
+            success = crawler.run()
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
     exit(0 if success else 1)
 
 
