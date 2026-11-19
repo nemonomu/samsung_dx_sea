@@ -7,6 +7,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from walmart.tv.wmart_tv_next_data import WalmartNextDataClient, extract_next_data
 from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
 
 URL = 'https://www.walmart.com/ip/example/123?classType=REGULAR'
@@ -521,6 +522,87 @@ class RenderTests(unittest.TestCase):
                 self.assertEqual(meta['browser_backend'], 'chrome')
                 self.assertEqual(drission.latest_tab.urls, [URL])
                 fallback.assert_called_once_with()
+
+    def test_five_product_failures_promote_browser_on_next_product_only(self):
+        uc_page = Page([''])
+        chrome_page = Page([''])
+        edge_page = Page([''])
+        renderer = WalmartTVBrowserRenderer(setup_zip=False)
+
+        def launch(edge_path=None):
+            renderer._browser_backend = 'edge' if edge_path else 'chrome'
+            return Browser(edge_page if edge_path else chrome_page)
+
+        failed = ('', None, 'explicit_block')
+        review = 'https://www.walmart.com/reviews/product/101'
+        with (
+            patch('amazon.tv.uc_page.make_uc_driver'),
+            patch('amazon.tv.uc_page.UCPage', return_value=uc_page),
+            patch.object(renderer, '_launch_browser', side_effect=launch),
+            patch.object(renderer, '_edge_path', return_value=Path('msedge.exe')),
+            patch.object(renderer, '_read_browser', return_value=failed) as read,
+        ):
+            def fetch(item, **kwargs):
+                return renderer.fetch_html(f'https://www.walmart.com/ip/{item}', **kwargs)[0]['browser_backend']
+
+            for item in range(91, 95):
+                self.assertEqual(fetch(item), 'uc')
+            accepted = html(item='95')
+            read.return_value = (accepted, extract_next_data(accepted), None)
+            self.assertEqual(fetch(95), 'uc')
+            read.return_value = failed
+
+            for item in range(101, 105):
+                self.assertEqual(fetch(item), 'uc')
+            self.assertEqual(fetch(104), 'uc')  # Alternate request for the same item.
+            self.assertEqual(renderer.fetch_html(review)[0]['browser_backend'], 'uc')
+            self.assertEqual(fetch(105), 'uc')
+            self.assertEqual(fetch(105), 'uc')
+            self.assertEqual(fetch(106), 'chrome')
+            for item in range(107, 111):
+                self.assertEqual(fetch(item), 'chrome')
+            self.assertEqual(fetch(111), 'edge')
+            self.assertEqual(fetch(112), 'edge')
+
+            client = WalmartNextDataClient(renderer=renderer, direct_enabled=False)
+            url = 'https://www.walmart.com/ip/113'
+            with patch.object(client, 'fetch_zenrows_html',
+                              return_value=({'status': 200}, html(item='113'))) as provider:
+                result = client.fetch_next_data(url)
+            self.assertEqual(result['attempts'][0]['browser_backend'], 'edge')
+            self.assertEqual(result['source'], 'zenrows_static')
+            provider.assert_called_once_with(url, js_render=False)
+
+    def test_unavailable_edge_preserves_working_chrome_and_provider_order(self):
+        for edge_path in (None, Path('msedge.exe')):
+            with self.subTest(edge_path=edge_path):
+                chrome = Browser(Page(['']))
+                renderer = WalmartTVBrowserRenderer(setup_zip=False)
+                renderer._browser = chrome
+                renderer._browser_backend = 'chrome'
+                next_chrome = Browser(Page(['']))
+
+                def launch(path=None):
+                    if path:
+                        raise OSError('Edge startup failed')
+                    renderer._browser_backend = 'chrome'
+                    return next_chrome
+
+                with (
+                    patch.object(renderer, '_edge_path', return_value=edge_path),
+                    patch.object(renderer, '_launch_browser', side_effect=launch) as start,
+                    patch.object(renderer, '_read_browser', return_value=('', None, 'explicit_block')),
+                ):
+                    for item in range(101, 107):
+                        meta, _ = renderer.fetch_html(f'https://www.walmart.com/ip/{item}')
+                        self.assertEqual(meta['browser_backend'], 'chrome')
+
+                if edge_path is None:
+                    start.assert_not_called()
+                    self.assertIs(renderer._browser, chrome)
+                else:
+                    self.assertEqual(start.call_count, 2)
+                    self.assertIs(renderer._browser, next_chrome)
 
     def test_uc_explicit_block_preserves_block_result(self):
         renderer = WalmartTVBrowserRenderer(retry_once=True)

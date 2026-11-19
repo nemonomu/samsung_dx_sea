@@ -16,6 +16,9 @@ from walmart.tv.wmart_tv_next_data import (
 )
 
 
+DETAIL_BROWSER_FAILURE_LIMIT = 5
+
+
 class WalmartTVBrowserRenderer:
     def __init__(self, *, setup_zip=True, retry_once=False, summarize_location=False, capture_similar=False):
         self._setup_zip = setup_zip
@@ -30,6 +33,10 @@ class WalmartTVBrowserRenderer:
         self._zip_attempted = False
         self._location_verified = False
         self._last_navigation = None
+        # The shared browser lock also orders results from concurrent detail workers.
+        self._detail_failure_backend = None
+        self._detail_failed_items = set()
+        self._preferred_detail_backend = None
 
     def record_location(self, meta, route):
         if self._location_counts is None:
@@ -71,6 +78,19 @@ class WalmartTVBrowserRenderer:
         return browser
 
     def _open_browser(self):
+        if self._preferred_detail_backend == 'edge':
+            from DrissionPage.errors import BrowserConnectError
+
+            edge_path = self._edge_path()
+            if edge_path is not None:
+                try:
+                    return self._launch_browser(edge_path)
+                except (BrowserConnectError, OSError) as error:
+                    print(f'[BROWSER FALLBACK] Edge startup error={type(error).__name__}; starting Chrome')
+            self._preferred_detail_backend = 'chrome'
+            return self._launch_browser()
+        if self._preferred_detail_backend == 'chrome':
+            return self._open_drission_browser()
         try:
             from amazon.tv.uc_page import UCPage, make_uc_driver
 
@@ -292,17 +312,52 @@ class WalmartTVBrowserRenderer:
             if is_blocked_html(body, current_url) or not self._valid(url, data, current_url):
                 return None
 
+    def _prefer_detail_backup(self, item):
+        if (
+            not item or item in self._detail_failed_items
+            or len(self._detail_failed_items) < DETAIL_BROWSER_FAILURE_LIMIT
+        ):
+            return
+        backend = self._detail_failure_backend
+        backup = 'chrome' if backend == 'uc' else 'edge'
+        if self._browser_backend == 'edge':
+            backup = 'edge'
+        if backup == 'edge' and self._edge_path() is None:
+            return
+        self._detail_failed_items.clear()
+        self._preferred_detail_backend = backup
+        if self._browser_backend != backup:
+            self._close_browser()
+        print(
+            f'[DETAIL BROWSER FAILOVER] backend={backend} consecutive_failures='
+            f'{DETAIL_BROWSER_FAILURE_LIMIT} next={backup} item={item}',
+            flush=True,
+        )
+
+    def _record_detail_browser_result(self, item, backend, success):
+        if backend != self._detail_failure_backend or success:
+            self._detail_failed_items.clear()
+        self._detail_failure_backend = backend
+        if (
+            not success and backend in ('uc', 'chrome')
+            and len(self._detail_failed_items) < DETAIL_BROWSER_FAILURE_LIMIT
+        ):
+            self._detail_failed_items.add(item)
+
     def fetch_html(self, url, wait_for_similar=False):
+        path = urlparse(url).path
+        detail_item = item_id_from_url(url) if path.startswith('/ip/') and not wait_for_similar else None
         with self._lock:
             meta = {'source': 'browser_render', 'status': None, 'content_valid': False,
                     'blocked': False, 'error': None, 'location_verified': False,
                     'location_zip': None}
             try:
+                self._prefer_detail_backup(detail_item)
                 if self._browser is None:
                     self._browser = self._open_browser()
                     self._page = (self._browser if self._browser_backend == 'uc'
                                   else self._browser.latest_tab)
-                is_review = urlparse(url).path.startswith('/reviews/')
+                is_review = path.startswith('/reviews/')
                 reuse = False
                 if wait_for_similar and self._page.url == url:
                     current = self._page.html or ''
@@ -376,10 +431,15 @@ class WalmartTVBrowserRenderer:
                     meta['location_warning'] = 'browser ZIP 11581 not verified; keeping collected data'
                 return meta, body
             except Exception as exc:
+                meta['browser_backend'] = self._browser_backend
                 meta['error'] = type(exc).__name__
                 meta['error_class'] = type(exc).__name__
                 self._close_browser()
                 return meta, ''
+            finally:
+                backend = meta.get('browser_backend')
+                if detail_item and backend:
+                    self._record_detail_browser_result(detail_item, backend, meta['content_valid'])
 
     def _close_browser(self):
         browser, self._browser, self._page = self._browser, None, None
