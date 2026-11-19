@@ -29,6 +29,7 @@ import re
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -993,6 +994,18 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if examples:
             print(f"[INFO] {label} examples: {' | '.join(examples)}")
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _detail_executor(workers):
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            yield executor
+        except KeyboardInterrupt:
+            print('[DETAIL INTERRUPT] Cancelling queued products; waiting for active workers', flush=True)
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def _collect_detail_initial_parallel(self, indexed_products, *, on_result=None):
         if not indexed_products:
             return {}, {}, {}
@@ -1009,7 +1022,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             f"{len(indexed_products)} products, workers={workers}"
         )
         started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with self._detail_executor(workers) as executor:
             future_map = {
                 executor.submit(self._crawl_detail_next_data_worker, index, product, mst_specs): (index, product)
                 for index, product in indexed_products
@@ -1121,7 +1134,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 f"products={round_size}, workers={workers}"
             )
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            with self._detail_executor(workers) as executor:
                 future_map = {
                     executor.submit(
                         self._crawl_detail_next_data_worker,

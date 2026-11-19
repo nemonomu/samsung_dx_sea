@@ -457,6 +457,18 @@ class ZenRowsRecoveryTests(unittest.TestCase):
 
 
 class DetailRunFlowTests(unittest.TestCase):
+    def test_interrupted_initial_pass_cancels_queued_detail_work(self):
+        crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
+        crawler.detail_next_data_workers = 1
+        crawler.load_mst_specs_cache = unittest.mock.Mock(return_value={})
+        with (
+            patch('walmart.tv.wmart_tv_dt.ThreadPoolExecutor') as pool,
+            patch('walmart.tv.wmart_tv_dt.as_completed', side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            crawler._collect_detail_initial_parallel([(1, {}), (2, {})])
+        pool.return_value.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
     def test_initialize_does_not_require_xpath_or_browser(self):
         crawler = bare_crawler()
         crawler.batch_id = 'w_test'
