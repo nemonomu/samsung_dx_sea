@@ -1,4 +1,5 @@
 """Shared Walmart browser transport for listings, detail and reviews."""
+from collections import Counter
 import os
 from pathlib import Path
 import random
@@ -16,9 +17,11 @@ from walmart.tv.wmart_tv_next_data import (
 
 
 class WalmartTVBrowserRenderer:
-    def __init__(self, *, setup_zip=True, retry_once=False):
+    def __init__(self, *, setup_zip=True, retry_once=False, summarize_location=False, capture_similar=False):
         self._setup_zip = setup_zip
         self._retry_once = retry_once
+        self._capture_similar = capture_similar
+        self._location_counts = Counter() if summarize_location else None
         self._lock = threading.Lock()
         self._browser = None
         self._browser_backend = None
@@ -27,6 +30,21 @@ class WalmartTVBrowserRenderer:
         self._zip_attempted = False
         self._location_verified = False
         self._last_navigation = None
+
+    def record_location(self, meta, route):
+        if self._location_counts is None:
+            return False
+        observed = meta.get('location_zip') or 'unknown'
+        verified = bool(meta.get('location_verified'))
+        with self._lock:
+            self._location_counts[(route, observed, verified)] += 1
+        return True
+
+    def print_location_summary(self):
+        if self._location_counts:
+            print('[LOCATION SUMMARY] Walmart expected ZIP 11581; accepted responses by route')
+            for (route, observed, verified), count in sorted(self._location_counts.items()):
+                print(f'  source={route} observed={observed} verified={verified} responses={count}')
 
     @staticmethod
     def _edge_path():
@@ -256,6 +274,24 @@ class WalmartTVBrowserRenderer:
             raise connection_error
         return body, data, block_reason
 
+    def _capture_similar_names(self, url, body, data):
+        item = item_id_from_url(url)
+        deadline = time.monotonic() + 7
+        while True:
+            names = (
+                parse_similar_product_names_from_html(body)
+                or parse_similar_product_names(data, current_item=item)
+            )
+            remaining = deadline - time.monotonic()
+            if names or remaining <= 0:
+                return names
+            time.sleep(min(1, remaining))
+            body = self._page.html or ''
+            current_url = self._page.url
+            data = extract_next_data(body)
+            if is_blocked_html(body, current_url) or not self._valid(url, data, current_url):
+                return None
+
     def fetch_html(self, url, wait_for_similar=False):
         with self._lock:
             meta = {'source': 'browser_render', 'status': None, 'content_valid': False,
@@ -310,7 +346,8 @@ class WalmartTVBrowserRenderer:
                     self._location_verified = False
                 if not self._location_verified:
                     meta['location_warning'] = 'browser ZIP 11581 not verified; keeping collected data'
-                    print('[LOCATION WARNING] Browser ZIP 11581 not verified; keeping collected data')
+                    if self._location_counts is None:
+                        print('[LOCATION WARNING] Browser ZIP 11581 not verified; keeping collected data')
 
                 if wait_for_similar:
                     deadline = time.monotonic() + 5
@@ -327,6 +364,11 @@ class WalmartTVBrowserRenderer:
                             return meta, ''
                         body, data = candidate, candidate_data
                         self._location_verified = bool(_response_location_confirmed(url, data))
+                if self._capture_similar and not wait_for_similar and urlparse(url).path.startswith('/ip/'):
+                    try:
+                        meta['similar_names'] = self._capture_similar_names(url, body, data)
+                    except Exception as exc:
+                        print(f'[SIMILAR SKIP] error={type(exc).__name__}; keeping validated detail')
                 meta['content_valid'] = True
                 meta['location_zip'] = response_zip(data) or ('11581' if self._location_verified else None)
                 meta['location_verified'] = self._location_verified

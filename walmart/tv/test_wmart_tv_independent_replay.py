@@ -36,7 +36,6 @@ class SavedPageReplayTests(unittest.TestCase):
         crawler.extract_sku = Mock(return_value=(None, None, None, None, None))
         crawler.extract_screen_size = Mock(return_value=(None, None, None, None))
         crawler.extract_model_year = Mock(return_value=None)
-        crawler._fill_similar_from_json_response = Mock()
         def reviews(item, count, inline, product, star_rating=None, count_of_star_ratings=None, **kwargs):
             return None, {'count_of_reviews': count, 'star_rating': star_rating,
                           'count_of_star_ratings': count_of_star_ratings}, False

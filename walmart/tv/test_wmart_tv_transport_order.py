@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import unittest
 from unittest.mock import Mock, patch
@@ -130,6 +132,23 @@ class TransportOrderTests(unittest.TestCase):
         self.assertEqual(result['source'], 'browser_render')
         self.assertIs(result['meta']['location_verified'], False)
         self.assertEqual(order, ['html', 'render'])
+
+    def test_batch_location_summary_replaces_repeated_response_warnings(self):
+        from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
+
+        renderer = WalmartTVBrowserRenderer(summarize_location=True)
+        renderer.fetch_html = Mock(return_value=(
+            {'content_valid': True, 'location_zip': '95829', 'location_verified': False},
+            page(),
+        ))
+        client = WalmartNextDataClient(direct_enabled=False, renderer=renderer)
+        output = StringIO()
+        with redirect_stdout(output):
+            for _ in range(2):
+                self.assertEqual(client.fetch_next_data(URL)['source'], 'browser_render')
+            renderer.print_location_summary()
+        self.assertNotIn('[LOCATION WARNING]', output.getvalue())
+        self.assertIn('source=browser_render observed=95829 verified=False responses=2', output.getvalue())
 
     def test_all_sources_fail_and_next_product_still_runs(self):
         client, _, order = self.make_client(direct(), rendered())

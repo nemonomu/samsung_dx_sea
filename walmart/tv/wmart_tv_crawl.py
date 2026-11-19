@@ -343,7 +343,10 @@ class WalmartTVIntegratedCrawler:
 
         crawl_results = {'main': None, 'bsr': None, 'detail': None}
         detail_report = None
-        renderer = WalmartTVBrowserRenderer(setup_zip=False, retry_once=True)
+        detail_crawler = None
+        renderer = WalmartTVBrowserRenderer(
+            setup_zip=False, retry_once=True, summarize_location=True, capture_similar=True,
+        )
         batch_status = 'failed'
 
         try:
@@ -500,6 +503,12 @@ class WalmartTVIntegratedCrawler:
             ) else 'ok'
             return True
 
+        except KeyboardInterrupt:
+            batch_status = 'interrupted'
+            if detail_crawler is not None:
+                detail_report = detail_crawler.detail_report
+            raise
+
         except Exception as e:
             print(f"\n[ERROR] Integrated crawler failed: {e}")
             traceback.print_exc()
@@ -525,6 +534,7 @@ class WalmartTVIntegratedCrawler:
             return False
         finally:
             renderer.close()
+            renderer.print_location_summary()
             detail = detail_report or {}
             print(
                 f"[BATCH END] batch={self.batch_id} pid={os.getpid()} status={batch_status} "
@@ -573,7 +583,10 @@ def main():
             print(f"[BATCH SKIP] reason=already_running pid={os.getpid()}", flush=True)
             raise SystemExit(75)
         crawler = WalmartTVIntegratedCrawler(resume_from=args.resume_from, batch_id=args.batch_id)
-        success = crawler.run()
+        try:
+            success = crawler.run()
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
     exit(0 if success else 1)
 
 

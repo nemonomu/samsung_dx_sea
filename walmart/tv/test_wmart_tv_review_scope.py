@@ -816,7 +816,6 @@ class ReviewCollectionTests(unittest.TestCase):
             '55', 'PDP spec', None, '55'
         )
         crawler.extract_model_year = lambda name: None
-        crawler._fill_similar_from_json_response = lambda *args, **kwargs: None
 
         row = crawler.crawl_detail_next_data(
             {
@@ -1441,6 +1440,35 @@ class IntegratedRunTests(unittest.TestCase):
             self.assertIn('batch=w_test', batch_end_lines()[0])
             self.assertIn('status=ok', batch_end_lines()[0])
             self.assertIn('detail_saved=1', batch_end_lines()[0])
+
+    def test_interrupted_batch_reports_progress_and_returns_interrupt_exit_code(self):
+        with (
+            TemporaryDirectory() as folder,
+            patch.object(wmart_tv_crawl, 'gettempdir', return_value=folder),
+            patch.object(wmart_tv_crawl.sys, 'argv', [
+                'wmart_tv_crawl', '--resume-from', 'detail', '--batch-id', 'w_test',
+            ]),
+            patch.object(wmart_tv_crawl, 'BaseCrawler'),
+            patch.object(wmart_tv_crawl, 'WalmartTVDetailCrawler') as detail,
+            patch.object(wmart_tv_crawl, 'WalmartTVBrowserRenderer'),
+            patch.object(wmart_tv_crawl, 'send_walmart_tv_email_report') as email,
+            patch('builtins.print') as printed,
+        ):
+            detail.return_value.detail_report = {
+                'target_records': 326, 'saved_records': 27, 'detail_records': 26,
+            }
+            detail.return_value.run.side_effect = KeyboardInterrupt
+            with self.assertRaises(SystemExit) as result:
+                wmart_tv_crawl.main()
+            self.assertEqual(result.exception.code, 130)
+            batch_end = [call.args[0] for call in printed.call_args_list
+                         if call.args and call.args[0].startswith('[BATCH END]')]
+            self.assertEqual(len(batch_end), 1)
+            self.assertIn(
+                'status=interrupted detail_target=326 detail_saved=27 detail_verified=26',
+                batch_end[0],
+            )
+            email.assert_not_called()
 
     def test_lock_refuses_second_active_run_and_allows_run_after_release(self):
         with TemporaryDirectory() as folder:

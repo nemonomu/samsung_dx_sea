@@ -286,8 +286,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 2,
             ),
         )
-        self.similar_json_fallback_enabled = self._env_bool('WALMART_TV_SIMILAR_JSON_FALLBACK', True)
-        self.similar_json_wait_ms = self._env_int('WALMART_TV_SIMILAR_JSON_WAIT_MS', 6000, minimum=0)
         self.parallel_miss_reasons = {}
 
 
@@ -335,7 +333,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if renderer is None:
                 try:
                     from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
-                    renderer = WalmartTVBrowserRenderer(setup_zip=False)
+                    renderer = WalmartTVBrowserRenderer(setup_zip=False, capture_similar=True)
                     self._browser_renderer = renderer
                 except Exception as exc:
                     print(f'[WARNING] Browser initialization failed: {type(exc).__name__}')
@@ -853,32 +851,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         )
         page_suffix = f" page{page_number}" if page_number else ''
         print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
-
-    def _fill_similar_from_json_response(self, parsed, product_url, item, client, log=True, *, browser_blocked=False):
-        existing_similar = self._normalize_similar_value(parsed.get('retailer_sku_name_similar'))
-        if existing_similar:
-            parsed['retailer_sku_name_similar'] = existing_similar
-            return
-        if not self.similar_json_fallback_enabled:
-            parsed['retailer_sku_name_similar'] = None
-            return
-
-        result = client.fetch_similar_product_names(
-            product_url,
-            current_item=item,
-            wait_ms=self.similar_json_wait_ms,
-            browser_blocked=browser_blocked,
-        )
-        meta = result.get('meta') or {}
-        similar = self._normalize_similar_value(result.get('names'))
-        if similar:
-            parsed['retailer_sku_name_similar'] = similar
-        if log:
-            print(
-                f"  [NEXT_DATA similar] source={result.get('source') or '-'}, "
-                f"status={meta.get('status') or '-'}, xhr={meta.get('xhr_count') or 0}, "
-                f"count={(similar.count(' ||| ') + 1) if similar else 0}"
-            )
 
     def load_mst_specs_cache(self, products):
         items = []
@@ -1749,6 +1721,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 continue
 
             parsed = parse_detail_product(next_data, html_text=result.get('html'))
+            if not parsed.get('retailer_sku_name_similar') and result.get('source') == 'browser_render':
+                parsed['retailer_sku_name_similar'] = (result.get('meta') or {}).get('similar_names')
             if not parsed.get('discount_type'):
                 parsed['discount_type'] = parse_discount_type_from_html(result.get('html'))
 
@@ -1794,14 +1768,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 mst_screen_size,
                 log=log,
                 page_screen_size_raw=parsed.get('screen_size'),
-            )
-            # Read recommendations while the product tab may still be open.
-            browser_blocked = any(
-                attempt.get('source') == 'browser_render' and attempt.get('error') == 'explicit_block'
-                for attempt in (result.get('attempts') or ())
-            )
-            self._fill_similar_from_json_response(
-                parsed, url, item, client, log=log, browser_blocked=browser_blocked,
             )
             detail_query = next_data.get('query')
             detail_data = get_initial_data(next_data)

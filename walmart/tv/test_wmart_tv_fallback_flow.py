@@ -28,7 +28,7 @@ class RendererLifecycleTests(unittest.TestCase):
                 results = list(pool.map(lambda i: crawler._crawl_detail_next_data_worker(i, {}, {}), range(4)))
             crawler._crawl_detail_next_data_worker(5, {}, {}, zenrows_only=True)
         self.assertTrue(all(result[1] for result in results))
-        factory.assert_called_once_with(setup_zip=False)
+        factory.assert_called_once_with(setup_zip=False, capture_similar=True)
         self.assertTrue(all(client['renderer'] is renderer and not client['direct_enabled'] for client in clients[:4]))
         self.assertEqual(clients[4], {'direct_enabled': False, 'renderer': None})
 
@@ -93,12 +93,12 @@ class DetailIdentityFallbackTests(unittest.TestCase):
         self.crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
         self.crawler.extract_sku = Mock(return_value=(None, None, None, None, None))
         self.crawler.extract_screen_size = Mock(return_value=(None, None, None, None))
-        self.crawler._fill_similar_from_json_response = Mock()
         self.product = {'product_url': 'https://www.walmart.com/ip/100',
                         'retailer_sku_name': 'Example Television 55 inch'}
         self.renderer = Mock()
         self.client = WalmartNextDataClient(renderer=self.renderer)
         self.client.fetch_zenrows_html = Mock(side_effect=AssertionError('unexpected ZenRows'))
+        self.client.fetch_similar_product_names = Mock()
 
     def crawl(self):
         return self.crawler.crawl_detail_next_data(
@@ -116,7 +116,21 @@ class DetailIdentityFallbackTests(unittest.TestCase):
         row = self.crawl()
         self.assertEqual(row['item'], '100')
         self.assertEqual(row['_detail_source'], 'browser_render')
+        self.assertIsNone(row['retailer_sku_name_similar'])
+        self.client.fetch_similar_product_names.assert_not_called()
         self.renderer.fetch_html.assert_called_once()
+        self.client.fetch_zenrows_html.assert_not_called()
+
+    def test_late_similar_names_from_detail_browser_are_saved_without_refetch(self):
+        self.client.direct_enabled = False
+        self.renderer.fetch_html.return_value = (
+            {'source': 'browser_render', 'content_valid': True, 'similar_names': 'Related TV'},
+            self.html('100', self.product['retailer_sku_name']),
+        )
+        row = self.crawl()
+        self.assertEqual(row['retailer_sku_name_similar'], 'Related TV')
+        self.renderer.fetch_html.assert_called_once()
+        self.client.fetch_similar_product_names.assert_not_called()
         self.client.fetch_zenrows_html.assert_not_called()
 
     def test_matching_name_redirect_keeps_direct_response(self):

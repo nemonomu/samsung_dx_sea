@@ -839,14 +839,14 @@ class WalmartNextDataClient:
                 meta.setdefault("location_zip", None)
                 if not self._verified_render_location(meta):
                     meta["location_verified"] = False
-                    if urlparse(url).path.startswith("/reviews/"):
-                        print(f"[LOCATION WARNING] Walmart {urlparse(url).path}: browser ZIP {WALMART_ZIP} not verified; "
-                              f"observed {meta.get('location_zip') or 'unknown'}")
                 self._rendered_pages[url] = (meta, html_text)
-            if not urlparse(url).path.startswith("/reviews/"):
-                if source != "browser_render":
-                    meta["location_zip"] = response_zip(next_data)
-                    meta["location_verified"] = _response_location_confirmed(url, next_data)
+            is_review = urlparse(url).path.startswith("/reviews/")
+            if source != "browser_render":
+                meta["location_zip"] = response_zip(next_data)
+                meta["location_verified"] = _response_location_confirmed(url, next_data)
+            record_location = getattr(self.renderer, "record_location", None)
+            summarized = record_location is not None and record_location(meta, source) is True
+            if not summarized and (not is_review or (source == "browser_render" and not meta["location_verified"])):
                 label = "LOCATION" if meta["location_verified"] else "LOCATION WARNING"
                 print(f"[{label}] Walmart {urlparse(url).path}: source={source}, "
                       f"expected ZIP {WALMART_ZIP}, observed {meta['location_zip'] or 'unknown'}, "

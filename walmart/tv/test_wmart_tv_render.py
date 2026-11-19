@@ -281,6 +281,30 @@ class RenderTests(unittest.TestCase):
             self.assertTrue(meta['content_valid']); self.assertFalse(meta['location_verified'])
             self.assertIn('__NEXT_DATA__', body)
 
+    def test_detail_collects_late_similar_items_without_second_navigation(self):
+        similar = ('<div id="ip-carousel-Similar items you might like">'
+                   '<h3 data-automation-id="product-title">Related TV</h3></div>')
+        for later, expected, elapsed in (
+            (html() + similar, 'Related TV', 1),
+            (html(item='999') + similar, None, 1),
+            (html(), None, 7),
+        ):
+            with self.subTest(expected=expected, elapsed=elapsed):
+                clock = Clock()
+                page = Page([html(), later])
+                renderer = WalmartTVBrowserRenderer(setup_zip=False, capture_similar=True)
+                renderer._open_browser = Mock(return_value=Browser(page))
+                with (
+                    patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+                    patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+                ):
+                    meta, body = renderer.fetch_html(URL)
+                self.assertEqual(meta.get('similar_names'), expected)
+                self.assertTrue(meta['content_valid'])
+                self.assertEqual(body, html())
+                self.assertEqual(page.urls, [URL])
+                self.assertEqual(clock.now, elapsed)
+
     def test_similar_reuses_current_valid_page_without_new_get(self):
         clock = Clock(); page = Page([html()]); renderer, _ = self.make(page, clock)
         with patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic), patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep):

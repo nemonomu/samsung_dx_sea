@@ -3,7 +3,6 @@ import json
 import unittest
 from unittest.mock import Mock
 
-from walmart.tv.wmart_tv_dt import WalmartTVDetailCrawler
 from walmart.tv.wmart_tv_next_data import WalmartNextDataClient
 
 URL = 'https://www.walmart.com/ip/100'
@@ -28,14 +27,6 @@ class RecommendationRequestTests(unittest.TestCase):
         client.fetch_zenrows_html = Mock(side_effect=AssertionError('unexpected ZenRows HTML'))
         client.fetch_zenrows_json_response = Mock(side_effect=AssertionError('unexpected ZenRows JSON'))
         return client, renderer
-
-    def test_complete_detail_with_names_does_not_request_again(self):
-        crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
-        parsed = {'retailer_sku_name_similar': 'First TV ||| Second TV'}
-        client = Mock()
-        crawler._fill_similar_from_json_response(parsed, URL, '100', client, log=False)
-        self.assertEqual(parsed['retailer_sku_name_similar'], 'First TV ||| Second TV')
-        client.fetch_similar_product_names.assert_not_called()
 
     def test_browser_detail_with_names_reuses_capture(self):
         client, renderer = self.client()
