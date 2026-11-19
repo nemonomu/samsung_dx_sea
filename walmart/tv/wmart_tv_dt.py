@@ -335,7 +335,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             if renderer is None:
                 try:
                     from walmart.tv.wmart_tv_render import WalmartTVBrowserRenderer
-                    renderer = WalmartTVBrowserRenderer()
+                    renderer = WalmartTVBrowserRenderer(setup_zip=False)
                     self._browser_renderer = renderer
                 except Exception as exc:
                     print(f'[WARNING] Browser initialization failed: {type(exc).__name__}')
@@ -376,66 +376,36 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 if product.get('bsr_rank') not in (None, '', 0, '0')
             )
 
-            total_saved = 0
             indexed_products = list(enumerate(product_list, 1))
             total_products = len(product_list)
             deferred_misses = {}
             deferred_mst_specs = {}
 
-            for chunk_start in range(0, len(indexed_products), self.detail_next_data_chunk_size):
+            def save_collected(index, product, combined_data, label='NEXT_DATA parallel HIT'):
+                try:
+                    print(f"\n[{index}/{total_products}] {product.get('retailer_sku_name') or 'N/A'}")
+                    review_count = self._formatted_review_count(combined_data.get('detailed_review_content'))
+                    print(
+                        f"  [{label}] source={combined_data.get('_detail_source')}, "
+                        f"item={combined_data.get('item') or '-'}, "
+                        f"price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}"
+                    )
+                    if self.save_detail_result(combined_data):
+                        self._record_saved(detail=True)
+                        print(f"[DETAIL SAVED] {self.detail_report['detail_records']}/{total_products}", flush=True)
+                    else:
+                        self._record_run_error('detail_save_rejected', product, 'validated detail row was not saved')
+                except Exception as error:
+                    self._record_run_error('detail', product, type(error).__name__)
+                    print(f"[DETAIL ITEM SKIP] index={index} stage=save error={type(error).__name__}")
+
+            for chunk_start in range(0, total_products, self.detail_next_data_chunk_size):
                 chunk = indexed_products[chunk_start:chunk_start + self.detail_next_data_chunk_size]
-                fast_results, chunk_misses, mst_specs = self._collect_detail_initial_parallel(chunk)
+                _, chunk_misses, mst_specs = self._collect_detail_initial_parallel(
+                    chunk, on_result=save_collected,
+                )
                 deferred_misses.update(chunk_misses)
                 deferred_mst_specs.update(mst_specs)
-
-                for i, product in chunk:
-                    combined_data = None
-                    try:
-                        retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
-                        product_url = (product.get('product_url') or 'N/A').split('?', 1)[0]
-                        url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
-                        print(f"\n[{i}/{total_products}] {retailer_sku_name}")
-                        print(f"  URL: {url_display}")
-
-                        combined_data = fast_results.get(i)
-                        if combined_data:
-                            review_count = self._formatted_review_count(combined_data.get('detailed_review_content'))
-                            print(
-                                f"  [NEXT_DATA parallel HIT] source={combined_data.get('_detail_source')}, "
-                                f"item={combined_data.get('item') or '-'}, "
-                                f"price={combined_data.get('final_sku_price') or '-'}, reviews={review_count}"
-                            )
-                        else:
-                            miss_entry = chunk_misses.get(i) or {}
-                            miss_reason = miss_entry.get('reason') or 'unknown'
-                            print(
-                                f"  [NEXT_DATA DEFERRED] item={item_id_from_url(product_url) or '-'} "
-                                f"reason={miss_reason} next=final_zenrows_recovery"
-                            )
-                            continue
-
-                        if combined_data:
-                            detail_loaded = combined_data is not product
-                            if self.save_detail_result(combined_data):
-                                total_saved += 1
-                                self._record_saved(detail=detail_loaded)
-                            else:
-                                self._record_run_error('detail_save_rejected', product, 'validated detail row was not saved')
-
-                        time.sleep(random.uniform(0.05, 0.15))
-
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        print(f"[ERROR] Product {i} failed: {e}")
-
-                        if "redirect detected" in error_msg:
-                            print("[INFO] 리다이렉트 감지 - 검증된 detail row 없음, 저장하지 않음")
-                            self._record_redirect(product, e)
-                            continue
-
-                        # 검증된 detail row가 없으면 불완전한 listing-only row를 저장하지 않는다.
-                        self._record_run_error('detail', product, e)
-                        continue
 
             unresolved = {}
             if deferred_misses:
@@ -446,6 +416,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 recovered, unresolved = self.collect_detail_zenrows_recovery_parallel(
                     deferred_misses,
                     deferred_mst_specs,
+                    on_result=lambda index, product, row: save_collected(index, product, row, 'ZENROWS FINAL HIT'),
                 )
                 self.parallel_miss_reasons = {
                     index: entry.get('reason') or 'unknown'
@@ -454,36 +425,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
                 for i, initial_entry in sorted(deferred_misses.items()):
                     product = initial_entry.get('product') or {}
-                    retailer_sku_name = product.get('retailer_sku_name') or 'N/A'
-                    product_url = (product.get('product_url') or 'N/A').split('?', 1)[0]
-                    url_display = product_url[:80] + '...' if len(product_url) > 80 else product_url
-                    print(f"\n[{i}/{total_products}] {retailer_sku_name}")
-                    print(f"  URL: {url_display}")
-
+                    if i in recovered:
+                        continue
+                    product_url = product.get('product_url') or ''
                     try:
-                        combined_data = recovered.get(i)
-                        if combined_data:
-                            review_count = self._formatted_review_count(
-                                combined_data.get('detailed_review_content')
-                            )
-                            print(
-                                f"  [ZENROWS FINAL HIT] source={combined_data.get('_detail_source')}, "
-                                f"item={combined_data.get('item') or '-'}, "
-                                f"price={combined_data.get('final_sku_price') or '-'}, "
-                                f"reviews={review_count}"
-                            )
-                            if self.save_detail_result(combined_data):
-                                total_saved += 1
-                                self._record_saved(detail=True)
-                            else:
-                                self._record_run_error(
-                                    'detail_save_rejected',
-                                    product,
-                                    'validated recovery row was not saved',
-                                )
-                            time.sleep(random.uniform(0.05, 0.15))
-                            continue
-
                         unresolved_entry = unresolved.get(i) or initial_entry
                         miss_reason = unresolved_entry.get('reason') or 'unknown'
                         message = self._parallel_miss_message(
@@ -502,7 +447,6 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                             "final ZenRows recovery exhausted"
                         )
                         if self.save_listing_fallback(product, miss_reason):
-                            total_saved += 1
                             self._record_saved(detail=False)
                             print("  [LISTING-ONLY SAVED] original listing row preserved")
                         else:
@@ -522,8 +466,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
             # All normal and deferred products have been processed before this pass.
             from walmart.tv.wmart_tv_save_recovery import recover_pending_saves, report_file_cleanup
+            print("[DETAIL SAVE RECOVERY] checking pending DB saves", flush=True)
             for recovered_row, kind in recover_pending_saves(self):
-                total_saved += 1
                 self._record_saved(detail=kind != 'insert_listing')
                 self.detail_report['run_errors'] = [
                     error for error in self.detail_report['run_errors']
@@ -533,8 +477,9 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                     )
                 ]
 
+            total_saved = self.detail_report['saved_records']
             table_name = 'test_tv_retail_com' if self.test_mode else 'tv_retail_com'
-            print(f"[DONE] Processed: {len(product_list)}, Saved: {total_saved}, Table: {table_name}, batch_id: {self.batch_id}")
+            print(f"[DETAIL SAVE RESULT] Processed: {len(product_list)}, Saved: {total_saved}, Table: {table_name}, batch_id: {self.batch_id}")
             report_file_cleanup(self)
 
             # ===== SPEC DIFF 일괄 출력 (마스터 vs 페이지 추출 값이 다른 item들) =====
@@ -565,7 +510,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             self.detail_report['all_targets_processed'] = True
             if unsaved:
                 print(f"[INCOMPLETE] Unsaved: {unsaved}; remaining products were all processed")
-            return unsaved == 0
+            missing_details = total_products - self.detail_report['detail_records']
+            if missing_details:
+                print(f"[INCOMPLETE] Detail quota: verified={total_products - missing_details} target={total_products}")
+            return unsaved == 0 and missing_details == 0
 
         except Exception as e:
             print(f"[ERROR] Crawler failed: {e}")
@@ -906,7 +854,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         page_suffix = f" page{page_number}" if page_number else ''
         print(f"  [NEXT_DATA {label}] {item or '-'}{page_suffix}: {summary}")
 
-    def _fill_similar_from_json_response(self, parsed, product_url, item, client, log=True):
+    def _fill_similar_from_json_response(self, parsed, product_url, item, client, log=True, *, browser_blocked=False):
         existing_similar = self._normalize_similar_value(parsed.get('retailer_sku_name_similar'))
         if existing_similar:
             parsed['retailer_sku_name_similar'] = existing_similar
@@ -919,6 +867,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
             product_url,
             current_item=item,
             wait_ms=self.similar_json_wait_ms,
+            browser_blocked=browser_blocked,
         )
         meta = result.get('meta') or {}
         similar = self._normalize_similar_value(result.get('names'))
@@ -984,9 +933,10 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
     ):
         diagnostics = []
         try:
+            renderer = None if zenrows_only else self._get_browser_renderer()
             client = WalmartNextDataClient(
-                direct_enabled=not zenrows_only,
-                renderer=None if zenrows_only else self._get_browser_renderer(),
+                direct_enabled=not zenrows_only and renderer is None,
+                renderer=renderer,
             )
             combined_data = self.crawl_detail_next_data(
                 product,
@@ -1071,7 +1021,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         if examples:
             print(f"[INFO] {label} examples: {' | '.join(examples)}")
 
-    def _collect_detail_initial_parallel(self, indexed_products):
+    def _collect_detail_initial_parallel(self, indexed_products, *, on_result=None):
         if not indexed_products:
             return {}, {}, {}
 
@@ -1103,6 +1053,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
                 if combined_data:
                     results[result_index] = combined_data
+                    if on_result is not None:
+                        on_result(result_index, product, combined_data)
                     continue
 
                 reason = reason or self._parallel_miss_reason(diagnostics)
@@ -1162,7 +1114,7 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         )
         return results
 
-    def collect_detail_zenrows_recovery_parallel(self, misses, mst_specs):
+    def collect_detail_zenrows_recovery_parallel(self, misses, mst_specs, *, on_result=None):
         if not misses:
             return {}, {}
 
@@ -1244,6 +1196,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
 
                     if combined_data:
                         recovered[result_index] = combined_data
+                        if on_result is not None:
+                            on_result(result_index, product, combined_data)
                         round_recovered += 1
                         print(
                             f"[INFO] ZenRows recovery HIT: #{result_index} "
@@ -1728,6 +1682,8 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
         client = next_data_client or self.next_data_client
         if isinstance(client, WalmartNextDataClient) and client.direct_enabled and client.renderer is None:
             client.renderer = self._get_browser_renderer()
+            if client.renderer is not None and next_data_client is None:
+                client.direct_enabled = False
         fast_errors = []
         review_notes = []
         diagnostics_list = diagnostics if diagnostics is not None else []
@@ -1840,7 +1796,13 @@ class WalmartTVDetailCrawler(WalmartBaseCrawler):
                 page_screen_size_raw=parsed.get('screen_size'),
             )
             # Read recommendations while the product tab may still be open.
-            self._fill_similar_from_json_response(parsed, url, item, client, log=log)
+            browser_blocked = any(
+                attempt.get('source') == 'browser_render' and attempt.get('error') == 'explicit_block'
+                for attempt in (result.get('attempts') or ())
+            )
+            self._fill_similar_from_json_response(
+                parsed, url, item, client, log=log, browser_blocked=browser_blocked,
+            )
             detail_query = next_data.get('query')
             detail_data = get_initial_data(next_data)
             detail_product = detail_data.get('product') or {}

@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from walmart.tv.wmart_tv_next_data import WalmartNextDataClient
 
@@ -185,6 +185,27 @@ class TransportOrderTests(unittest.TestCase):
         renderer.fetch_html.assert_not_called()
         client.fetch_zenrows_json_response.assert_not_called()
 
+    def test_explicitly_blocked_product_uses_existing_similar_backup_without_browser_revisit(self):
+        block = {'source': 'browser_render', 'blocked': True, 'error': 'explicit_block'}
+        blocked_html = '<title>Robot or human?</title>'
+        direct_block = {'source': 'direct', 'status': 200, 'blocked': True}
+        client, renderer, order = self.make_client(
+            (direct_block, blocked_html), (block, ''),
+            ({'source': 'zenrows_static', 'status': 200}, page()),
+        )
+        detail = client.fetch_next_data(URL)
+        self.assertEqual(detail['source'], 'zenrows_static')
+        self.assertEqual(detail['attempts'][0]['status'], 200)
+        self.assertTrue(detail['attempts'][0]['blocked'])
+        self.assertEqual(order, ['html', 'render', 'zenrows_static'])
+        self.assertEqual(detail['attempts'][1]['error'], 'explicit_block')
+        client.fetch_zenrows_json_response = Mock(return_value=(
+            {'source': 'zenrows_json', 'status': 200}, {'html': page(similar=True)},
+        ))
+        similar = client.fetch_similar_product_names(URL, current_item='100', browser_blocked=True)
+        self.assertEqual(similar['names'], 'Related TV')
+        renderer.fetch_html.assert_called_once_with(URL)
+
     def test_similar_items_wait_for_render_before_using_provider(self):
         client, renderer, _ = self.make_client(direct(), rendered())
         client.fetch_zenrows_json_response = Mock(return_value=(
@@ -226,6 +247,25 @@ class TransportOrderTests(unittest.TestCase):
                 self.assertEqual(result['source'], 'browser_render')
                 self.assertIs(result['meta']['location_verified'], False)
                 client.fetch_zenrows_json_response.assert_not_called()
+
+    def test_blocked_json_response_never_supplies_similar_names(self):
+        client = WalmartNextDataClient()
+        client.fetch_zenrows_json_response = Mock(return_value=(
+            {'source': 'zenrows_json', 'status': 200, 'blocked': True}, {'html': page(similar=True)},
+        ))
+        result = client.fetch_similar_product_names(URL, current_item='100')
+        self.assertIsNone(result['names'])
+
+    def test_json_block_detection_uses_the_page_not_unrelated_responses(self):
+        client = WalmartNextDataClient()
+        client.zenrows_api_key = 'offline-test-placeholder'
+        payload = {'html': page(similar=True), 'xhr': [{'body': 'Robot or human?'}]}
+        response = Mock(status_code=200, url='https://example.test', text=json.dumps(payload))
+        response.json.return_value = payload
+        with patch('walmart.tv.wmart_tv_next_data.requests.get', return_value=response):
+            result = client.fetch_similar_product_names(URL, current_item='100')
+        self.assertFalse(result['meta']['blocked'])
+        self.assertEqual(result['names'], 'Related TV')
 
     def test_similar_failure_does_not_raise_or_stop_collection(self):
         client, _, _ = self.make_client(direct(), RuntimeError('browser closed'))

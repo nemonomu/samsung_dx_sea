@@ -1,36 +1,80 @@
-"""Owned, shared Walmart browser fallback for detail and review pages."""
+"""Shared Walmart browser transport for listings, detail and reviews."""
+import os
+from pathlib import Path
 import random
-import re
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
 from walmart.tv.wmart_tv_next_data import (
-    _response_location_confirmed, extract_next_data, find_reviews_node,
-    get_initial_data, is_blocked_html, item_id_from_url, product_scope_query_params,
+    WalmartNextDataClient, _response_location_confirmed, extract_next_data, find_reviews_node,
+    get_initial_data, has_listing_products, is_blocked_html, is_explicit_block_page, item_id_from_url,
+    product_scope_query_params,
     response_zip, review_response_scope_error, parse_similar_product_names_from_html,
     parse_similar_product_names, _transport_log,
 )
 
 
 class WalmartTVBrowserRenderer:
-    def __init__(self):
+    def __init__(self, *, setup_zip=True, retry_once=False):
+        self._setup_zip = setup_zip
+        self._retry_once = retry_once
         self._lock = threading.Lock()
         self._browser = None
+        self._browser_backend = None
         self._page = None
         self._initial_attempted = False
         self._zip_attempted = False
         self._location_verified = False
         self._last_navigation = None
 
-    def _open_browser(self):
+    @staticmethod
+    def _edge_path():
+        for variable in ('ProgramFiles(x86)', 'ProgramFiles', 'LOCALAPPDATA'):
+            install_dir = os.environ.get(variable)
+            if not install_dir:
+                continue
+            edge = Path(install_dir) / 'Microsoft' / 'Edge' / 'Application' / 'msedge.exe'
+            if edge.is_file():
+                return edge
+        return None
+
+    def _launch_browser(self, edge_path=None):
         from DrissionPage import Chromium, ChromiumOptions
+
         options = ChromiumOptions(read_file=False)
         options.auto_port()
-        # Keep hydration/challenge requests loading while our readiness loop waits.
+        if edge_path is not None:
+            options.set_browser_path(str(edge_path))
         options.set_load_mode('none')
         options.set_timeouts(page_load=30)
-        return Chromium(options)
+        browser = Chromium(options)
+        self._browser_backend = 'edge' if edge_path is not None else 'chrome'
+        return browser
+
+    def _open_browser(self):
+        try:
+            from amazon.tv.uc_page import UCPage, make_uc_driver
+
+            browser = UCPage(make_uc_driver(page_load_strategy='eager'))
+            self._browser_backend = 'uc'
+            print('[BROWSER] Starting Walmart TV collection with UC')
+            return browser
+        except Exception as error:
+            print(f'[BROWSER FALLBACK] UC startup error={type(error).__name__}; starting DrissionPage')
+            return self._open_drission_browser()
+
+    def _open_drission_browser(self):
+        from DrissionPage.errors import BrowserConnectError
+
+        try:
+            return self._launch_browser()
+        except (BrowserConnectError, OSError) as error:
+            edge_path = self._edge_path()
+            if edge_path is None:
+                raise
+            print(f'[BROWSER FALLBACK] Chrome startup error={type(error).__name__}; starting Edge')
+            return self._launch_browser(edge_path)
 
     def _set_zip(self):
         # The banner hydrates after the embedded product data becomes available.
@@ -76,10 +120,13 @@ class WalmartTVBrowserRenderer:
             if remaining > 0:
                 time.sleep(remaining)
         self._last_navigation = time.monotonic()
-        self._page.get(url, retry=0, timeout=30)
+        if self._browser_backend == 'uc':
+            self._page.get(url)
+        else:
+            self._page.get(url, retry=0, timeout=30)
 
     @staticmethod
-    def _valid(url, data):
+    def _valid(url, data, final_url=None):
         if not isinstance(data, dict):
             return False
         item = item_id_from_url(url)
@@ -89,7 +136,11 @@ class WalmartTVBrowserRenderer:
         if any(str(query.get(k) or '') != v
                for k, v in product_scope_query_params(url).items()):
             return False
-        if urlparse(url).path.startswith('/reviews/'):
+        path = urlparse(url).path
+        if path.rstrip('/') == '/search':
+            requested_page = parse_qs(urlparse(url).query).get('page', ['1'])[0]
+            return has_listing_products(data, requested_page, final_url)
+        if path.startswith('/reviews/'):
             requested_page = parse_qs(urlparse(url).query).get('page', ['1'])[0]
             response_page = str(query.get('page') or '1')
             return bool(item and requested_page == response_page
@@ -99,7 +150,8 @@ class WalmartTVBrowserRenderer:
         if not isinstance(product, dict):
             return False
         actual = product.get('usItemId') or item_id_from_url(product.get('canonicalUrl'))
-        return bool(item and actual and str(actual) == item)
+        return bool(item and actual and str(actual) == item
+                    and WalmartNextDataClient._usable_detail_or_review(url, data))
 
     def _wait_ready(self, url, timeout, require_location=False):
         from DrissionPage.errors import ContextLostError
@@ -108,21 +160,21 @@ class WalmartTVBrowserRenderer:
         _transport_log(url, 'browser_readiness', 0, None, 'waiting',
                        'browser_result', event='readiness_start', budget_s=timeout)
         blocked = False
+        challenge_seen = False
         reason = 'next_data_missing'
         while True:
             try:
                 body = self._page.html or ''
                 current_url = self._page.url
                 blocked = is_blocked_html(body, current_url)
-                if blocked and (
-                    urlparse(current_url or '').path.rstrip('/') == '/blocked'
-                    or re.search(r'<title\b[^>]*>\s*robot or human\s*\??\s*</title\s*>', body, re.I)
-                ):
+                challenge_seen = challenge_seen or blocked
+                if blocked and is_explicit_block_page(body, current_url):
                     _transport_log(url, 'browser_readiness', time.monotonic() - started, None,
                                    'explicit_block', 'browser_result', event='readiness')
-                    return '', None, True
+                    return '', None, 'explicit_block'
             except ContextLostError:
                 body = ''
+                blocked = False
             data = extract_next_data(body) if not blocked else None
             if blocked:
                 reason = 'blocked'
@@ -130,18 +182,79 @@ class WalmartTVBrowserRenderer:
                 reason = 'response_incomplete_or_mismatched'
             else:
                 reason = 'next_data_missing'
-            if data and self._valid(url, data):
+            if data and self._valid(url, data, current_url):
                 if not require_location or _response_location_confirmed(url, data):
                     _transport_log(url, 'browser_readiness', time.monotonic() - started, None,
                                    'ready', 'browser_processing', event='readiness')
-                    return body, data, False
+                    return body, data, None
                 reason = 'location_unverified'
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _transport_log(url, 'browser_readiness', time.monotonic() - started, None, reason,
                                'browser_result', event='readiness')
-                return '', None, blocked
+                return '', None, 'challenge timeout' if challenge_seen else None
             time.sleep(min(1, remaining))
+
+    def _read_ready(self, url, *, reuse=False, wait_for_similar=False):
+        retry = self._retry_once and not wait_for_similar
+        attempts = 2 if retry else 1
+        for attempt in range(attempts):
+            if attempt or not reuse:
+                self._navigate(url)
+            first = not self._initial_attempted
+            self._initial_attempted = True
+            timeout = 30 if retry else 300 if first else 90
+            body, data, block_reason = self._wait_ready(url, timeout)
+            if data or block_reason or attempt + 1 == attempts:
+                return body, data, block_reason
+            print(f"[BROWSER RETRY] backend={self._browser_backend} reason=page_readiness_timeout attempt=2/2")
+
+    def _read_browser(self, url, *, reuse, wait_for_similar):
+        from DrissionPage.errors import BrowserConnectError, PageDisconnectedError
+
+        if self._browser_backend == 'uc':
+            from selenium.common.exceptions import WebDriverException
+
+            try:
+                body, data, block_reason = self._read_ready(
+                    url, reuse=reuse, wait_for_similar=wait_for_similar,
+                )
+                if data or block_reason == 'explicit_block':
+                    return body, data, block_reason
+                reason = block_reason or 'page readiness timeout'
+            except WebDriverException as error:
+                reason = type(error).__name__
+
+            print(f'[BROWSER FALLBACK] UC {reason}; starting DrissionPage')
+            self._close_browser()
+            self._browser = self._open_drission_browser()
+            self._page = self._browser.latest_tab
+            reuse = False
+
+        chrome = self._browser_backend == 'chrome'
+        connection_error = None
+        try:
+            body, data, block_reason = self._read_ready(
+                url, reuse=reuse, wait_for_similar=wait_for_similar,
+            )
+        except (BrowserConnectError, PageDisconnectedError) as error:
+            if not self._retry_once or not chrome or wait_for_similar:
+                raise
+            body, data, block_reason = '', None, None
+            connection_error = error
+
+        if chrome and not data and block_reason is None and not wait_for_similar:
+            edge_path = self._edge_path()
+            if edge_path is not None:
+                reason = type(connection_error).__name__ if connection_error else 'page readiness timeout'
+                print(f'[BROWSER FALLBACK] Chrome {reason}; starting Edge')
+                self._close_browser()
+                self._browser = self._launch_browser(edge_path)
+                self._page = self._browser.latest_tab
+                return self._read_ready(url)
+        if connection_error is not None:
+            raise connection_error
+        return body, data, block_reason
 
     def fetch_html(self, url, wait_for_similar=False):
         with self._lock:
@@ -151,25 +264,25 @@ class WalmartTVBrowserRenderer:
             try:
                 if self._browser is None:
                     self._browser = self._open_browser()
-                    self._page = self._browser.latest_tab
+                    self._page = (self._browser if self._browser_backend == 'uc'
+                                  else self._browser.latest_tab)
                 is_review = urlparse(url).path.startswith('/reviews/')
                 reuse = False
                 if wait_for_similar and self._page.url == url:
                     current = self._page.html or ''
                     reuse = (not is_blocked_html(current, self._page.url)
                              and self._valid(url, extract_next_data(current)))
-                if not reuse:
-                    self._navigate(url)
-                first = not self._initial_attempted
-                self._initial_attempted = True
-                body, data, blocked = self._wait_ready(url, 300 if first else 90)
-                meta['blocked'] = blocked
+                body, data, block_reason = self._read_browser(
+                    url, reuse=reuse, wait_for_similar=wait_for_similar,
+                )
+                meta['browser_backend'] = self._browser_backend
+                meta['blocked'] = bool(block_reason)
                 if not data:
-                    meta['error'] = 'challenge timeout' if blocked else 'page readiness timeout'
+                    meta['error'] = block_reason or 'page readiness timeout'
                     return meta, ''
 
                 meta['location_zip'] = response_zip(data)
-                if (not is_review and not self._zip_attempted
+                if (self._setup_zip and not is_review and not self._zip_attempted
                         and not _response_location_confirmed(url, data)):
                     self._zip_attempted = True
                     self._location_verified = False
@@ -181,7 +294,7 @@ class WalmartTVBrowserRenderer:
                     if zip_set:
                         try:
                             self._navigate(url)
-                            updated_body, updated_data, blocked = self._wait_ready(url, 90)
+                            updated_body, updated_data, _ = self._wait_ready(url, 90)
                         except Exception as exc:
                             print(f'[LOCATION WARNING] ZIP revisit failed: {type(exc).__name__}')
                             self._close_browser()
@@ -228,6 +341,7 @@ class WalmartTVBrowserRenderer:
 
     def _close_browser(self):
         browser, self._browser, self._page = self._browser, None, None
+        self._browser_backend = None
         self._zip_attempted = False
         self._location_verified = False
         if browser is not None:

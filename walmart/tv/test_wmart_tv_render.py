@@ -1,4 +1,7 @@
 import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
@@ -348,11 +351,166 @@ class RenderTests(unittest.TestCase):
     def test_open_browser_uses_independent_options(self):
         renderer = WalmartTVBrowserRenderer()
         with patch('DrissionPage.ChromiumOptions') as options_cls, patch('DrissionPage.Chromium') as chromium:
-            renderer._open_browser()
+            renderer._open_drission_browser()
         options_cls.assert_called_once_with(read_file=False)
         options_cls.return_value.auto_port.assert_called_once_with()
         options_cls.return_value.set_load_mode.assert_called_once_with('none')
         chromium.assert_called_once_with(options_cls.return_value)
+
+    def test_chrome_startup_failure_tries_installed_edge_once(self):
+        from DrissionPage.errors import BrowserConnectError
+
+        renderer = WalmartTVBrowserRenderer()
+        with TemporaryDirectory() as program_files:
+            edge_path = Path(program_files) / 'Microsoft' / 'Edge' / 'Application' / 'msedge.exe'
+            edge_path.parent.mkdir(parents=True)
+            edge_path.touch()
+            chrome_options, edge_options, edge = Mock(), Mock(), Mock()
+            with (
+                patch.dict(os.environ, {'ProgramFiles(x86)': program_files}, clear=True),
+                patch('DrissionPage.ChromiumOptions', side_effect=[chrome_options, edge_options]),
+                patch('DrissionPage.Chromium', side_effect=[BrowserConnectError('startup failed'), edge]) as launch,
+            ):
+                self.assertIs(renderer._open_drission_browser(), edge)
+            edge_options.set_browser_path.assert_called_once_with(str(edge_path))
+            edge_options.auto_port.assert_called_once_with()
+            edge_options.set_load_mode.assert_called_once_with('none')
+            self.assertEqual([call.args[0] for call in launch.call_args_list], [chrome_options, edge_options])
+
+    def test_chrome_timeout_uses_edge_but_explicit_block_does_not(self):
+        for chrome_body, switched in (
+            ('', True), ('<title>Robot or human?</title>', False), ('<title>403 Forbidden</title>', False),
+            ('<title>429 Too Many Requests</title>', False),
+        ):
+            with self.subTest(switched=switched):
+                clock = Clock()
+                chrome = Browser(Page([chrome_body]))
+                edge = Browser(Page([html()]))
+                renderer = WalmartTVBrowserRenderer(retry_once=True)
+                renderer._open_browser = Mock(return_value=chrome)
+                renderer._browser_backend = 'chrome'
+                with (
+                    patch.object(renderer, '_edge_path', return_value=Path('msedge.exe')),
+                    patch.object(renderer, '_launch_browser', return_value=edge) as launch,
+                    patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+                    patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+                ):
+                    meta, _ = renderer.fetch_html(URL)
+                self.assertEqual(meta['content_valid'], switched)
+                self.assertEqual(launch.call_count, int(switched))
+                self.assertEqual(chrome.quits, int(switched))
+
+    def test_integrated_retries_each_browser_once_before_provider(self):
+        clock = Clock()
+        chrome = Browser(Page(['']))
+        edge = Browser(Page(['']))
+        renderer = WalmartTVBrowserRenderer(setup_zip=False, retry_once=True)
+        renderer._open_browser = Mock(return_value=chrome)
+        renderer._browser_backend = 'chrome'
+        with (
+            patch.object(renderer, '_edge_path', return_value=Path('msedge.exe')),
+            patch.object(renderer, '_launch_browser', return_value=edge) as launch,
+            patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+            patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+        ):
+            meta, body = renderer.fetch_html(URL)
+        self.assertEqual(chrome.latest_tab.urls, [URL, URL])
+        self.assertEqual(edge.latest_tab.urls, [URL, URL])
+        launch.assert_called_once_with(Path('msedge.exe'))
+        self.assertEqual(meta['error'], 'page readiness timeout')
+        self.assertFalse(meta['blocked'])
+        self.assertEqual(body, '')
+
+    def test_rendered_search_requires_products_and_rejects_wrong_page(self):
+        item = {'name': 'Test TV', 'canonicalUrl': '/ip/test/123', 'usItemId': '123'}
+        search = {'itemStacks': [{'title': 'Results for tv', 'items': [item]}]}
+        data = {'query': {'page': 2}, 'props': {'pageProps': {'initialData': {'searchResult': search}}}}
+        renderer = WalmartTVBrowserRenderer()
+        self.assertTrue(renderer._valid('https://www.walmart.com/search?q=tv&page=2', data))
+        self.assertFalse(renderer._valid('https://www.walmart.com/search?q=tv&page=1', data))
+        search['itemStacks'][0]['items'] = []
+        self.assertFalse(renderer._valid('https://www.walmart.com/search?q=tv&page=2', data))
+
+    def test_chrome_missing_without_installed_edge_leaves_transport_fallback(self):
+        renderer = WalmartTVBrowserRenderer()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch('DrissionPage.ChromiumOptions'),
+            patch('DrissionPage.Chromium', side_effect=FileNotFoundError('startup failed')) as launch,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                renderer._open_drission_browser()
+            launch.assert_called_once()
+
+    def test_uc_success_uses_same_browser_for_later_pages(self):
+        clock = Clock()
+        renderer = WalmartTVBrowserRenderer()
+        with (
+            patch('amazon.tv.uc_page.make_uc_driver') as make,
+            patch.object(renderer, '_open_drission_browser') as fallback,
+            patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+            patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+        ):
+            driver = make.return_value
+            driver.current_url = URL
+            driver.page_source = html()
+            for _ in range(2):
+                meta, _ = renderer.fetch_html(URL)
+                self.assertTrue(meta['content_valid'])
+                self.assertEqual(meta['browser_backend'], 'uc')
+            renderer.close()
+        make.assert_called_once_with(page_load_strategy='eager')
+        self.assertEqual(driver.get.call_count, 2)
+        driver.quit.assert_called_once_with()
+        fallback.assert_not_called()
+
+    def test_uc_startup_navigation_and_readiness_failures_use_drission_for_same_url(self):
+        from selenium.common.exceptions import WebDriverException
+
+        for failure in ('startup', 'navigation', 'readiness', 'product_id_only', 'challenge_timeout'):
+            with self.subTest(failure=failure):
+                clock = Clock()
+                renderer = WalmartTVBrowserRenderer(retry_once=True)
+                drission = Browser(Page([html()]))
+                driver = Mock(current_url=URL, page_source='')
+                if failure == 'navigation':
+                    driver.get.side_effect = WebDriverException('disconnected')
+                if failure == 'product_id_only':
+                    driver.page_source = html().replace('"price": 100', '"price": null')
+                if failure == 'challenge_timeout':
+                    driver.page_source = 'Robot or human'
+
+                def start_drission():
+                    self.assertEqual(driver.quit.call_count, int(failure != 'startup'))
+                    renderer._browser_backend = 'chrome'
+                    return drission
+
+                with (
+                    patch('amazon.tv.uc_page.make_uc_driver', return_value=driver,
+                          side_effect=OSError('driver unavailable') if failure == 'startup' else None),
+                    patch.object(renderer, '_open_drission_browser', side_effect=start_drission) as fallback,
+                    patch('walmart.tv.wmart_tv_render.time.monotonic', clock.monotonic),
+                    patch('walmart.tv.wmart_tv_render.time.sleep', clock.sleep),
+                ):
+                    meta, _ = renderer.fetch_html(URL)
+                self.assertTrue(meta['content_valid'])
+                self.assertEqual(meta['browser_backend'], 'chrome')
+                self.assertEqual(drission.latest_tab.urls, [URL])
+                fallback.assert_called_once_with()
+
+    def test_uc_explicit_block_preserves_block_result(self):
+        renderer = WalmartTVBrowserRenderer(retry_once=True)
+        with (
+            patch('amazon.tv.uc_page.make_uc_driver') as make,
+            patch.object(renderer, '_open_drission_browser') as fallback,
+        ):
+            make.return_value.current_url = URL
+            make.return_value.page_source = '<title>403 Forbidden</title>'
+            meta, body = renderer.fetch_html(URL)
+        self.assertTrue(meta['blocked'])
+        self.assertEqual(meta['error'], 'explicit_block')
+        self.assertEqual(body, '')
+        fallback.assert_not_called()
 
     def test_concurrent_navigation_does_not_overlap(self):
         page = Page([html()]); renderer, _ = self.make(page, Clock())

@@ -235,11 +235,23 @@ def build_listing_url(url_template, page_number, page_type=None):
     return url
 
 
+def is_explicit_block_page(html_text, final_url=None):
+    return (
+        urlparse(final_url or '').path.lower().rstrip('/') == '/blocked'
+        or bool(re.search(
+            r'<title\b[^>]*>\s*(?:robot or human\s*\??|(?:403\s+)?(?:access denied|request blocked|forbidden)'
+            r'|(?:429\s+)?too many requests)\s*</title\s*>',
+            html_text or '', re.I,
+        ))
+    )
+
+
 def is_blocked_html(html_text, final_url=None):
     lower = (html_text or "").lower()
     final_lower = (final_url or "").lower()
     return (
-        "/blocked" in final_lower
+        is_explicit_block_page(html_text, final_url)
+        or "/blocked" in final_lower
         or "robot or human" in lower
         or "px-captcha" in lower
         or "validatecaptcha" in lower
@@ -509,6 +521,9 @@ class WalmartNextDataClient:
                 return meta, None
             if isinstance(payload, dict):
                 meta["xhr_count"] = len(payload.get("xhr") or [])
+                captured_html = payload.get("html")
+                if isinstance(captured_html, str) and captured_html.strip():
+                    meta["blocked"] = is_blocked_html(captured_html, url)
             if set_location:
                 if response.status_code != 200 or not isinstance(payload, dict):
                     meta["error"] = "location request failed"
@@ -668,9 +683,9 @@ class WalmartNextDataClient:
                     cls._location_retry_after = time.monotonic() + 600
         return meta, payload
 
-    def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30):
+    def fetch_similar_product_names(self, url, current_item=None, wait_ms=6000, limit=30, *, browser_blocked=False):
         attempts = []
-        if self.renderer is not None:
+        if self.renderer is not None and not browser_blocked:
             cached = self._rendered_pages.get(url)
             for use_cache in ([True, False] if cached else [False]):
                 started = time.monotonic()
@@ -704,24 +719,26 @@ class WalmartNextDataClient:
                 _transport_log(url, route, time.monotonic() - started, meta.get("status"),
                                "blocked" if meta.get("blocked") else "no_valid_similar_products",
                                "similar_browser" if use_cache else "zenrows_json")
-        print("[LOCATION WARNING] Walmart similar products: location not verified; using existing route")
+        if browser_blocked:
+            _transport_log(url, "similar_browser", 0, None, "prior_explicit_block", "zenrows_json", event="skip")
         started = time.monotonic()
         try:
             meta, payload = self.fetch_zenrows_json_response(url, wait_ms=wait_ms)
         except Exception as exc:
             meta, payload = {"source": "zenrows_json", "error": type(exc).__name__}, None
         attempts.append(meta)
-        names = parse_similar_product_names_from_json_response(
-            payload,
-            current_item=current_item,
-            limit=limit,
-        )
+        names = None
+        if meta.get("status") == 200 and not meta.get("blocked"):
+            names = parse_similar_product_names_from_json_response(
+                payload, current_item=current_item, limit=limit,
+            )
         if names:
             meta["similar_count"] = names.count(" ||| ") + 1
         else:
             meta["similar_count"] = 0
         _transport_log(url, "zenrows_json", time.monotonic() - started, meta.get("status"),
-                       "ok" if names else "request_error" if meta.get("error") else "no_valid_similar_products",
+                       "ok" if names else "blocked" if meta.get("blocked") else
+                       "request_error" if meta.get("error") else "no_valid_similar_products",
                        "none", success=bool(names), error_class=meta.get("error_class"))
         return {"names": names, "source": meta.get("source"), "meta": meta, "attempts": attempts}
 
@@ -1434,6 +1451,19 @@ def _listing_items_from_next_data(next_data):
             return []
         return [item for item in items if _is_listing_product(item)]
     return []
+
+
+def listing_page_matches(next_data, page_number, final_url=None):
+    query = (next_data or {}).get('query') or {}
+    if not isinstance(query, dict):
+        return False
+    url_page = parse_qs(urlparse(final_url or '').query).get('page', [None])[0]
+    return all(page is None or str(page) == str(page_number)
+               for page in (query.get('page'), url_page))
+
+
+def has_listing_products(next_data, page_number, final_url=None):
+    return listing_page_matches(next_data, page_number, final_url) and bool(_listing_items_from_next_data(next_data))
 
 
 def parse_listing_products(next_data, *, account_name, page_type, page_number, calendar_week, batch_id):

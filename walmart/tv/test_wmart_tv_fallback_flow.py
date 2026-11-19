@@ -28,9 +28,17 @@ class RendererLifecycleTests(unittest.TestCase):
                 results = list(pool.map(lambda i: crawler._crawl_detail_next_data_worker(i, {}, {}), range(4)))
             crawler._crawl_detail_next_data_worker(5, {}, {}, zenrows_only=True)
         self.assertTrue(all(result[1] for result in results))
-        factory.assert_called_once_with()
-        self.assertTrue(all(client['renderer'] is renderer and client['direct_enabled'] for client in clients[:4]))
+        factory.assert_called_once_with(setup_zip=False)
+        self.assertTrue(all(client['renderer'] is renderer and not client['direct_enabled'] for client in clients[:4]))
         self.assertEqual(clients[4], {'direct_enabled': False, 'renderer': None})
+
+    def test_integrated_detail_worker_starts_with_existing_browser(self):
+        crawler = WalmartTVDetailCrawler.__new__(WalmartTVDetailCrawler)
+        crawler._browser_renderer = Mock()
+        crawler.crawl_detail_next_data = Mock(return_value={'item': '100'})
+        with patch('walmart.tv.wmart_tv_dt.WalmartNextDataClient') as client:
+            crawler._crawl_detail_next_data_worker(1, {}, {})
+        client.assert_called_once_with(direct_enabled=False, renderer=crawler._browser_renderer)
 
     def test_close_error_does_not_prevent_main_or_update_cleanup(self):
         for crawler_type in (WalmartTVDetailCrawler, WalmartTVDetailUpdateCrawler):

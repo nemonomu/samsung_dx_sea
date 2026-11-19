@@ -521,7 +521,7 @@ class DetailRunFlowTests(unittest.TestCase):
         crawler.initialize = lambda: True
         crawler.load_product_list = lambda: products
 
-        def fake_initial_collect(indexed_products):
+        def fake_initial_collect(indexed_products, *, on_result):
             misses = {
                 2: {
                     'product': products[1],
@@ -533,9 +533,10 @@ class DetailRunFlowTests(unittest.TestCase):
                     'error': None,
                 },
             }
+            on_result(1, products[0], recovered)
             return {1: recovered}, misses, {}
 
-        def fake_final_recovery(misses, mst_specs):
+        def fake_final_recovery(misses, mst_specs, *, on_result):
             return {}, misses
 
         def fail_browser_fallback(*args, **kwargs):
@@ -548,8 +549,10 @@ class DetailRunFlowTests(unittest.TestCase):
         listing_saved = []
         crawler.save_detail_result = lambda row: detail_saved.append(row) or True
         crawler.save_to_retail_com = lambda row: listing_saved.append(row) or True
+        folder = self.enterContext(TemporaryDirectory())
+        crawler.save_recovery_dir = Path(folder)
 
-        self.assertTrue(crawler.run())
+        self.assertFalse(crawler.run())
         self.assertEqual(detail_saved, [recovered])
         self.assertEqual(len(listing_saved), 1)
         self.assertEqual(listing_saved[0]['item'], '200')
@@ -597,7 +600,7 @@ class DetailRunFlowTests(unittest.TestCase):
         crawler.initialize = lambda: True
         crawler.load_product_list = lambda: products
 
-        def fake_initial_collect(indexed_products):
+        def fake_initial_collect(indexed_products, *, on_result):
             index, product = indexed_products[0]
             events.append(f'initial-{index}')
             return {}, {
@@ -609,7 +612,7 @@ class DetailRunFlowTests(unittest.TestCase):
                 },
             }, {}
 
-        def fake_final_recovery(misses, mst_specs):
+        def fake_final_recovery(misses, mst_specs, *, on_result):
             events.append('recovery-' + ','.join(str(index) for index in sorted(misses)))
             recovered = products[0].copy()
             recovered.update({
@@ -617,6 +620,7 @@ class DetailRunFlowTests(unittest.TestCase):
                 '_detail_source': 'zenrows_static',
                 'detailed_review_content': 'review1 - recovered review',
             })
+            on_result(1, products[0], recovered)
             return {1: recovered}, {2: misses[2]}
 
         crawler._collect_detail_initial_parallel = fake_initial_collect
@@ -625,8 +629,10 @@ class DetailRunFlowTests(unittest.TestCase):
         listing_saved = []
         crawler.save_detail_result = lambda row: detail_saved.append(row) or True
         crawler.save_to_retail_com = lambda row: listing_saved.append(row) or True
+        folder = self.enterContext(TemporaryDirectory())
+        crawler.save_recovery_dir = Path(folder)
 
-        self.assertTrue(crawler.run())
+        self.assertFalse(crawler.run())
         self.assertEqual(events, ['initial-1', 'initial-2', 'recovery-1,2'])
         self.assertEqual(len(detail_saved), 1)
         self.assertEqual(detail_saved[0]['item'], '100')
@@ -1248,6 +1254,9 @@ class ReviewCollectionTests(unittest.TestCase):
 class DetailSaveGuardTests(unittest.TestCase):
     def save_crawler(self):
         crawler = bare_crawler()
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        crawler.save_recovery_dir = Path(folder.name)
         crawler.spec_diffs = []
         crawler.upsert_item_mst = lambda product: True
         crawler.save_to_retail_com = lambda product: True
@@ -1320,7 +1329,7 @@ class DetailSaveGuardTests(unittest.TestCase):
         ))
 
     def test_listing_fallback_never_writes_item_mst(self):
-        crawler = bare_crawler()
+        crawler = self.save_crawler()
         saved_rows = []
         crawler.upsert_item_mst = lambda product: self.fail(
             'listing fallback must not write tv_item_mst'
@@ -1379,6 +1388,60 @@ class DetailSaveGuardTests(unittest.TestCase):
 
 
 class IntegratedRunTests(unittest.TestCase):
+    def test_running_batch_is_not_reported_as_completed_by_second_launch(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'samsung-dx-sea-walmart-tv.lock'
+            with (
+                wmart_tv_crawl.batch_lock(path) as acquired,
+                patch.object(wmart_tv_crawl, 'gettempdir', return_value=folder),
+                patch.object(wmart_tv_crawl.sys, 'argv', ['wmart_tv_crawl']),
+                patch.object(wmart_tv_crawl, 'WalmartTVIntegratedCrawler') as crawler,
+                patch('builtins.print') as printed,
+            ):
+                self.assertTrue(acquired)
+                with self.assertRaises(SystemExit) as exit_info:
+                    wmart_tv_crawl.main()
+                self.assertEqual(exit_info.exception.code, 75)
+                crawler.assert_not_called()
+                self.assertIn('reason=already_running', printed.call_args.args[0])
+                self.assertNotIn('[BATCH END]', printed.call_args.args[0])
+
+    def test_batch_end_is_logged_after_detail_save_and_browser_cleanup(self):
+        report = {'all_targets_processed': True, 'target_records': 1,
+                  'saved_records': 1, 'detail_records': 1}
+        with (
+            patch.object(wmart_tv_crawl, 'BaseCrawler') as base,
+            patch.object(wmart_tv_crawl, 'WalmartTVDetailCrawler') as detail,
+            patch.object(wmart_tv_crawl, 'WalmartTVBrowserRenderer') as renderer,
+            patch.object(wmart_tv_crawl, 'send_walmart_tv_email_report'),
+            patch('builtins.print') as printed,
+        ):
+            def batch_end_lines():
+                return [call.args[0] for call in printed.call_args_list
+                        if call.args and call.args[0].startswith('[BATCH END]')]
+
+            def finish_detail():
+                self.assertEqual(batch_end_lines(), [])
+                detail.return_value.detail_report = report
+                return True
+
+            def close_browser():
+                self.assertEqual(batch_end_lines(), [])
+
+            def stop_logging():
+                self.assertEqual(len(batch_end_lines()), 1)
+
+            detail.return_value.run.side_effect = finish_detail
+            renderer.return_value.close.side_effect = close_browser
+            base.return_value.stop_logging.side_effect = stop_logging
+            crawler = wmart_tv_crawl.WalmartTVIntegratedCrawler(
+                resume_from='detail', batch_id='w_test',
+            )
+            self.assertTrue(crawler.run())
+            self.assertIn('batch=w_test', batch_end_lines()[0])
+            self.assertIn('status=ok', batch_end_lines()[0])
+            self.assertIn('detail_saved=1', batch_end_lines()[0])
+
     def test_lock_refuses_second_active_run_and_allows_run_after_release(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / 'walmart.lock'
